@@ -8,9 +8,8 @@ from typing import Any
 import numpy as np
 import pydicom
 from PIL import Image, ImageTk
-from pydicom import config as pydicom_config
 from pydicom.errors import InvalidDicomError
-from pydicom.pixel_data_handlers.util import apply_modality_lut
+from dicom_loader import DicomLoader
 
 
 class DicomViewer:
@@ -28,9 +27,8 @@ class DicomViewer:
         self.loaded_from_folder = False
         self.photo_image = None
         self._last_canvas_size = (0, 0)
-        self._decoded_cache: dict[str, tuple[pydicom.dataset.FileDataset, list[np.ndarray]]] = {}
+        self.dicom_loader = DicomLoader()
         self._metadata_cache: dict[str, pydicom.dataset.FileDataset] = {}
-        self._load_error_cache: dict[str, str] = {}
         self.window_width_value: float | None = None
         self.window_level_value: float | None = None
         self.default_window_width: float | None = None
@@ -1391,7 +1389,7 @@ class DicomViewer:
             return cached
 
         try:
-            dataset, frames = self._get_decoded_file(path)
+            dataset, frames = self.dicom_loader.get_decoded_file(path)
             if not frames:
                 return None
             preview = self._build_multiview_thumbnail_image(dataset, frames[0], width, height)
@@ -2094,7 +2092,7 @@ class DicomViewer:
 
         path = file_paths[index]
         try:
-            dataset, frames = self._get_decoded_file(path)
+            dataset, frames = self.dicom_loader.get_decoded_file(path)
         except Exception as exc:
             messagebox.showerror("열기 실패", f"파일을 읽는 중 오류가 발생했습니다.\n\n{path}\n\n{exc}")
             return
@@ -2569,9 +2567,8 @@ class DicomViewer:
         self.current_file_index = -1
         self.current_folder_path = None
         self.loaded_from_folder = False
-        self._decoded_cache = {}
+        self.dicom_loader.clear_cache()
         self._metadata_cache = {}
-        self._load_error_cache = {}
         self._clear_multiview_thumbnail_cache()
         self.multiview_info_cache = {}
         self.multiview_tile_meta_cache = {}
@@ -2674,7 +2671,7 @@ class DicomViewer:
                 self._record_excluded_file(result, "non_dicom", path, metadata_error)
                 continue
 
-            transfer_syntax = self._get_transfer_syntax(metadata_dataset)
+            transfer_syntax = self.dicom_loader.get_transfer_syntax(metadata_dataset)
             is_compressed = bool(getattr(transfer_syntax, "is_compressed", False)) if transfer_syntax else False
             if is_compressed:
                 result["compressed_dicom"].append(path)
@@ -2685,7 +2682,7 @@ class DicomViewer:
                 result["multiframe_dicom"].append(path)
 
             try:
-                display_dataset, _ = self._get_decoded_file(path)
+                display_dataset, _ = self.dicom_loader.get_decoded_file(path)
             except ValueError as exc:
                 category = self._categorize_display_failure(str(exc), transfer_syntax)
                 self._record_excluded_file(result, category, path, str(exc))
@@ -2737,41 +2734,16 @@ class DicomViewer:
         except (TypeError, ValueError):
             return 1
 
-    @staticmethod
-    def _get_transfer_syntax(dataset):
-        file_meta = getattr(dataset, "file_meta", None)
-        return getattr(file_meta, "TransferSyntaxUID", None)
-
     def _build_compressed_detail(self, dataset, displayable: bool) -> dict[str, str]:
-        transfer_syntax = self._get_transfer_syntax(dataset)
+        transfer_syntax = self.dicom_loader.get_transfer_syntax(dataset)
         is_compressed = bool(getattr(transfer_syntax, "is_compressed", False)) if transfer_syntax else False
-        decoder_available = self._has_transfer_syntax_handler(transfer_syntax) if transfer_syntax else True
+        decoder_available = self.dicom_loader.has_transfer_syntax_handler(transfer_syntax) if transfer_syntax else True
         return {
             "transfer_syntax_uid": str(transfer_syntax) if transfer_syntax else "Unknown",
             "is_compressed": "예" if is_compressed else "아니오",
             "decoder_available": "예" if decoder_available else "아니오",
             "displayable": "예" if displayable else "아니오",
         }
-
-    def _has_transfer_syntax_handler(self, transfer_syntax) -> bool:
-        if transfer_syntax is None:
-            return True
-
-        try:
-            is_compressed = bool(transfer_syntax.is_compressed)
-        except Exception:
-            is_compressed = False
-
-        if not is_compressed:
-            return True
-
-        for handler in pydicom_config.pixel_data_handlers:
-            try:
-                if handler.is_available() and handler.supports_transfer_syntax(transfer_syntax):
-                    return True
-            except Exception:
-                continue
-        return False
 
     def _build_folder_summary(self, diagnosis: dict[str, list[str]]) -> str:
         return (
@@ -3000,7 +2972,7 @@ class DicomViewer:
         if "Pixel Data가 없는 DICOM 파일" in reason:
             return "no_pixel_data"
         if "전송구문을 해제할 수 있는 픽셀 디코더가 없습니다" in reason:
-            if transfer_syntax is not None and not self._has_transfer_syntax_handler(transfer_syntax):
+            if transfer_syntax is not None and not self.dicom_loader.has_transfer_syntax_handler(transfer_syntax):
                 return "compressed_unsupported"
         return "display_failures"
 
@@ -3082,7 +3054,7 @@ class DicomViewer:
 
         path = self.file_paths[index]
         try:
-            dataset, frames = self._get_decoded_file(path)
+            dataset, frames = self.dicom_loader.get_decoded_file(path)
         except Exception as exc:
             messagebox.showerror("열기 실패", f"파일을 읽는 중 오류가 발생했습니다.\n\n{path}\n\n{exc}")
             return
@@ -3382,99 +3354,6 @@ class DicomViewer:
     @staticmethod
     def _is_ctrl_pressed(event: tk.Event) -> bool:
         return bool(getattr(event, "state", 0) & 0x0004)
-
-    def _get_decoded_file(self, path: str) -> tuple[pydicom.dataset.FileDataset, list[np.ndarray]]:
-        cached = self._decoded_cache.get(path)
-        if cached is not None:
-            return cached
-
-        cached_error = self._load_error_cache.get(path)
-        if cached_error is not None:
-            raise ValueError(cached_error)
-
-        try:
-            dataset, frames = self._read_dataset_for_display(path)
-        except ValueError as exc:
-            self._load_error_cache[path] = str(exc)
-            raise
-
-        self._decoded_cache[path] = (dataset, frames)
-        return dataset, frames
-
-    def _read_dataset_for_display(self, path: str) -> tuple[pydicom.dataset.FileDataset, list[np.ndarray]]:
-        try:
-            dataset = pydicom.dcmread(path)
-        except InvalidDicomError as exc:
-            raise ValueError("DICOM 형식이 아닌 파일입니다.") from exc
-        except Exception as exc:
-            raise ValueError("DICOM 파일을 읽지 못했습니다.") from exc
-
-        if "PixelData" not in dataset:
-            raise ValueError("Pixel Data가 없는 DICOM 파일입니다.")
-
-        self._ensure_transfer_syntax_supported(dataset, path)
-
-        try:
-            frames = self._extract_frames(dataset)
-        except NotImplementedError as exc:
-            raise ValueError("이 DICOM의 픽셀 형식은 현재 뷰어에서 지원하지 않습니다.") from exc
-        except Exception as exc:
-            if self._is_probable_decode_error(exc):
-                raise ValueError(
-                    "압축된 DICOM 픽셀 데이터를 디코딩하지 못했습니다.\n"
-                    "Windows Python에 `pylibjpeg`, `pylibjpeg-libjpeg`, "
-                    "`pylibjpeg-openjpeg`, `gdcm` 중 필요한 디코더를 설치해 주세요."
-                ) from exc
-            raise
-
-        if not frames:
-            raise ValueError("표시할 프레임이 없습니다.")
-
-        return dataset, frames
-
-    def _extract_frames(self, dataset) -> list[np.ndarray]:
-        pixel_array = apply_modality_lut(dataset.pixel_array, dataset)
-        pixel_array = np.asarray(pixel_array)
-
-        if pixel_array.ndim == 2:
-            return [pixel_array]
-
-        if pixel_array.ndim == 3:
-            if getattr(dataset, "SamplesPerPixel", 1) == 3:
-                return [pixel_array]
-            return [pixel_array[index] for index in range(pixel_array.shape[0])]
-
-        if pixel_array.ndim == 4 and pixel_array.shape[-1] == 3:
-            return [pixel_array[index] for index in range(pixel_array.shape[0])]
-
-        raise ValueError(f"지원하지 않는 이미지 차원입니다: {pixel_array.shape}")
-
-    def _ensure_transfer_syntax_supported(self, dataset, _path: str) -> None:
-        transfer_syntax = self._get_transfer_syntax(dataset)
-        if transfer_syntax is None:
-            return
-        if self._has_transfer_syntax_handler(transfer_syntax):
-            return
-
-        raise ValueError(
-            "압축된 DICOM 전송구문을 해제할 수 있는 픽셀 디코더가 없습니다.\n"
-            f"Transfer Syntax: {transfer_syntax}\n"
-            "Windows Python에 `pylibjpeg`, `pylibjpeg-libjpeg`, "
-            "`pylibjpeg-openjpeg`, `gdcm` 중 필요한 디코더를 설치해 주세요."
-        )
-
-    @staticmethod
-    def _is_probable_decode_error(exc: Exception) -> bool:
-        text = str(exc).lower()
-        keywords = (
-            "decoder",
-            "decompress",
-            "compressed",
-            "transfer syntax",
-            "pixel data handler",
-            "missing required element",
-        )
-        return any(keyword in text for keyword in keywords)
 
     def _build_info_text(self, dataset, frames: list[np.ndarray]) -> str:
         patient_name = str(getattr(dataset, "PatientName", "Unknown"))
