@@ -36,6 +36,13 @@ class DicomViewer:
         self.window_level_range = (0.0, 1.0)
         self._window_drag_origin: tuple[int, int] | None = None
         self._window_drag_base: tuple[float, float] | None = None
+        self.invert_display = tk.BooleanVar(value=False)
+        self.show_grid_overlay = tk.BooleanVar(value=False)
+        self.cursor_var = tk.StringVar(value="Cursor: -, -")
+        self.measurement_mode = tk.StringVar(value="pan")
+        self.temporary_measurements: list[dict[str, Any]] = []
+        self._active_temporary_measurement: dict[str, Any] | None = None
+        self._image_bbox: tuple[float, float, float, float] | None = None
         self.zoom_scale = 1.0
         self.min_zoom_scale = 0.05
         self.max_zoom_scale = 32.0
@@ -145,6 +152,22 @@ class DicomViewer:
         self.window_level_reset_button.pack(side="left", padx=(16, 0))
         ttk.Checkbutton(
             top,
+            text="Invert",
+            variable=self.invert_display,
+            command=self._refresh_single_view_image,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(
+            top,
+            text="Grid",
+            variable=self.show_grid_overlay,
+            command=self._refresh_grid_overlay,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Radiobutton(top, text="Pan", value="pan", variable=self.measurement_mode).pack(side="left", padx=(12, 0))
+        ttk.Radiobutton(top, text="ROI", value="roi", variable=self.measurement_mode).pack(side="left", padx=(4, 0))
+        ttk.Radiobutton(top, text="Line", value="line", variable=self.measurement_mode).pack(side="left", padx=(4, 0))
+        ttk.Button(top, text="임시 측정 지우기", command=self.clear_temporary_measurements).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(
+            top,
             text="Compare Mode",
             variable=self.compare_mode_enabled,
             command=self.toggle_compare_mode,
@@ -177,9 +200,10 @@ class DicomViewer:
         ttk.Label(top, textvariable=self.frame_var).pack(side="left", padx=(12, 0))
         ttk.Label(top, textvariable=self.zoom_var).pack(side="left", padx=(12, 0))
         ttk.Label(top, textvariable=self.window_level_var).pack(side="left", padx=(12, 0))
+        ttk.Label(top, textvariable=self.cursor_var).pack(side="left", padx=(12, 0))
 
         ttk.Label(self.root, textvariable=self.path_var, padding=(12, 0)).pack(fill="x")
-        ttk.Label(self.root, textvariable=self.info_var, padding=(12, 6)).pack(fill="x")
+        ttk.Label(self.root, textvariable=self.info_var, padding=(12, 6), justify="left", wraplength=1040).pack(fill="x")
         ttk.Label(self.root, textvariable=self.shortcut_var, padding=(12, 0, 12, 6)).pack(fill="x")
 
         self.content_container = ttk.Frame(self.root, padding=(12, 0, 12, 12))
@@ -201,9 +225,10 @@ class DicomViewer:
         y_scroll.grid(row=0, column=1, sticky="ns")
         x_scroll.grid(row=1, column=0, sticky="ew")
         self.canvas.bind("<Configure>", self._on_canvas_resize)
-        self.canvas.bind("<ButtonPress-1>", self._start_pan)
-        self.canvas.bind("<B1-Motion>", self._update_pan)
-        self.canvas.bind("<ButtonRelease-1>", self._end_pan)
+        self.canvas.bind("<ButtonPress-1>", self._handle_left_button_press)
+        self.canvas.bind("<B1-Motion>", self._handle_left_button_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._handle_left_button_release)
+        self.canvas.bind("<Motion>", self._update_cursor_coordinates)
         self.canvas.bind("<ButtonPress-3>", self._start_window_level_drag)
         self.canvas.bind("<B3-Motion>", self._update_window_level_drag)
         self.canvas.bind("<ButtonRelease-3>", self._end_window_level_drag)
@@ -2588,9 +2613,13 @@ class DicomViewer:
         self.multiview_page_var.set("페이지: - / -")
         self.path_var.set("파일이 선택되지 않았습니다.")
         self.info_var.set("파일을 열면 현재 선택 영상의 요약이 표시됩니다.")
+        self.cursor_var.set("Cursor: -, -")
         for field in self.overlay_field_definitions:
             self.current_overlay_values[field["key"]] = "N/A"
         self.canvas.delete("overlay")
+        self.canvas.delete("grid_overlay")
+        self.clear_temporary_measurements()
+        self._image_bbox = None
         self.close_multiview_grid_selector()
         self._update_multiview_controls()
 
@@ -3063,6 +3092,7 @@ class DicomViewer:
         self.frames = frames
         self.current_file_index = index
         self.current_frame = 0
+        self.clear_temporary_measurements()
         self._initialize_window_level(dataset, frames)
         if preserve_view_state and preserved_zoom is not None:
             self.zoom_scale = preserved_zoom
@@ -3186,6 +3216,24 @@ class DicomViewer:
         self._window_drag_origin = None
         self._window_drag_base = None
 
+    def _handle_left_button_press(self, event: tk.Event) -> None:
+        if self.measurement_mode.get() == "pan":
+            self._start_pan(event)
+            return
+        self._start_temporary_measurement(event)
+
+    def _handle_left_button_drag(self, event: tk.Event) -> None:
+        if self.measurement_mode.get() == "pan":
+            self._update_pan(event)
+            return
+        self._update_temporary_measurement(event)
+
+    def _handle_left_button_release(self, event: tk.Event) -> None:
+        if self.measurement_mode.get() == "pan":
+            self._end_pan(event)
+            return
+        self._finish_temporary_measurement(event)
+
     def _start_pan(self, event: tk.Event) -> None:
         if not self.frames:
             return
@@ -3202,6 +3250,178 @@ class DicomViewer:
         if self.view_mode == "single":
             self._draw_single_view_overlays()
         return
+
+    def _update_cursor_coordinates(self, event: tk.Event) -> None:
+        if not self.frames:
+            self.cursor_var.set("Cursor: -, -")
+            return
+        coords = self._canvas_to_image_pixel(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        if coords is None:
+            self.cursor_var.set("Cursor: -, -")
+            return
+        x, y = coords
+        self.cursor_var.set(f"Cursor: ({x}, {y})")
+
+    def _canvas_to_image_pixel(self, canvas_x: float, canvas_y: float) -> tuple[int, int] | None:
+        if self._image_bbox is None or not self.frames:
+            return None
+        left, top, right, bottom = self._image_bbox
+        if canvas_x < left or canvas_x >= right or canvas_y < top or canvas_y >= bottom:
+            return None
+
+        frame_array = np.asarray(self.frames[self.current_frame])
+        if frame_array.ndim < 2:
+            return None
+        height, width = frame_array.shape[:2]
+        display_width = max(right - left, 1.0)
+        display_height = max(bottom - top, 1.0)
+        x_ratio = (canvas_x - left) / display_width
+        y_ratio = (canvas_y - top) / display_height
+        pixel_x = int(np.clip(np.floor(x_ratio * width), 0, width - 1))
+        pixel_y = int(np.clip(np.floor(y_ratio * height), 0, height - 1))
+        return pixel_x, pixel_y
+
+    def _start_temporary_measurement(self, event: tk.Event) -> None:
+        if not self.frames or self.view_mode != "single":
+            return
+        mode = self.measurement_mode.get()
+        if mode not in {"roi", "line"}:
+            return
+        start_x = self.canvas.canvasx(event.x)
+        start_y = self.canvas.canvasy(event.y)
+        if mode == "roi":
+            item_id = self.canvas.create_rectangle(
+                start_x, start_y, start_x, start_y, outline="#ffd34d", width=2, dash=(4, 2), tags=("temp_measurement",)
+            )
+        else:
+            item_id = self.canvas.create_line(
+                start_x, start_y, start_x, start_y, fill="#7bdff2", width=2, tags=("temp_measurement",)
+            )
+        self._active_temporary_measurement = {
+            "mode": mode,
+            "item_id": item_id,
+            "start": (start_x, start_y),
+            "end": (start_x, start_y),
+        }
+
+    def _update_temporary_measurement(self, event: tk.Event) -> None:
+        if self._active_temporary_measurement is None:
+            return
+        end_x = self.canvas.canvasx(event.x)
+        end_y = self.canvas.canvasy(event.y)
+        start_x, start_y = self._active_temporary_measurement["start"]
+        self._active_temporary_measurement["end"] = (end_x, end_y)
+        self.canvas.coords(self._active_temporary_measurement["item_id"], start_x, start_y, end_x, end_y)
+
+    def _finish_temporary_measurement(self, event: tk.Event) -> None:
+        if self._active_temporary_measurement is None:
+            return
+        self._update_temporary_measurement(event)
+        mode = self._active_temporary_measurement["mode"]
+        start_x, start_y = self._active_temporary_measurement["start"]
+        end_x, end_y = self._active_temporary_measurement["end"]
+        image_start = self._canvas_to_image_pixel(start_x, start_y)
+        image_end = self._canvas_to_image_pixel(end_x, end_y)
+        self.canvas.delete(self._active_temporary_measurement["item_id"])
+        self._active_temporary_measurement = None
+        if image_start is None or image_end is None:
+            return
+        self.temporary_measurements.append({"mode": mode, "start": image_start, "end": image_end})
+        self._draw_temporary_measurements()
+
+    def _image_pixel_to_canvas(self, pixel_x: int, pixel_y: int) -> tuple[float, float] | None:
+        if self._image_bbox is None or not self.frames:
+            return None
+        frame_array = np.asarray(self.frames[self.current_frame])
+        if frame_array.ndim < 2:
+            return None
+        height, width = frame_array.shape[:2]
+        if width <= 0 or height <= 0:
+            return None
+        left, top, right, bottom = self._image_bbox
+        display_width = right - left
+        display_height = bottom - top
+        canvas_x = left + (float(pixel_x) / width) * display_width
+        canvas_y = top + (float(pixel_y) / height) * display_height
+        return canvas_x, canvas_y
+
+    def _draw_temporary_measurements(self) -> None:
+        self.canvas.delete("temp_measurement")
+        for measurement in self.temporary_measurements:
+            start = self._image_pixel_to_canvas(*measurement["start"])
+            end = self._image_pixel_to_canvas(*measurement["end"])
+            if start is None or end is None:
+                continue
+            start_x, start_y = start
+            end_x, end_y = end
+            if measurement["mode"] == "roi":
+                self.canvas.create_rectangle(
+                    start_x,
+                    start_y,
+                    end_x,
+                    end_y,
+                    outline="#ffd34d",
+                    width=2,
+                    dash=(4, 2),
+                    tags=("temp_measurement",),
+                )
+                width_px = abs(measurement["end"][0] - measurement["start"][0])
+                height_px = abs(measurement["end"][1] - measurement["start"][1])
+                label = f"{width_px} x {height_px}px"
+            else:
+                self.canvas.create_line(
+                    start_x,
+                    start_y,
+                    end_x,
+                    end_y,
+                    fill="#7bdff2",
+                    width=2,
+                    tags=("temp_measurement",),
+                )
+                length_px = float(np.hypot(measurement["end"][0] - measurement["start"][0], measurement["end"][1] - measurement["start"][1]))
+                label = f"{length_px:.1f}px"
+            self.canvas.create_text(
+                end_x + 6,
+                end_y - 6,
+                text=label,
+                fill="white",
+                anchor="sw",
+                font=("TkDefaultFont", 9, "bold"),
+                tags=("temp_measurement",),
+            )
+
+    def clear_temporary_measurements(self) -> None:
+        self.temporary_measurements = []
+        self._active_temporary_measurement = None
+        self.canvas.delete("temp_measurement")
+
+    def _draw_grid_overlay(self) -> None:
+        self.canvas.delete("grid_overlay")
+        if not self.show_grid_overlay.get() or self._image_bbox is None:
+            return
+        left, top, right, bottom = self._image_bbox
+        width = right - left
+        height = bottom - top
+        columns = 8
+        rows = 8
+        for column in range(1, columns):
+            x = left + (width * column / columns)
+            self.canvas.create_line(x, top, x, bottom, fill="#5bc0de", width=1, dash=(2, 3), tags=("grid_overlay",))
+        for row in range(1, rows):
+            y = top + (height * row / rows)
+            self.canvas.create_line(left, y, right, y, fill="#5bc0de", width=1, dash=(2, 3), tags=("grid_overlay",))
+
+    def _refresh_single_view_image(self) -> None:
+        if self.view_mode != "single" or not self.frames:
+            return
+        center_ratio = self._capture_view_center_ratio()
+        self._show_frame()
+        self._restore_view_center_ratio(center_ratio)
+
+    def _refresh_grid_overlay(self) -> None:
+        if self.view_mode != "single" or not self.frames:
+            return
+        self._draw_grid_overlay()
 
     def _handle_mousewheel(self, event: tk.Event) -> str:
         direction = self._get_mousewheel_direction(event)
@@ -3375,6 +3595,7 @@ class DicomViewer:
         if not 0 <= new_index < len(self.frames):
             return
         self.current_frame = new_index
+        self.clear_temporary_measurements()
         self._show_frame()
 
     def change_file(self, delta: int) -> None:
@@ -3425,6 +3646,12 @@ class DicomViewer:
 
         self.canvas.delete("all")
         self.canvas.create_image(center_x, center_y, image=self.photo_image, anchor="center")
+        self._image_bbox = (
+            center_x - (self.photo_image.width() / 2),
+            center_y - (self.photo_image.height() / 2),
+            center_x + (self.photo_image.width() / 2),
+            center_y + (self.photo_image.height() / 2),
+        )
         self.canvas.config(
             scrollregion=(
                 0,
@@ -3438,6 +3665,8 @@ class DicomViewer:
         else:
             self._restore_view_center_ratio(center_ratio)
         self._draw_single_view_overlays()
+        self._draw_grid_overlay()
+        self._draw_temporary_measurements()
         self.frame_var.set(f"프레임: {self.current_frame + 1} / {len(self.frames)}")
         self._update_zoom_label()
 
@@ -3576,11 +3805,17 @@ class DicomViewer:
         if array.ndim == 2:
             array = self._apply_window_level_to_array(array, window_width, window_level)
             array = self._scale_to_uint8(array)
-            return self._apply_photometric_interpretation(array, dataset)
+            array = self._apply_photometric_interpretation(array, dataset)
+            if self.invert_display.get():
+                return 255 - array
+            return array
 
         if array.ndim == 3 and array.shape[-1] == 3:
             channels = [self._scale_to_uint8(array[..., index]) for index in range(3)]
-            return np.stack(channels, axis=-1)
+            rgb = np.stack(channels, axis=-1)
+            if self.invert_display.get():
+                return 255 - rgb
+            return rgb
 
         raise ValueError(f"지원하지 않는 프레임 형식입니다: {array.shape}")
 
