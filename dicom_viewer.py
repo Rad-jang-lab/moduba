@@ -8,9 +8,9 @@ from typing import Any
 import numpy as np
 import pydicom
 from PIL import Image, ImageTk
-from pydicom import config as pydicom_config
 from pydicom.errors import InvalidDicomError
-from pydicom.pixel_data_handlers.util import apply_modality_lut
+from dicom_loader import DicomLoader
+from image_pipeline import ImagePipeline
 
 
 class DicomViewer:
@@ -28,9 +28,9 @@ class DicomViewer:
         self.loaded_from_folder = False
         self.photo_image = None
         self._last_canvas_size = (0, 0)
-        self._decoded_cache: dict[str, tuple[pydicom.dataset.FileDataset, list[np.ndarray]]] = {}
+        self.dicom_loader = DicomLoader()
+        self.image_pipeline = ImagePipeline()
         self._metadata_cache: dict[str, pydicom.dataset.FileDataset] = {}
-        self._load_error_cache: dict[str, str] = {}
         self.window_width_value: float | None = None
         self.window_level_value: float | None = None
         self.default_window_width: float | None = None
@@ -43,6 +43,7 @@ class DicomViewer:
         self.max_zoom_scale = 32.0
         self._zoom_limit_notice: str | None = None
         self.zoom_var = tk.StringVar(value="Zoom: -")
+        self.cursor_var = tk.StringVar(value="좌표: -")
         self.view_mode = "single"
         self.multiview_cols = 3
         self.multiview_rows = 2
@@ -65,6 +66,8 @@ class DicomViewer:
         self.multiview_cache_page_window = 1
         self.show_basic_overlay = tk.BooleanVar(value=True)
         self.show_acquisition_overlay = tk.BooleanVar(value=True)
+        self.show_grid_overlay = tk.BooleanVar(value=False)
+        self.invert_display = tk.BooleanVar(value=False)
         self.compare_mode_enabled = tk.BooleanVar(value=False)
         self.compare_sync_enabled = tk.BooleanVar(value=False)
         self.compare_sync_mode = "index"
@@ -170,6 +173,18 @@ class DicomViewer:
             variable=self.show_acquisition_overlay,
             command=self.refresh_overlay_display,
         ).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(
+            top,
+            text="Grid",
+            variable=self.show_grid_overlay,
+            command=self.toggle_grid_overlay,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(
+            top,
+            text="반전 표시",
+            variable=self.invert_display,
+            command=self.toggle_invert_display,
+        ).pack(side="left", padx=(8, 0))
         ttk.Button(top, text="오버레이 항목 설정", command=self.open_overlay_settings).pack(side="left", padx=(12, 0))
 
         ttk.Label(top, textvariable=self.view_mode_var).pack(side="left", padx=(12, 0))
@@ -179,9 +194,12 @@ class DicomViewer:
         ttk.Label(top, textvariable=self.frame_var).pack(side="left", padx=(12, 0))
         ttk.Label(top, textvariable=self.zoom_var).pack(side="left", padx=(12, 0))
         ttk.Label(top, textvariable=self.window_level_var).pack(side="left", padx=(12, 0))
+        ttk.Label(top, textvariable=self.cursor_var).pack(side="left", padx=(12, 0))
 
-        ttk.Label(self.root, textvariable=self.path_var, padding=(12, 0)).pack(fill="x")
-        ttk.Label(self.root, textvariable=self.info_var, padding=(12, 6)).pack(fill="x")
+        self.path_label = ttk.Label(self.root, textvariable=self.path_var, padding=(12, 0), justify="left", anchor="w")
+        self.path_label.pack(fill="x")
+        self.info_label = ttk.Label(self.root, textvariable=self.info_var, padding=(12, 6), justify="left", anchor="w")
+        self.info_label.pack(fill="x")
         ttk.Label(self.root, textvariable=self.shortcut_var, padding=(12, 0, 12, 6)).pack(fill="x")
 
         self.content_container = ttk.Frame(self.root, padding=(12, 0, 12, 12))
@@ -212,6 +230,8 @@ class DicomViewer:
         self.canvas.bind("<MouseWheel>", self._handle_mousewheel)
         self.canvas.bind("<Button-4>", self._handle_mousewheel)
         self.canvas.bind("<Button-5>", self._handle_mousewheel)
+        self.canvas.bind("<Motion>", self._on_canvas_mouse_move)
+        self.canvas.bind("<Leave>", self._on_canvas_mouse_leave)
 
         self.multiview_container = ttk.Frame(self.content_container)
         self.multiview_container.grid(row=0, column=0, sticky="nsew")
@@ -258,8 +278,21 @@ class DicomViewer:
         self.multiview_container.grid_remove()
         self.compare_container.grid_remove()
         self._bind_shortcuts()
+        self.root.bind("<Configure>", self._on_root_resize, add="+")
+        self._update_status_label_wraplength()
         self._update_multiview_controls()
         self._update_compare_controls()
+
+    def _on_root_resize(self, _event: tk.Event) -> None:
+        self._update_status_label_wraplength()
+
+    def _update_status_label_wraplength(self) -> None:
+        window_width = self.root.winfo_width()
+        if window_width <= 1:
+            return
+        wraplength = max(window_width - 32, 120)
+        self.path_label.configure(wraplength=wraplength)
+        self.info_label.configure(wraplength=wraplength)
 
     def _bind_shortcuts(self) -> None:
         bindings = [
@@ -473,6 +506,22 @@ class DicomViewer:
             for panel in self.compare_panels.values():
                 if panel["frames"]:
                     self._compare_show_frame(panel["side"])
+
+    def toggle_invert_display(self) -> None:
+        if self.view_mode == "single" and self.frames:
+            self._show_frame()
+            return
+        if self.view_mode == "compare":
+            for panel in self.compare_panels.values():
+                if panel["frames"]:
+                    self._compare_show_frame(panel["side"])
+            return
+        if self.view_mode == "multi":
+            self.render_multiview_page()
+
+    def toggle_grid_overlay(self) -> None:
+        if self.view_mode == "single" and self.frames:
+            self._show_frame()
 
     def _load_overlay_preferences(self) -> None:
         try:
@@ -1391,7 +1440,7 @@ class DicomViewer:
             return cached
 
         try:
-            dataset, frames = self._get_decoded_file(path)
+            dataset, frames = self.dicom_loader.get_decoded_file(path)
             if not frames:
                 return None
             preview = self._build_multiview_thumbnail_image(dataset, frames[0], width, height)
@@ -1507,12 +1556,14 @@ class DicomViewer:
         self.multiview_tile_images.append(photo)
 
     def _build_multiview_thumbnail_image(self, dataset, frame: np.ndarray, width: int, height: int) -> Image.Image:
-        normalized = self._normalize_frame_for_dataset(
+        normalized = self.image_pipeline.normalize_frame_for_dataset(
             dataset=dataset,
             frame=frame,
             window_width=self._get_window_width_from_dataset(dataset),
             window_level=self._get_window_center_from_dataset(dataset),
         )
+        if self.invert_display.get():
+            normalized = 255 - normalized
         image = Image.fromarray(normalized)
         image.thumbnail((max(width, 1), max(height, 1)), Image.Resampling.BILINEAR)
         return image
@@ -2094,7 +2145,7 @@ class DicomViewer:
 
         path = file_paths[index]
         try:
-            dataset, frames = self._get_decoded_file(path)
+            dataset, frames = self.dicom_loader.get_decoded_file(path)
         except Exception as exc:
             messagebox.showerror("열기 실패", f"파일을 읽는 중 오류가 발생했습니다.\n\n{path}\n\n{exc}")
             return
@@ -2300,26 +2351,16 @@ class DicomViewer:
         panel["zoom_var"].set(f"Zoom: {panel['zoom_scale'] * 100:.0f}%")
 
     def _compare_frame_to_photoimage(self, panel: dict[str, Any], frame: np.ndarray) -> ImageTk.PhotoImage:
-        normalized = self._normalize_frame_for_dataset(
+        scale = self._compare_get_effective_zoom_scale(panel, frame)
+        image = self.image_pipeline.frame_to_display_image(
             dataset=panel["dataset"],
             frame=frame,
             window_width=panel["window_width_value"],
             window_level=panel["window_level_value"],
+            scale=scale,
+            invert_display=bool(self.invert_display.get()),
         )
-        image = Image.fromarray(normalized)
-        resized = self._compare_resize_image_for_display(panel, image)
-        return ImageTk.PhotoImage(resized)
-
-    def _compare_resize_image_for_display(self, panel: dict[str, Any], image: Image.Image) -> Image.Image:
-        scale = self._compare_get_effective_zoom_scale(panel, image)
-        if scale == 1.0:
-            return image
-
-        width, height = image.size
-        resized_width = max(int(round(width * scale)), 1)
-        resized_height = max(int(round(height * scale)), 1)
-        resample = Image.Resampling.LANCZOS if scale < 1.0 else Image.Resampling.BICUBIC
-        return image.resize((resized_width, resized_height), resample)
+        return ImageTk.PhotoImage(image)
 
     def _compare_initialize_zoom(self, panel: dict[str, Any], frame: np.ndarray | None) -> None:
         if frame is None:
@@ -2346,8 +2387,15 @@ class DicomViewer:
             return 1.0
         return min(canvas_width / width, canvas_height / height, 1.0)
 
-    def _compare_get_effective_zoom_scale(self, panel: dict[str, Any], image: Image.Image) -> float:
-        fit_scale = self._compare_calculate_fit_scale(panel, *image.size)
+    def _compare_get_effective_zoom_scale(self, panel: dict[str, Any], frame: np.ndarray) -> float:
+        frame_array = np.asarray(frame)
+        if frame_array.ndim == 2:
+            height, width = frame_array.shape
+        elif frame_array.ndim == 3:
+            height, width = frame_array.shape[:2]
+        else:
+            return float(np.clip(panel["zoom_scale"], self.min_zoom_scale, self.max_zoom_scale))
+        fit_scale = self._compare_calculate_fit_scale(panel, width, height)
         if panel["zoom_scale"] <= 0:
             panel["zoom_scale"] = fit_scale
         return float(np.clip(panel["zoom_scale"], self.min_zoom_scale, self.max_zoom_scale))
@@ -2569,9 +2617,8 @@ class DicomViewer:
         self.current_file_index = -1
         self.current_folder_path = None
         self.loaded_from_folder = False
-        self._decoded_cache = {}
+        self.dicom_loader.clear_cache()
         self._metadata_cache = {}
-        self._load_error_cache = {}
         self._clear_multiview_thumbnail_cache()
         self.multiview_info_cache = {}
         self.multiview_tile_meta_cache = {}
@@ -2594,6 +2641,7 @@ class DicomViewer:
         for field in self.overlay_field_definitions:
             self.current_overlay_values[field["key"]] = "N/A"
         self.canvas.delete("overlay")
+        self.canvas.delete("grid")
         self.close_multiview_grid_selector()
         self._update_multiview_controls()
 
@@ -2674,7 +2722,7 @@ class DicomViewer:
                 self._record_excluded_file(result, "non_dicom", path, metadata_error)
                 continue
 
-            transfer_syntax = self._get_transfer_syntax(metadata_dataset)
+            transfer_syntax = self.dicom_loader.get_transfer_syntax(metadata_dataset)
             is_compressed = bool(getattr(transfer_syntax, "is_compressed", False)) if transfer_syntax else False
             if is_compressed:
                 result["compressed_dicom"].append(path)
@@ -2685,7 +2733,7 @@ class DicomViewer:
                 result["multiframe_dicom"].append(path)
 
             try:
-                display_dataset, _ = self._get_decoded_file(path)
+                display_dataset, _ = self.dicom_loader.get_decoded_file(path)
             except ValueError as exc:
                 category = self._categorize_display_failure(str(exc), transfer_syntax)
                 self._record_excluded_file(result, category, path, str(exc))
@@ -2737,41 +2785,16 @@ class DicomViewer:
         except (TypeError, ValueError):
             return 1
 
-    @staticmethod
-    def _get_transfer_syntax(dataset):
-        file_meta = getattr(dataset, "file_meta", None)
-        return getattr(file_meta, "TransferSyntaxUID", None)
-
     def _build_compressed_detail(self, dataset, displayable: bool) -> dict[str, str]:
-        transfer_syntax = self._get_transfer_syntax(dataset)
+        transfer_syntax = self.dicom_loader.get_transfer_syntax(dataset)
         is_compressed = bool(getattr(transfer_syntax, "is_compressed", False)) if transfer_syntax else False
-        decoder_available = self._has_transfer_syntax_handler(transfer_syntax) if transfer_syntax else True
+        decoder_available = self.dicom_loader.has_transfer_syntax_handler(transfer_syntax) if transfer_syntax else True
         return {
             "transfer_syntax_uid": str(transfer_syntax) if transfer_syntax else "Unknown",
             "is_compressed": "예" if is_compressed else "아니오",
             "decoder_available": "예" if decoder_available else "아니오",
             "displayable": "예" if displayable else "아니오",
         }
-
-    def _has_transfer_syntax_handler(self, transfer_syntax) -> bool:
-        if transfer_syntax is None:
-            return True
-
-        try:
-            is_compressed = bool(transfer_syntax.is_compressed)
-        except Exception:
-            is_compressed = False
-
-        if not is_compressed:
-            return True
-
-        for handler in pydicom_config.pixel_data_handlers:
-            try:
-                if handler.is_available() and handler.supports_transfer_syntax(transfer_syntax):
-                    return True
-            except Exception:
-                continue
-        return False
 
     def _build_folder_summary(self, diagnosis: dict[str, list[str]]) -> str:
         return (
@@ -3000,7 +3023,7 @@ class DicomViewer:
         if "Pixel Data가 없는 DICOM 파일" in reason:
             return "no_pixel_data"
         if "전송구문을 해제할 수 있는 픽셀 디코더가 없습니다" in reason:
-            if transfer_syntax is not None and not self._has_transfer_syntax_handler(transfer_syntax):
+            if transfer_syntax is not None and not self.dicom_loader.has_transfer_syntax_handler(transfer_syntax):
                 return "compressed_unsupported"
         return "display_failures"
 
@@ -3082,7 +3105,7 @@ class DicomViewer:
 
         path = self.file_paths[index]
         try:
-            dataset, frames = self._get_decoded_file(path)
+            dataset, frames = self.dicom_loader.get_decoded_file(path)
         except Exception as exc:
             messagebox.showerror("열기 실패", f"파일을 읽는 중 오류가 발생했습니다.\n\n{path}\n\n{exc}")
             return
@@ -3383,99 +3406,6 @@ class DicomViewer:
     def _is_ctrl_pressed(event: tk.Event) -> bool:
         return bool(getattr(event, "state", 0) & 0x0004)
 
-    def _get_decoded_file(self, path: str) -> tuple[pydicom.dataset.FileDataset, list[np.ndarray]]:
-        cached = self._decoded_cache.get(path)
-        if cached is not None:
-            return cached
-
-        cached_error = self._load_error_cache.get(path)
-        if cached_error is not None:
-            raise ValueError(cached_error)
-
-        try:
-            dataset, frames = self._read_dataset_for_display(path)
-        except ValueError as exc:
-            self._load_error_cache[path] = str(exc)
-            raise
-
-        self._decoded_cache[path] = (dataset, frames)
-        return dataset, frames
-
-    def _read_dataset_for_display(self, path: str) -> tuple[pydicom.dataset.FileDataset, list[np.ndarray]]:
-        try:
-            dataset = pydicom.dcmread(path)
-        except InvalidDicomError as exc:
-            raise ValueError("DICOM 형식이 아닌 파일입니다.") from exc
-        except Exception as exc:
-            raise ValueError("DICOM 파일을 읽지 못했습니다.") from exc
-
-        if "PixelData" not in dataset:
-            raise ValueError("Pixel Data가 없는 DICOM 파일입니다.")
-
-        self._ensure_transfer_syntax_supported(dataset, path)
-
-        try:
-            frames = self._extract_frames(dataset)
-        except NotImplementedError as exc:
-            raise ValueError("이 DICOM의 픽셀 형식은 현재 뷰어에서 지원하지 않습니다.") from exc
-        except Exception as exc:
-            if self._is_probable_decode_error(exc):
-                raise ValueError(
-                    "압축된 DICOM 픽셀 데이터를 디코딩하지 못했습니다.\n"
-                    "Windows Python에 `pylibjpeg`, `pylibjpeg-libjpeg`, "
-                    "`pylibjpeg-openjpeg`, `gdcm` 중 필요한 디코더를 설치해 주세요."
-                ) from exc
-            raise
-
-        if not frames:
-            raise ValueError("표시할 프레임이 없습니다.")
-
-        return dataset, frames
-
-    def _extract_frames(self, dataset) -> list[np.ndarray]:
-        pixel_array = apply_modality_lut(dataset.pixel_array, dataset)
-        pixel_array = np.asarray(pixel_array)
-
-        if pixel_array.ndim == 2:
-            return [pixel_array]
-
-        if pixel_array.ndim == 3:
-            if getattr(dataset, "SamplesPerPixel", 1) == 3:
-                return [pixel_array]
-            return [pixel_array[index] for index in range(pixel_array.shape[0])]
-
-        if pixel_array.ndim == 4 and pixel_array.shape[-1] == 3:
-            return [pixel_array[index] for index in range(pixel_array.shape[0])]
-
-        raise ValueError(f"지원하지 않는 이미지 차원입니다: {pixel_array.shape}")
-
-    def _ensure_transfer_syntax_supported(self, dataset, _path: str) -> None:
-        transfer_syntax = self._get_transfer_syntax(dataset)
-        if transfer_syntax is None:
-            return
-        if self._has_transfer_syntax_handler(transfer_syntax):
-            return
-
-        raise ValueError(
-            "압축된 DICOM 전송구문을 해제할 수 있는 픽셀 디코더가 없습니다.\n"
-            f"Transfer Syntax: {transfer_syntax}\n"
-            "Windows Python에 `pylibjpeg`, `pylibjpeg-libjpeg`, "
-            "`pylibjpeg-openjpeg`, `gdcm` 중 필요한 디코더를 설치해 주세요."
-        )
-
-    @staticmethod
-    def _is_probable_decode_error(exc: Exception) -> bool:
-        text = str(exc).lower()
-        keywords = (
-            "decoder",
-            "decompress",
-            "compressed",
-            "transfer syntax",
-            "pixel data handler",
-            "missing required element",
-        )
-        return any(keyword in text for keyword in keywords)
-
     def _build_info_text(self, dataset, frames: list[np.ndarray]) -> str:
         patient_name = str(getattr(dataset, "PatientName", "Unknown"))
         modality = getattr(dataset, "Modality", "Unknown")
@@ -3558,9 +3488,97 @@ class DicomViewer:
             self._center_view_for_content(content_width, content_height)
         else:
             self._restore_view_center_ratio(center_ratio)
+        self._draw_single_view_grid(
+            frame=frame,
+            content_width=content_width,
+            content_height=content_height,
+        )
         self._draw_single_view_overlays()
+        self.cursor_var.set("좌표: -")
         self.frame_var.set(f"프레임: {self.current_frame + 1} / {len(self.frames)}")
         self._update_zoom_label()
+
+    def _draw_single_view_grid(
+        self,
+        frame: np.ndarray,
+        content_width: float,
+        content_height: float,
+    ) -> None:
+        self.canvas.delete("grid")
+        if self.view_mode != "single" or not self.show_grid_overlay.get() or self.photo_image is None:
+            return
+
+        frame_array = np.asarray(frame)
+        if frame_array.ndim == 2:
+            frame_height, frame_width = frame_array.shape
+        elif frame_array.ndim == 3:
+            frame_height, frame_width = frame_array.shape[:2]
+        else:
+            return
+        if frame_width <= 0 or frame_height <= 0:
+            return
+
+        display_width = self.photo_image.width()
+        display_height = self.photo_image.height()
+        if display_width <= 0 or display_height <= 0:
+            return
+
+        image_left = (content_width - display_width) / 2.0
+        image_top = (content_height - display_height) / 2.0
+        scale_x = display_width / frame_width
+        scale_y = display_height / frame_height
+        pixel_step_x = max(1, int(np.ceil(20.0 / scale_x)))
+        pixel_step_y = max(1, int(np.ceil(20.0 / scale_y)))
+
+        for x in range(0, frame_width + 1, pixel_step_x):
+            canvas_x = image_left + x * scale_x
+            self.canvas.create_line(
+                canvas_x,
+                image_top,
+                canvas_x,
+                image_top + display_height,
+                fill="#66ff66",
+                width=1,
+                stipple="gray50",
+                tags=("grid",),
+            )
+        if frame_width % pixel_step_x != 0:
+            canvas_x = image_left + display_width
+            self.canvas.create_line(
+                canvas_x,
+                image_top,
+                canvas_x,
+                image_top + display_height,
+                fill="#66ff66",
+                width=1,
+                stipple="gray50",
+                tags=("grid",),
+            )
+
+        for y in range(0, frame_height + 1, pixel_step_y):
+            canvas_y = image_top + y * scale_y
+            self.canvas.create_line(
+                image_left,
+                canvas_y,
+                image_left + display_width,
+                canvas_y,
+                fill="#66ff66",
+                width=1,
+                stipple="gray50",
+                tags=("grid",),
+            )
+        if frame_height % pixel_step_y != 0:
+            canvas_y = image_top + display_height
+            self.canvas.create_line(
+                image_left,
+                canvas_y,
+                image_left + display_width,
+                canvas_y,
+                fill="#66ff66",
+                width=1,
+                stipple="gray50",
+                tags=("grid",),
+            )
 
     def _on_canvas_resize(self, event: tk.Event) -> None:
         canvas_size = (event.width, event.height)
@@ -3572,25 +3590,85 @@ class DicomViewer:
             self._show_frame()
             self._restore_view_center_ratio(center_ratio)
 
-    def _frame_to_photoimage(self, frame: np.ndarray) -> ImageTk.PhotoImage:
-        normalized = self._normalize_frame(frame)
-        image = Image.fromarray(normalized)
-        resized = self._resize_image_for_display(image)
-        return ImageTk.PhotoImage(resized)
-
-    def _resize_image_for_display(self, image: Image.Image) -> Image.Image:
-        scale = self._get_effective_zoom_scale(image)
-        if scale == 1.0:
-            return image
-
-        width, height = image.size
-        resized_width = max(int(round(width * scale)), 1)
-        resized_height = max(int(round(height * scale)), 1)
-        if scale < 1.0:
-            resample = Image.Resampling.LANCZOS
+    def _on_canvas_mouse_move(self, event: tk.Event) -> None:
+        if self.view_mode != "single" or not self.frames or self.photo_image is None:
+            self.cursor_var.set("좌표: -")
+            return
+        frame = np.asarray(self.frames[self.current_frame])
+        if frame.ndim == 2:
+            frame_height, frame_width = frame.shape
+        elif frame.ndim == 3:
+            frame_height, frame_width = frame.shape[:2]
         else:
-            resample = Image.Resampling.BICUBIC
-        return image.resize((resized_width, resized_height), resample)
+            self.cursor_var.set("좌표: -")
+            return
+
+        coords = self._map_canvas_to_frame_pixel(
+            canvas=self.canvas,
+            event_x=event.x,
+            event_y=event.y,
+            display_width=self.photo_image.width(),
+            display_height=self.photo_image.height(),
+            frame_width=frame_width,
+            frame_height=frame_height,
+        )
+        if coords is None:
+            self.cursor_var.set("좌표: -")
+            return
+        x, y = coords
+        self.cursor_var.set(f"좌표: ({x}, {y})")
+
+    def _on_canvas_mouse_leave(self, _event: tk.Event) -> None:
+        self.cursor_var.set("좌표: -")
+
+    @staticmethod
+    def _map_canvas_to_frame_pixel(
+        canvas: tk.Canvas,
+        event_x: float,
+        event_y: float,
+        display_width: int,
+        display_height: int,
+        frame_width: int,
+        frame_height: int,
+    ) -> tuple[int, int] | None:
+        if display_width <= 0 or display_height <= 0 or frame_width <= 0 or frame_height <= 0:
+            return None
+
+        bbox = canvas.bbox("all")
+        canvas_width = canvas.winfo_width()
+        canvas_height = canvas.winfo_height()
+        content_width = max(bbox[2] if bbox else canvas_width, canvas_width, 1)
+        content_height = max(bbox[3] if bbox else canvas_height, canvas_height, 1)
+
+        image_left = (content_width - display_width) / 2.0
+        image_top = (content_height - display_height) / 2.0
+        x_on_canvas = canvas.canvasx(event_x)
+        y_on_canvas = canvas.canvasy(event_y)
+
+        if x_on_canvas < image_left or y_on_canvas < image_top:
+            return None
+        if x_on_canvas >= image_left + display_width or y_on_canvas >= image_top + display_height:
+            return None
+
+        rel_x = x_on_canvas - image_left
+        rel_y = y_on_canvas - image_top
+        pixel_x = int(rel_x * frame_width / display_width)
+        pixel_y = int(rel_y * frame_height / display_height)
+        pixel_x = int(np.clip(pixel_x, 0, frame_width - 1))
+        pixel_y = int(np.clip(pixel_y, 0, frame_height - 1))
+        return pixel_x, pixel_y
+
+    def _frame_to_photoimage(self, frame: np.ndarray) -> ImageTk.PhotoImage:
+        scale = self._get_effective_zoom_scale(frame)
+        image = self.image_pipeline.frame_to_display_image(
+            dataset=self.dataset,
+            frame=frame,
+            window_width=self.window_width_value,
+            window_level=self.window_level_value,
+            scale=scale,
+            invert_display=bool(self.invert_display.get()),
+        )
+        return ImageTk.PhotoImage(image)
 
     def _initialize_zoom(self, frame: np.ndarray | None) -> None:
         if frame is None:
@@ -3616,8 +3694,15 @@ class DicomViewer:
             return 1.0
         return min(canvas_width / width, canvas_height / height, 1.0)
 
-    def _get_effective_zoom_scale(self, image: Image.Image) -> float:
-        fit_scale = self._calculate_fit_scale(*image.size)
+    def _get_effective_zoom_scale(self, frame: np.ndarray) -> float:
+        frame_array = np.asarray(frame)
+        if frame_array.ndim == 2:
+            height, width = frame_array.shape
+        elif frame_array.ndim == 3:
+            height, width = frame_array.shape[:2]
+        else:
+            return float(np.clip(self.zoom_scale, self.min_zoom_scale, self.max_zoom_scale))
+        fit_scale = self._calculate_fit_scale(width, height)
         if self.zoom_scale <= 0:
             self.zoom_scale = fit_scale
         return float(np.clip(self.zoom_scale, self.min_zoom_scale, self.max_zoom_scale))
@@ -3677,74 +3762,6 @@ class DicomViewer:
 
     def _center_view_for_content(self, content_width: float, content_height: float) -> None:
         self._set_view_center(content_width / 2, content_height / 2)
-
-    def _normalize_frame(self, frame: np.ndarray) -> np.ndarray:
-        return self._normalize_frame_for_dataset(
-            dataset=self.dataset,
-            frame=frame,
-            window_width=self.window_width_value,
-            window_level=self.window_level_value,
-        )
-
-    def _normalize_frame_for_dataset(
-        self,
-        dataset,
-        frame: np.ndarray,
-        window_width: float | None,
-        window_level: float | None,
-    ) -> np.ndarray:
-        array = np.asarray(frame, dtype=np.float32)
-        if array.ndim == 2:
-            array = self._apply_window_level_to_array(array, window_width, window_level)
-            array = self._scale_to_uint8(array)
-            return self._apply_photometric_interpretation(array, dataset)
-
-        if array.ndim == 3 and array.shape[-1] == 3:
-            channels = [self._scale_to_uint8(array[..., index]) for index in range(3)]
-            return np.stack(channels, axis=-1)
-
-        raise ValueError(f"지원하지 않는 프레임 형식입니다: {array.shape}")
-
-    def _apply_photometric_interpretation(self, array: np.ndarray, dataset) -> np.ndarray:
-        photometric = str(getattr(dataset, "PhotometricInterpretation", "")).upper()
-        if photometric == "MONOCHROME1":
-            # MONOCHROME1 means lower values should appear brighter, so invert after
-            # window/level clipping and 8-bit scaling.
-            return 255 - array
-        return array
-
-    def _apply_window_level(self, array: np.ndarray) -> np.ndarray:
-        return self._apply_window_level_to_array(
-            array,
-            self.window_width_value,
-            self.window_level_value,
-        )
-
-    def _apply_window_level_to_array(
-        self,
-        array: np.ndarray,
-        window_width: float | None,
-        window_level: float | None,
-    ) -> np.ndarray:
-        if window_level is None or window_width is None:
-            return array
-        center = float(window_level)
-        width = float(window_width)
-        if width <= 1:
-            width = 1.0
-
-        lower = center - width / 2.0
-        upper = center + width / 2.0
-        return np.clip(array, lower, upper)
-
-    @staticmethod
-    def _scale_to_uint8(array: np.ndarray) -> np.ndarray:
-        minimum = float(np.min(array))
-        maximum = float(np.max(array))
-        if maximum == minimum:
-            return np.zeros(array.shape, dtype=np.uint8)
-        scaled = (array - minimum) / (maximum - minimum)
-        return np.clip(scaled * 255.0, 0, 255).astype(np.uint8)
 
 def main() -> None:
     root = tk.Tk()
