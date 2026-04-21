@@ -977,7 +977,31 @@ class DicomViewer:
 
     def _build_roi_analysis_options(self) -> list[tuple[str, str]]:
         options: list[tuple[str, str]] = []
+        roi_display_indices = self._get_current_roi_display_indices()
+        for measurement in self.persistent_measurements:
+            if measurement.kind != "roi":
+                continue
+            roi_index = roi_display_indices.get(measurement.id)
+            if roi_index is None:
+                continue
+            metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
+            signal_stats = dict(metrics.get("signal_stats") or {})
+            mean = float(signal_stats.get("mean", 0.0))
+            min_val = float(signal_stats.get("min", 0.0))
+            std = float(signal_stats.get("std", 0.0))
+            area_mm2 = metrics.get("area_mm2")
+            area_text = f"{area_mm2:.1f} mm²" if isinstance(area_mm2, (int, float)) else f"{metrics['area_px']:.1f} px²"
+            label = (
+                f"{roi_index}번 ROI | 최소값 {min_val:.1f} | 평균값 {mean:.1f} | "
+                f"표준편차 {std:.1f} | 면적 {area_text}"
+            )
+            options.append((measurement.id, label))
+        return options
+
+    def _get_current_roi_display_indices(self) -> dict[str, int]:
+        roi_display_indices: dict[str, int] = {}
         current_geometry = self._get_current_geometry_key()
+        roi_index = 0
         for measurement in self.persistent_measurements:
             if measurement.kind != "roi":
                 continue
@@ -985,15 +1009,9 @@ class DicomViewer:
                 continue
             if measurement.frame_index != self.current_frame:
                 continue
-            metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
-            signal_stats = dict(metrics.get("signal_stats") or {})
-            mean = float(signal_stats.get("mean", 0.0))
-            std = float(signal_stats.get("std", 0.0))
-            area_mm2 = metrics.get("area_mm2")
-            area_text = f"{area_mm2:.1f} mm²" if isinstance(area_mm2, (int, float)) else f"{metrics['area_px']:.1f} px²"
-            label = f"ROI {measurement.id[:8]} | mean {mean:.1f} | std {std:.1f} | area {area_text}"
-            options.append((measurement.id, label))
-        return options
+            roi_index += 1
+            roi_display_indices[measurement.id] = roi_index
+        return roi_display_indices
 
     def _build_line_analysis_options(self) -> list[tuple[str, str]]:
         options: list[tuple[str, str]] = []
@@ -5427,6 +5445,7 @@ class DicomViewer:
         self.canvas.delete("persistent_measurement")
         self._persistent_canvas_item_to_measurement_id = {}
         current_geometry = self._get_current_geometry_key()
+        roi_display_indices = self._get_current_roi_display_indices()
         grid_roi_measurements: list[Measurement] = []
         occupied_label_boxes: list[tuple[float, float, float, float]] = []
         for measurement in self.persistent_measurements:
@@ -5444,15 +5463,27 @@ class DicomViewer:
             measurement.meta = self._canonicalize_measurement_meta(measurement, metrics)
             selected = measurement.id == self.selected_persistent_measurement_id
             if measurement.kind == "roi":
+                roi_index = roi_display_indices.get(measurement.id)
+                roi_label_prefix = f"{roi_index}번 ROI" if roi_index is not None else "ROI"
                 outline = "#ffdc5e" if selected else "#ff7f50"
                 item_id = self.canvas.create_rectangle(
                     sx, sy, ex, ey, outline=outline, width=3 if selected else 2, tags=("persistent_measurement",)
                 )
                 self.register_measurement_hit_target(item_id, measurement.id)
                 if measurement.meta.get("grid_cell") is not None:
+                    self.canvas.create_text(
+                        min(sx, ex) + 4,
+                        min(sy, ey) + 4,
+                        text=roi_label_prefix,
+                        fill="#F9FAFB",
+                        anchor="nw",
+                        font=("TkDefaultFont", 8, "bold"),
+                        tags=("persistent_measurement",),
+                    )
                     grid_roi_measurements.append(measurement)
                     continue
                 primary_label, secondary_label = self._build_measurement_label_parts("roi", metrics)
+                primary_label = f"{roi_label_prefix} | {primary_label}"
                 rect_box = (min(sx, ex), min(sy, ey), max(sx, ex), max(sy, ey))
                 occupied_label_boxes.append(rect_box)
             elif measurement.kind == "line":
