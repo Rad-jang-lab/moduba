@@ -91,6 +91,7 @@ class DicomViewer:
         self._window_drag_base: tuple[float, float] | None = None
         self.invert_display = tk.BooleanVar(value=False)
         self.show_grid_overlay = tk.BooleanVar(value=False)
+        self.include_overlays_in_export = tk.BooleanVar(value=True)
         self.grid_spacing_presets_px = (2, 4, 6, 8, 10, 12, 16, 20, 24, 32)
         self.grid_spacing_mode = tk.StringVar(value="8")
         self.grid_spacing_custom_px = tk.IntVar(value=8)
@@ -103,7 +104,14 @@ class DicomViewer:
         self.grid_cell_size_var = tk.StringVar(value="Grid cell size: 8 px")
         self.cursor_var = tk.StringVar(value="Cursor: -, -")
         self.measurement_mode = tk.StringVar(value="pan")
+        self.roi_propagation_enabled = tk.BooleanVar(value=False)
+        self.roi_propagation_scope = tk.StringVar(value="next")
         self._active_preview_measurement: dict[str, Any] | None = None
+        self._line_snap_anchor: tuple[int, int] | None = None
+        self.crop_mode_active = tk.BooleanVar(value=False)
+        self._active_crop_start: tuple[float, float] | None = None
+        self._active_crop_end: tuple[float, float] | None = None
+        self._active_crop_item_id: int | None = None
         self.persistent_measurements: list[Measurement] = []
         self.selected_persistent_measurement_id: str | None = None
         self.selected_persistent_measurement_ids: set[str] = set()
@@ -497,7 +505,7 @@ class DicomViewer:
         return strip
 
     def _build_home_toolbar(self, tab: ttk.Frame) -> None:
-        sections = self._build_subtoolbar_sections(tab, ["View", "Compare", "Overlay"])
+        sections = self._build_subtoolbar_sections(tab, ["View", "Compare", "Overlay", "Output"])
 
         self.diagnose_button = ttk.Button(sections["View"], text="폴더 진단", command=self.diagnose_folder)
         self.diagnose_button.pack(side="left")
@@ -532,8 +540,17 @@ class DicomViewer:
         ).pack(side="left", padx=(8, 0))
         ttk.Button(sections["Overlay"], text="오버레이 항목 설정", command=self.open_overlay_settings).pack(side="left", padx=(8, 0))
 
+        ttk.Checkbutton(
+            sections["Output"],
+            text="ROI/Line 오버레이 포함",
+            variable=self.include_overlays_in_export,
+        ).pack(side="left")
+        ttk.Button(sections["Output"], text="현재 이미지 저장", command=self.export_current_image).pack(side="left", padx=(8, 0))
+        ttk.Button(sections["Output"], text="측정 CSV 저장", command=self.export_measurements_csv).pack(side="left", padx=(8, 0))
+        ttk.Button(sections["Output"], text="프레임 일괄 저장", command=self.export_all_frames).pack(side="left", padx=(8, 0))
+
     def _build_image_toolbar(self, tab: ttk.Frame) -> None:
-        sections = self._build_subtoolbar_sections(tab, ["File", "Navigate", "Display"])
+        sections = self._build_subtoolbar_sections(tab, ["File", "Navigate", "Display", "Transform"])
 
         self.open_file_button = ttk.Button(sections["File"], text="DICOM 열기", command=self.open_file)
         self.open_file_button.pack(side="left")
@@ -557,6 +574,11 @@ class DicomViewer:
             variable=self.invert_display,
             command=self._refresh_single_view_image,
         ).pack(side="left", padx=(8, 0))
+        ttk.Button(sections["Transform"], text="Crop 선택", command=self.enable_crop_mode).pack(side="left")
+        ttk.Button(sections["Transform"], text="Crop 취소", command=self.cancel_crop_mode).pack(side="left", padx=(8, 0))
+        ttk.Button(sections["Transform"], text="Rotate 90°", command=lambda: self.rotate_current_image(90)).pack(side="left", padx=(16, 0))
+        ttk.Button(sections["Transform"], text="Rotate 180°", command=lambda: self.rotate_current_image(180)).pack(side="left", padx=(8, 0))
+        ttk.Button(sections["Transform"], text="Rotate 270°", command=lambda: self.rotate_current_image(270)).pack(side="left", padx=(8, 0))
 
     def _build_measure_toolbar(self, tab: ttk.Frame) -> None:
         strip = self._build_grouped_toolbar_strip(tab)
@@ -621,6 +643,23 @@ class DicomViewer:
         ttk.Button(measurement_group, text="Grid ROI Summary", command=self._show_grid_roi_combined_summary).grid(
             row=2, column=0, sticky="ew", pady=(6, 0)
         )
+        ttk.Checkbutton(
+            measurement_group,
+            text="ROI Propagation",
+            variable=self.roi_propagation_enabled,
+        ).grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Radiobutton(
+            measurement_group,
+            text="Next frame/image",
+            value="next",
+            variable=self.roi_propagation_scope,
+        ).grid(row=4, column=0, sticky="w")
+        ttk.Radiobutton(
+            measurement_group,
+            text="All navigated targets",
+            value="all",
+            variable=self.roi_propagation_scope,
+        ).grid(row=5, column=0, sticky="w")
 
         analysis_group = ttk.LabelFrame(strip, text="Analysis", padding=(8, 6))
         analysis_group.pack(side="left", padx=(0, 8), fill="y")
@@ -3151,6 +3190,7 @@ class DicomViewer:
         self.canvas.delete("overlay")
         self.canvas.delete("grid_overlay")
         self.clear_preview_overlay()
+        self.cancel_crop_mode()
         self._image_bbox = None
         self.close_multiview_grid_selector()
         self._update_multiview_controls()
@@ -3750,6 +3790,12 @@ class DicomViewer:
         self._window_drag_base = None
 
     def _handle_left_button_press(self, event: tk.Event) -> None:
+        if self.crop_mode_active.get():
+            self._start_crop_selection(event)
+            return
+        if self._should_use_grid_snapped_line_mode() and not self._is_ctrl_pressed(event):
+            self._handle_grid_snapped_line_click(event)
+            return
         if self._select_persistent_measurement_at_event(event):
             return
         if self.measurement_mode.get() == "pan":
@@ -3758,12 +3804,24 @@ class DicomViewer:
         self._start_preview_measurement(event)
 
     def _handle_left_button_drag(self, event: tk.Event) -> None:
+        if self.crop_mode_active.get():
+            self._update_crop_selection(event)
+            return
+        if self._should_use_grid_snapped_line_mode():
+            self._update_grid_snapped_line_preview(event)
+            return
         if self.measurement_mode.get() == "pan":
             self._update_pan(event)
             return
         self._update_preview_measurement(event)
 
     def _handle_left_button_release(self, event: tk.Event) -> None:
+        if self.crop_mode_active.get():
+            self._finish_crop_selection(event)
+            return
+        if self._should_use_grid_snapped_line_mode():
+            self._update_grid_snapped_line_preview(event)
+            return
         if self.measurement_mode.get() == "pan":
             self._end_pan(event)
             return
@@ -3795,6 +3853,115 @@ class DicomViewer:
             self._draw_single_view_overlays()
         return
 
+    def enable_crop_mode(self) -> None:
+        if not self.frames or self.view_mode != "single":
+            messagebox.showinfo("안내", "Crop은 단일 보기에서 이미지를 연 상태에서만 사용할 수 있습니다.")
+            return
+        self.crop_mode_active.set(True)
+        self.cursor_var.set("Cursor: Crop 모드 (드래그하여 영역 선택)")
+
+    def cancel_crop_mode(self) -> None:
+        self.crop_mode_active.set(False)
+        self._active_crop_start = None
+        self._active_crop_end = None
+        if self._active_crop_item_id is not None:
+            self.canvas.delete(self._active_crop_item_id)
+            self._active_crop_item_id = None
+
+    def _start_crop_selection(self, event: tk.Event) -> None:
+        start = self._canvas_to_image_coords(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        if start is None:
+            return
+        self._active_crop_start = start
+        self._active_crop_end = start
+        if self._active_crop_item_id is not None:
+            self.canvas.delete(self._active_crop_item_id)
+        start_canvas = self._image_coords_to_canvas(*start)
+        if start_canvas is None:
+            return
+        sx, sy = start_canvas
+        self._active_crop_item_id = self.canvas.create_rectangle(
+            sx,
+            sy,
+            sx,
+            sy,
+            outline="#ffd34d",
+            width=2,
+            dash=(4, 2),
+            tags=("temp_measurement",),
+        )
+
+    def _update_crop_selection(self, event: tk.Event) -> None:
+        if self._active_crop_start is None or self._active_crop_item_id is None:
+            return
+        end = self._canvas_to_image_coords(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        if end is None:
+            return
+        self._active_crop_end = end
+        start_canvas = self._image_coords_to_canvas(*self._active_crop_start)
+        end_canvas = self._image_coords_to_canvas(*end)
+        if start_canvas is None or end_canvas is None:
+            return
+        sx, sy = start_canvas
+        ex, ey = end_canvas
+        self.canvas.coords(self._active_crop_item_id, sx, sy, ex, ey)
+
+    def _finish_crop_selection(self, event: tk.Event) -> None:
+        self._update_crop_selection(event)
+        if self._active_crop_start is None or self._active_crop_end is None:
+            return
+        x0 = int(np.floor(min(self._active_crop_start[0], self._active_crop_end[0])))
+        y0 = int(np.floor(min(self._active_crop_start[1], self._active_crop_end[1])))
+        x1 = int(np.ceil(max(self._active_crop_start[0], self._active_crop_end[0])))
+        y1 = int(np.ceil(max(self._active_crop_start[1], self._active_crop_end[1])))
+        self.cancel_crop_mode()
+        self.apply_crop(x0, y0, x1, y1)
+
+    def _confirm_measurement_reset_for_transform(self, action_name: str) -> bool:
+        if not self.persistent_measurements:
+            return True
+        keep_going = messagebox.askyesno(
+            "측정 초기화 확인",
+            f"{action_name}을(를) 적용하면 현재 측정값 좌표 정합성이 보장되지 않아 측정을 초기화합니다.\n계속하시겠습니까?",
+        )
+        if not keep_going:
+            return False
+        self.clear_persistent_measurements()
+        return True
+
+    def apply_crop(self, x0: int, y0: int, x1: int, y1: int) -> None:
+        if not self.frames:
+            return
+        frame = np.asarray(self.frames[self.current_frame])
+        if frame.ndim < 2:
+            return
+        height, width = frame.shape[:2]
+        x0 = int(np.clip(min(x0, x1), 0, width - 1))
+        y0 = int(np.clip(min(y0, y1), 0, height - 1))
+        x1 = int(np.clip(max(x0 + 1, x1), 1, width))
+        y1 = int(np.clip(max(y0 + 1, y1), 1, height))
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            messagebox.showwarning("Crop 취소", "최소 2x2 px 이상의 영역을 선택해 주세요.")
+            return
+        if not self._confirm_measurement_reset_for_transform("Crop"):
+            return
+        self.frames = [np.asarray(frame_item)[y0:y1, x0:x1].copy() for frame_item in self.frames]
+        self._initialize_window_level(self.dataset, self.frames)
+        self.fit_to_window()
+
+    def rotate_current_image(self, angle: int) -> None:
+        if not self.frames:
+            return
+        rotation_map = {90: 1, 180: 2, 270: 3}
+        if angle not in rotation_map:
+            return
+        if not self._confirm_measurement_reset_for_transform(f"Rotate {angle}°"):
+            return
+        k = rotation_map[angle]
+        self.frames = [np.rot90(np.asarray(frame_item), k=k).copy() for frame_item in self.frames]
+        self._initialize_window_level(self.dataset, self.frames)
+        self.fit_to_window()
+
     def _update_cursor_coordinates(self, event: tk.Event) -> None:
         if not self.frames:
             self.cursor_var.set("Cursor: -, -")
@@ -3805,6 +3972,86 @@ class DicomViewer:
             return
         x, y = coords
         self.cursor_var.set(f"Cursor: ({x}, {y})")
+
+    def _should_use_grid_snapped_line_mode(self) -> bool:
+        return self.measurement_mode.get() == "line" and self.show_grid_overlay.get() and self.view_mode == "single"
+
+    def _snap_image_point_to_grid_intersection(self, point: tuple[int, int]) -> tuple[int, int]:
+        if not self.frames:
+            return point
+        frame_array = np.asarray(self.frames[self.current_frame])
+        if frame_array.ndim < 2:
+            return point
+        height, width = frame_array.shape[:2]
+        spacing = self._get_grid_spacing_px()
+        x, y = point
+        snapped_x = int(np.clip(round(x / spacing) * spacing, 0, width - 1))
+        snapped_y = int(np.clip(round(y / spacing) * spacing, 0, height - 1))
+        return snapped_x, snapped_y
+
+    def _handle_grid_snapped_line_click(self, event: tk.Event) -> None:
+        click_point = self._canvas_to_image_pixel(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        if click_point is None:
+            return
+        snapped = self._snap_image_point_to_grid_intersection(click_point)
+        if self._line_snap_anchor is None:
+            self._line_snap_anchor = snapped
+            canvas_point = self._image_pixel_to_canvas(snapped[0], snapped[1])
+            if canvas_point is None:
+                return
+            sx, sy = canvas_point
+            self.canvas.delete("temp_measurement")
+            self._active_preview_measurement = {
+                "mode": "line_snap",
+                "start": snapped,
+            }
+            self.canvas.create_line(sx, sy, sx, sy, fill="#7bdff2", width=2, tags=("temp_measurement",))
+            return
+
+        measurement = self._append_persistent_measurement("line", self._line_snap_anchor, snapped)
+        if measurement is not None:
+            self._update_guided_snr_selection(measurement)
+        self._line_snap_anchor = None
+        self._active_preview_measurement = None
+        self.canvas.delete("temp_measurement")
+        self._draw_persistent_measurements()
+
+    def _update_grid_snapped_line_preview(self, event: tk.Event) -> None:
+        if self._line_snap_anchor is None:
+            return
+        cursor_point = self._canvas_to_image_pixel(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        if cursor_point is None:
+            return
+        snapped = self._snap_image_point_to_grid_intersection(cursor_point)
+        start_canvas = self._image_pixel_to_canvas(self._line_snap_anchor[0], self._line_snap_anchor[1])
+        end_canvas = self._image_pixel_to_canvas(snapped[0], snapped[1])
+        if start_canvas is None or end_canvas is None:
+            return
+        sx, sy = start_canvas
+        ex, ey = end_canvas
+        self.canvas.delete("temp_measurement")
+        self.canvas.create_line(sx, sy, ex, ey, fill="#7bdff2", width=2, tags=("temp_measurement",))
+        preview_measurement = Measurement(
+            id="preview",
+            kind="line",
+            start=(float(self._line_snap_anchor[0]), float(self._line_snap_anchor[1])),
+            end=(float(snapped[0]), float(snapped[1])),
+            frame_index=int(self.current_frame),
+            geometry_key=self._get_current_geometry_key() or "",
+            summary_text="",
+            meta={},
+        )
+        metrics = self.compute_measurement(preview_measurement, self._get_frame_pixel_array(self.current_frame))
+        primary_label, secondary_label = self._build_measurement_label_parts("line", metrics)
+        self._draw_measurement_label(
+            self.canvas,
+            ex + 6,
+            ey - 6,
+            primary_label,
+            secondary_label,
+            tags=("temp_measurement",),
+            anchor="sw",
+        )
 
     def _canvas_to_image_pixel(self, canvas_x: float, canvas_y: float) -> tuple[int, int] | None:
         image_coords = self._canvas_to_image_coords(canvas_x, canvas_y)
@@ -4375,7 +4622,9 @@ class DicomViewer:
 
     def clear_preview_overlay(self) -> None:
         self._active_preview_measurement = None
+        self._line_snap_anchor = None
         self.canvas.delete("temp_measurement")
+        self._active_crop_item_id = None
 
     def clear_persistent_measurements(self) -> None:
         self.persistent_measurements = []
@@ -4457,9 +4706,14 @@ class DicomViewer:
         self._persistent_canvas_item_to_measurement_id[item_id] = measurement_id
 
     def _get_current_geometry_key(self) -> str | None:
+        return self._get_geometry_key_for_frame(self.current_frame)
+
+    def _get_geometry_key_for_frame(self, frame_index: int) -> str | None:
         if self.dataset is None or not self.frames:
             return None
-        frame = np.asarray(self.frames[self.current_frame])
+        if not (0 <= frame_index < len(self.frames)):
+            return None
+        frame = np.asarray(self.frames[frame_index])
         if frame.ndim < 2:
             return None
         key = {
@@ -4470,7 +4724,7 @@ class DicomViewer:
             "orientation": getattr(self.dataset, "ImageOrientationPatient", None),
             "position": getattr(self.dataset, "ImagePositionPatient", None),
             "sop": getattr(self.dataset, "SOPInstanceUID", None),
-            "frame_index": int(self.current_frame),
+            "frame_index": int(frame_index),
         }
         return json.dumps(key, sort_keys=True, default=str)
 
@@ -4502,6 +4756,95 @@ class DicomViewer:
         measurement.meta = self._canonicalize_measurement_meta(measurement, metrics)
         self.persistent_measurements.append(measurement)
         return measurement
+
+    def _propagate_rois_from_geometry(
+        self,
+        source_geometry_key: str | None,
+        source_frame_index: int,
+        navigation_step: int = 1,
+    ) -> None:
+        if not self.roi_propagation_enabled.get():
+            return
+        if source_geometry_key is None:
+            return
+        target_geometry_key = self._get_current_geometry_key()
+        if target_geometry_key is None or target_geometry_key == source_geometry_key:
+            return
+        scope = self.roi_propagation_scope.get()
+        if scope == "next" and abs(navigation_step) != 1:
+            return
+
+        source_rois = [
+            measurement
+            for measurement in self.persistent_measurements
+            if measurement.kind == "roi"
+            and measurement.frame_index == source_frame_index
+            and self._geometry_matches(measurement.geometry_key, source_geometry_key)
+        ]
+        if not source_rois:
+            return
+        target_frame = np.asarray(self.frames[self.current_frame]) if self.frames else None
+        if target_frame is None or target_frame.ndim < 2:
+            return
+        target_height, target_width = target_frame.shape[:2]
+
+        for source in source_rois:
+            if not self._roi_fits_target_frame(source, target_width, target_height):
+                continue
+            if self._has_equivalent_roi_for_target(source, target_geometry_key, self.current_frame):
+                continue
+            propagated = Measurement(
+                id=str(uuid.uuid4()),
+                kind="roi",
+                start=(float(source.start[0]), float(source.start[1])),
+                end=(float(source.end[0]), float(source.end[1])),
+                frame_index=int(self.current_frame),
+                geometry_key=target_geometry_key,
+                summary_text="",
+                meta=dict(source.meta or {}),
+            )
+            propagated.meta["propagated_from"] = source.id
+            metrics = self.compute_measurement(propagated, self._get_frame_pixel_array(propagated.frame_index))
+            propagated.summary_text = metrics["summary"]
+            propagated.meta = self._canonicalize_measurement_meta(propagated, metrics)
+            self.persistent_measurements.append(propagated)
+
+    @staticmethod
+    def _roi_fits_target_frame(source: Measurement, target_width: int, target_height: int) -> bool:
+        x_values = (source.start[0], source.end[0])
+        y_values = (source.start[1], source.end[1])
+        return (
+            min(x_values) >= 0
+            and min(y_values) >= 0
+            and max(x_values) < target_width
+            and max(y_values) < target_height
+        )
+
+    @staticmethod
+    def _roi_coordinates_match(left: Measurement, right: Measurement) -> bool:
+        return (
+            abs(left.start[0] - right.start[0]) < 0.5
+            and abs(left.start[1] - right.start[1]) < 0.5
+            and abs(left.end[0] - right.end[0]) < 0.5
+            and abs(left.end[1] - right.end[1]) < 0.5
+        )
+
+    def _has_equivalent_roi_for_target(
+        self,
+        source: Measurement,
+        target_geometry_key: str,
+        target_frame_index: int,
+    ) -> bool:
+        for measurement in self.persistent_measurements:
+            if measurement.kind != "roi":
+                continue
+            if measurement.frame_index != target_frame_index:
+                continue
+            if not self._geometry_matches(measurement.geometry_key, target_geometry_key):
+                continue
+            if self._roi_coordinates_match(measurement, source):
+                return True
+        return False
 
     def _draw_persistent_measurements(self) -> None:
         self.canvas.delete("persistent_measurement")
@@ -4992,15 +5335,23 @@ class DicomViewer:
         cnr = abs(signal_mean - background_mean) / noise_std
         messagebox.showinfo("CNR", f"CNR = {cnr:.4f}")
 
-    def _render_measurements_on_image(self, image: Image.Image, include_labels: bool = True, include_grid: bool = False) -> Image.Image:
+    def _render_measurements_on_image(
+        self,
+        image: Image.Image,
+        frame_index: int,
+        include_labels: bool = True,
+        include_grid: bool = False,
+    ) -> Image.Image:
         composed = image.convert("RGB")
         draw = ImageDraw.Draw(composed)
         width, height = composed.size
-        frame = np.asarray(self.frames[self.current_frame])
+        frame = np.asarray(self.frames[frame_index])
         source_h, source_w = frame.shape[:2]
-        current_geometry = self._get_current_geometry_key()
+        current_geometry = self._get_geometry_key_for_frame(frame_index)
         for measurement in self.persistent_measurements:
             if not self._geometry_matches(current_geometry, measurement.geometry_key):
+                continue
+            if measurement.frame_index != frame_index:
                 continue
             sx = measurement.start[0] / max(source_w, 1) * width
             sy = measurement.start[1] / max(source_h, 1) * height
@@ -5008,7 +5359,7 @@ class DicomViewer:
             ey = measurement.end[1] / max(source_h, 1) * height
             label_summary = self.compute_measurement(
                 measurement,
-                self._get_frame_pixel_array(measurement.frame_index),
+                self._get_frame_pixel_array(frame_index),
             )["summary"]
             if measurement.kind == "roi":
                 draw.rectangle((sx, sy, ex, ey), outline="#ff7f50", width=2)
@@ -5035,17 +5386,53 @@ class DicomViewer:
         return composed
 
     def export_view_screenshot(self) -> None:
+        self.export_current_image()
+
+    def _compose_export_frame_image(self, frame_index: int, include_overlays: bool, include_grid: bool) -> Image.Image:
+        frame = self.frames[frame_index]
+        base = Image.fromarray(self._normalize_frame(frame))
+        if include_overlays:
+            return self._render_measurements_on_image(
+                base,
+                frame_index=frame_index,
+                include_labels=True,
+                include_grid=include_grid,
+            )
+        return base
+
+    def export_current_image(self) -> None:
         if not self.frames:
             return
-        path = filedialog.asksaveasfilename(title="뷰 이미지 저장", defaultextension=".png", filetypes=[("PNG", "*.png")])
+        path = filedialog.asksaveasfilename(title="현재 이미지 저장", defaultextension=".png", filetypes=[("PNG", "*.png")])
         if not path:
             return
-        frame = self.frames[self.current_frame]
-        base = Image.fromarray(self._normalize_frame(frame))
-        base = self._resize_image_for_display(base)
-        image = self._render_measurements_on_image(base, include_labels=True, include_grid=self.show_grid_overlay.get())
+        image = self._compose_export_frame_image(
+            frame_index=self.current_frame,
+            include_overlays=self.include_overlays_in_export.get(),
+            include_grid=self.show_grid_overlay.get(),
+        )
         image.save(path)
-        messagebox.showinfo("저장 완료", f"뷰 이미지를 저장했습니다.\n{path}")
+        messagebox.showinfo("저장 완료", f"현재 이미지를 저장했습니다.\n{path}")
+
+    def export_all_frames(self) -> None:
+        if len(self.frames) <= 1:
+            messagebox.showinfo("안내", "일괄 저장은 2개 이상의 프레임이 있을 때 사용할 수 있습니다.")
+            return
+        directory = filedialog.askdirectory(title="프레임 일괄 저장 폴더 선택")
+        if not directory:
+            return
+        base_name = Path(self.file_paths[self.current_file_index]).stem if 0 <= self.current_file_index < len(self.file_paths) else "frame"
+        saved_count = 0
+        for frame_index in range(len(self.frames)):
+            image = self._compose_export_frame_image(
+                frame_index=frame_index,
+                include_overlays=self.include_overlays_in_export.get(),
+                include_grid=self.show_grid_overlay.get(),
+            )
+            output_path = Path(directory) / f"{base_name}_frame_{frame_index + 1:04d}.png"
+            image.save(output_path)
+            saved_count += 1
+        messagebox.showinfo("저장 완료", f"{saved_count}개 프레임을 저장했습니다.\n{directory}")
 
     def export_clean_figure(self) -> None:
         if not self.frames:
@@ -5055,7 +5442,7 @@ class DicomViewer:
             return
         frame = self.frames[self.current_frame]
         base = Image.fromarray(self._normalize_frame(frame))
-        image = self._render_measurements_on_image(base, include_labels=False, include_grid=False)
+        image = self._render_measurements_on_image(base, frame_index=self.current_frame, include_labels=False, include_grid=False)
         image.save(path)
         messagebox.showinfo("저장 완료", f"Figure를 저장했습니다.\n{path}")
 
@@ -5094,6 +5481,8 @@ class DicomViewer:
     def _refresh_grid_overlay(self) -> None:
         if self.view_mode != "single" or not self.frames:
             return
+        if not self.show_grid_overlay.get() and self._line_snap_anchor is not None:
+            self.clear_preview_overlay()
         self._draw_grid_overlay()
 
     def _handle_mousewheel(self, event: tk.Event) -> str:
@@ -5280,10 +5669,13 @@ class DicomViewer:
     def change_frame(self, delta: int) -> None:
         if self.view_mode != "single" or not self.frames:
             return
+        source_geometry_key = self._get_current_geometry_key()
+        source_frame_index = int(self.current_frame)
         new_index = self.current_frame + delta
         if not 0 <= new_index < len(self.frames):
             return
         self.current_frame = new_index
+        self._propagate_rois_from_geometry(source_geometry_key, source_frame_index, navigation_step=delta)
         self.clear_preview_overlay()
         self._show_frame()
 
@@ -5292,6 +5684,8 @@ class DicomViewer:
             return
         if not self.file_paths:
             return
+        source_geometry_key = self._get_current_geometry_key()
+        source_frame_index = int(self.current_frame)
         new_index = self.current_file_index + delta
         if not 0 <= new_index < len(self.file_paths):
             return
@@ -5302,12 +5696,17 @@ class DicomViewer:
             self.render_multiview_page()
             return
         self._load_file(new_index, preserve_view_state=True)
+        self._propagate_rois_from_geometry(source_geometry_key, source_frame_index, navigation_step=delta)
+        self._draw_persistent_measurements()
 
     def go_to_file(self, index: int) -> None:
         if self.view_mode == "compare":
             return
         if not 0 <= index < len(self.file_paths):
             return
+        previous_index = self.current_file_index
+        source_geometry_key = self._get_current_geometry_key()
+        source_frame_index = int(self.current_frame)
         if self.view_mode == "multi":
             self.current_file_index = index
             self.image_var.set(f"이미지: {self.current_file_index + 1} / {len(self.file_paths)}")
@@ -5315,6 +5714,9 @@ class DicomViewer:
             self.render_multiview_page()
             return
         self._load_file(index, preserve_view_state=True)
+        step = 0 if previous_index < 0 or index == previous_index else (1 if index > previous_index else -1)
+        self._propagate_rois_from_geometry(source_geometry_key, source_frame_index, navigation_step=step)
+        self._draw_persistent_measurements()
 
     def _show_frame(
         self,
