@@ -4610,7 +4610,7 @@ class DicomViewer:
                 occupied_label_boxes.append(label_box)
             else:
                 label_x, label_y, anchor = ex + 6, ey - 6, "sw"
-            label_ids = self._draw_measurement_label(
+            self._draw_measurement_label(
                 self.canvas,
                 label_x,
                 label_y,
@@ -4619,8 +4619,6 @@ class DicomViewer:
                 tags=("persistent_measurement",),
                 anchor=anchor,
             )
-            for label_id in label_ids:
-                self._persistent_canvas_item_to_measurement_id[label_id] = measurement.id
 
         regions = self._build_grid_roi_regions(grid_roi_measurements)
         placed_boxes: list[tuple[float, float, float, float]] = []
@@ -4646,7 +4644,7 @@ class DicomViewer:
                 for bx0, by0, bx1, by1 in placed_boxes
             ):
                 y += estimated_height + 4
-            label_id = self.canvas.create_text(
+            self.canvas.create_text(
                 x,
                 y,
                 text=label,
@@ -4655,9 +4653,6 @@ class DicomViewer:
                 font=("TkDefaultFont", 9, "bold"),
                 tags=("persistent_measurement",),
             )
-            representative_id = next(iter(region["measurement_ids"]), None)
-            if representative_id is not None:
-                self._persistent_canvas_item_to_measurement_id[label_id] = representative_id
             placed_boxes.append((x - estimated_width / 2, y, x + estimated_width / 2, y - estimated_height))
 
     def export_measurements_csv(self) -> None:
