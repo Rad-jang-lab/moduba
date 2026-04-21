@@ -66,6 +66,7 @@ class DicomViewer:
         self.invert_display = tk.BooleanVar(value=False)
         self.show_grid_overlay = tk.BooleanVar(value=False)
         self.grid_spacing_px = tk.IntVar(value=8)
+        self.grid_roi_size_px = tk.IntVar(value=16)
         self.cursor_var = tk.StringVar(value="Cursor: -, -")
         self.measurement_mode = tk.StringVar(value="pan")
         self.temporary_measurements: list[dict[str, Any]] = []
@@ -340,6 +341,14 @@ class DicomViewer:
             textvariable=self.grid_spacing_px,
         ).pack(side="left", padx=(4, 0))
         self.grid_spacing_px.trace_add("write", lambda *_args: self._refresh_grid_overlay())
+        ttk.Label(tab, text="Grid ROI Size(px)").pack(side="left", padx=(8, 0))
+        ttk.Combobox(
+            tab,
+            width=6,
+            state="readonly",
+            values=(4, 8, 16, 32),
+            textvariable=self.grid_roi_size_px,
+        ).pack(side="left", padx=(4, 0))
         ttk.Button(tab, text="임시 측정 지우기", command=self.clear_temporary_measurements).pack(side="left", padx=(16, 0))
         ttk.Button(tab, text="영구 측정 지우기", command=self.clear_persistent_measurements).pack(side="left", padx=(4, 0))
         ttk.Button(tab, text="라인 프로파일", command=self.show_line_profile_for_selected_line).pack(side="left", padx=(12, 0))
@@ -3427,7 +3436,7 @@ class DicomViewer:
         self._draw_persistent_measurements()
 
     def _create_grid_aligned_roi(self, event: tk.Event) -> None:
-        spacing = max(int(self.grid_spacing_px.get()), 1)
+        roi_size = max(int(self.grid_roi_size_px.get()), 1)
         canvas_x = self.canvas.canvasx(event.x)
         canvas_y = self.canvas.canvasy(event.y)
         image_point = self._canvas_to_image_pixel(canvas_x, canvas_y)
@@ -3437,10 +3446,10 @@ class DicomViewer:
         if frame_array.ndim < 2:
             return
         height, width = frame_array.shape[:2]
-        x0 = int(np.clip((image_point[0] // spacing) * spacing, 0, max(width - 1, 0)))
-        y0 = int(np.clip((image_point[1] // spacing) * spacing, 0, max(height - 1, 0)))
-        x1 = int(np.clip(x0 + spacing, 0, max(width - 1, 0)))
-        y1 = int(np.clip(y0 + spacing, 0, max(height - 1, 0)))
+        x0 = int(np.clip((image_point[0] // roi_size) * roi_size, 0, max(width - 1, 0)))
+        y0 = int(np.clip((image_point[1] // roi_size) * roi_size, 0, max(height - 1, 0)))
+        x1 = int(np.clip(x0 + roi_size, 0, max(width - 1, 0)))
+        y1 = int(np.clip(y0 + roi_size, 0, max(height - 1, 0)))
         image_start = (x0, y0)
         image_end = (x1, y1)
         self.temporary_measurements.append({"mode": "roi", "start": image_start, "end": image_end})
@@ -3471,15 +3480,18 @@ class DicomViewer:
             "pixel_spacing_mm": spacing,
             "width_px": float(dx_px),
             "height_px": float(dy_px),
+            "area_px": float(dx_px * dy_px),
             "length_px": float(np.hypot(dx_px, dy_px)),
             "width_mm": None,
             "height_mm": None,
+            "area_mm2": None,
             "length_mm": None,
         }
         if spacing is not None:
             row_mm, col_mm = spacing
             metrics["width_mm"] = dx_px * col_mm
             metrics["height_mm"] = dy_px * row_mm
+            metrics["area_mm2"] = dx_px * dy_px * row_mm * col_mm
             metrics["length_mm"] = float(np.hypot(dx_px * col_mm, dy_px * row_mm))
         if mode == "roi":
             metrics["summary"] = self._format_roi_measurement_summary(metrics)
@@ -3494,12 +3506,16 @@ class DicomViewer:
         return f"{value:.2f}"
 
     def _format_roi_measurement_summary(self, metrics: dict[str, Any]) -> str:
-        px_text = f"{int(round(metrics['width_px']))} x {int(round(metrics['height_px']))}px"
-        if metrics["width_mm"] is None or metrics["height_mm"] is None:
-            return f"{px_text} | N/Amm x N/Amm"
+        width_px = int(round(metrics["width_px"]))
+        height_px = int(round(metrics["height_px"]))
+        area_px = int(round(metrics["area_px"]))
+        width_mm_text = f"{self._format_mm_value(metrics['width_mm'])} mm"
+        height_mm_text = f"{self._format_mm_value(metrics['height_mm'])} mm"
+        area_mm_text = f"{self._format_mm_value(metrics['area_mm2'])} mm²"
         return (
-            f"{px_text} | "
-            f"{self._format_mm_value(metrics['width_mm'])}mm x {self._format_mm_value(metrics['height_mm'])}mm"
+            f"W: {width_mm_text} ({width_px} px)\n"
+            f"H: {height_mm_text} ({height_px} px)\n"
+            f"Area: {area_mm_text} ({area_px} px²)"
         )
 
     def _format_line_measurement_summary(self, metrics: dict[str, Any]) -> str:
@@ -3685,9 +3701,11 @@ class DicomViewer:
                     "summary",
                     "width_px",
                     "height_px",
+                    "area_px",
                     "length_px",
                     "width_mm",
                     "height_mm",
+                    "area_mm2",
                     "length_mm",
                     "geometry_key",
                     "meta",
@@ -3709,9 +3727,11 @@ class DicomViewer:
                         item.summary_text,
                         f"{metrics['width_px']:.4f}",
                         f"{metrics['height_px']:.4f}",
+                        f"{metrics['area_px']:.4f}",
                         f"{metrics['length_px']:.4f}",
                         "" if metrics["width_mm"] is None else f"{metrics['width_mm']:.4f}",
                         "" if metrics["height_mm"] is None else f"{metrics['height_mm']:.4f}",
+                        "" if metrics["area_mm2"] is None else f"{metrics['area_mm2']:.4f}",
                         "" if metrics["length_mm"] is None else f"{metrics['length_mm']:.4f}",
                         item.geometry_key,
                         json.dumps(item.meta, ensure_ascii=False, sort_keys=True),
