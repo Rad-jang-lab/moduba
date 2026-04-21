@@ -158,89 +158,10 @@ class DicomViewer:
         self._build_ui()
 
     def _build_ui(self) -> None:
-        top = ttk.Frame(self.root, padding=12)
-        top.pack(fill="x")
-
-        self.open_file_button = ttk.Button(top, text="DICOM 열기", command=self.open_file)
-        self.open_file_button.pack(side="left")
-        self.open_folder_button = ttk.Button(top, text="폴더 열기", command=self.open_folder)
-        self.open_folder_button.pack(side="left", padx=(8, 0))
-        self.diagnose_button = ttk.Button(top, text="폴더 진단", command=self.diagnose_folder)
-        self.diagnose_button.pack(side="left", padx=(8, 0))
-        self.toggle_view_button = ttk.Button(top, text="단일/멀티 전환", command=self.toggle_view_mode)
-        self.toggle_view_button.pack(side="left", padx=(16, 0))
-        self.prev_image_button = ttk.Button(top, text="이전 이미지", command=lambda: self.change_file(-1))
-        self.prev_image_button.pack(side="left", padx=(16, 0))
-        self.next_image_button = ttk.Button(top, text="다음 이미지", command=lambda: self.change_file(1))
-        self.next_image_button.pack(side="left", padx=(8, 0))
-        self.prev_frame_button = ttk.Button(top, text="이전 프레임", command=lambda: self.change_frame(-1))
-        self.prev_frame_button.pack(side="left", padx=(16, 0))
-        self.next_frame_button = ttk.Button(top, text="다음 프레임", command=lambda: self.change_frame(1))
-        self.next_frame_button.pack(side="left", padx=(8, 0))
-        self.window_level_reset_button = ttk.Button(top, text="W/L 리셋", command=self.reset_window_level)
-        self.window_level_reset_button.pack(side="left", padx=(16, 0))
-        ttk.Checkbutton(
-            top,
-            text="Invert",
-            variable=self.invert_display,
-            command=self._refresh_single_view_image,
-        ).pack(side="left", padx=(8, 0))
-        ttk.Checkbutton(
-            top,
-            text="Grid",
-            variable=self.show_grid_overlay,
-            command=self._refresh_grid_overlay,
-        ).pack(side="left", padx=(8, 0))
-        ttk.Radiobutton(top, text="Pan", value="pan", variable=self.measurement_mode).pack(side="left", padx=(12, 0))
-        ttk.Radiobutton(top, text="ROI", value="roi", variable=self.measurement_mode).pack(side="left", padx=(4, 0))
-        ttk.Radiobutton(top, text="Line", value="line", variable=self.measurement_mode).pack(side="left", padx=(4, 0))
-        ttk.Button(top, text="임시 측정 지우기", command=self.clear_temporary_measurements).pack(side="left", padx=(8, 0))
-        ttk.Button(top, text="영구 측정 지우기", command=self.clear_persistent_measurements).pack(side="left", padx=(4, 0))
-        ttk.Button(top, text="측정 CSV", command=self.export_measurements_csv).pack(side="left", padx=(4, 0))
-        ttk.Button(top, text="세트 저장", command=self.save_measurement_set).pack(side="left", padx=(4, 0))
-        ttk.Button(top, text="세트 적용", command=self.apply_measurement_set).pack(side="left", padx=(4, 0))
-        ttk.Button(top, text="세트 JSON", command=self.export_measurement_sets_json).pack(side="left", padx=(4, 0))
-        ttk.Button(top, text="세트 불러오기", command=self.import_measurement_sets_json).pack(side="left", padx=(4, 0))
-        ttk.Button(top, text="라인 프로파일", command=self.show_line_profile_for_selected_line).pack(side="left", padx=(4, 0))
-        ttk.Button(top, text="ROI 역할", command=self.assign_roi_role).pack(side="left", padx=(4, 0))
-        ttk.Button(top, text="SNR/CNR", command=self.calculate_snr_cnr).pack(side="left", padx=(4, 0))
-        ttk.Button(top, text="뷰 내보내기", command=self.export_view_screenshot).pack(side="left", padx=(4, 0))
-        ttk.Button(top, text="Figure 내보내기", command=self.export_clean_figure).pack(side="left", padx=(4, 0))
-        ttk.Checkbutton(
-            top,
-            text="Compare Mode",
-            variable=self.compare_mode_enabled,
-            command=self.toggle_compare_mode,
-        ).pack(side="left", padx=(16, 0))
-        ttk.Checkbutton(
-            top,
-            text="Sync",
-            variable=self.compare_sync_enabled,
-            command=self._update_compare_sync_status,
-        ).pack(side="left", padx=(8, 0))
-        ttk.Button(top, text="Swap Left/Right", command=self.swap_compare_panels).pack(side="left", padx=(8, 0))
-        ttk.Checkbutton(
-            top,
-            text="기본 정보 오버레이",
-            variable=self.show_basic_overlay,
-            command=self.refresh_overlay_display,
-        ).pack(side="left", padx=(16, 0))
-        ttk.Checkbutton(
-            top,
-            text="촬영 정보 오버레이",
-            variable=self.show_acquisition_overlay,
-            command=self.refresh_overlay_display,
-        ).pack(side="left", padx=(8, 0))
-        ttk.Button(top, text="오버레이 항목 설정", command=self.open_overlay_settings).pack(side="left", padx=(12, 0))
-
-        ttk.Label(top, textvariable=self.view_mode_var).pack(side="left", padx=(12, 0))
-        ttk.Label(top, textvariable=self.compare_sync_status_var).pack(side="left", padx=(12, 0))
-        ttk.Label(top, textvariable=self.source_var).pack(side="left", padx=(12, 0))
-        ttk.Label(top, textvariable=self.image_var).pack(side="left", padx=(12, 0))
-        ttk.Label(top, textvariable=self.frame_var).pack(side="left", padx=(12, 0))
-        ttk.Label(top, textvariable=self.zoom_var).pack(side="left", padx=(12, 0))
-        ttk.Label(top, textvariable=self.window_level_var).pack(side="left", padx=(12, 0))
-        ttk.Label(top, textvariable=self.cursor_var).pack(side="left", padx=(12, 0))
+        toolbar_container = ttk.Frame(self.root, padding=12)
+        toolbar_container.pack(fill="x")
+        self._build_toolbar_tabs(toolbar_container)
+        self._build_status_row(toolbar_container)
 
         ttk.Label(self.root, textvariable=self.path_var, padding=(12, 0)).pack(fill="x")
         ttk.Label(self.root, textvariable=self.info_var, padding=(12, 6), justify="left", wraplength=1040).pack(fill="x")
@@ -323,6 +244,121 @@ class DicomViewer:
         self._bind_shortcuts()
         self._update_multiview_controls()
         self._update_compare_controls()
+
+    def _build_toolbar_tabs(self, parent: ttk.Frame) -> None:
+        notebook = ttk.Notebook(parent)
+        notebook.pack(fill="x")
+
+        home_tab = self._add_toolbar_tab(notebook, "HOME")
+        image_tab = self._add_toolbar_tab(notebook, "IMAGE")
+        measure_tab = self._add_toolbar_tab(notebook, "MEASURE")
+        analysis_tab = self._add_toolbar_tab(notebook, "ANALYSIS")
+        export_tab = self._add_toolbar_tab(notebook, "EXPORT")
+
+        self._build_home_toolbar(home_tab)
+        self._build_image_toolbar(image_tab)
+        self._build_measure_toolbar(measure_tab)
+        self._build_analysis_toolbar(analysis_tab)
+        self._build_export_toolbar(export_tab)
+
+    @staticmethod
+    def _add_toolbar_tab(notebook: ttk.Notebook, title: str) -> ttk.Frame:
+        tab = ttk.Frame(notebook, padding=(8, 8, 8, 6))
+        notebook.add(tab, text=title)
+        return tab
+
+    def _build_home_toolbar(self, tab: ttk.Frame) -> None:
+        self.diagnose_button = ttk.Button(tab, text="폴더 진단", command=self.diagnose_folder)
+        self.diagnose_button.pack(side="left")
+        self.toggle_view_button = ttk.Button(tab, text="단일/멀티 전환", command=self.toggle_view_mode)
+        self.toggle_view_button.pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(
+            tab,
+            text="Compare Mode",
+            variable=self.compare_mode_enabled,
+            command=self.toggle_compare_mode,
+        ).pack(side="left", padx=(16, 0))
+        ttk.Checkbutton(
+            tab,
+            text="Sync",
+            variable=self.compare_sync_enabled,
+            command=self._update_compare_sync_status,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(tab, text="Swap Left/Right", command=self.swap_compare_panels).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(
+            tab,
+            text="기본 정보 오버레이",
+            variable=self.show_basic_overlay,
+            command=self.refresh_overlay_display,
+        ).pack(side="left", padx=(16, 0))
+        ttk.Checkbutton(
+            tab,
+            text="촬영 정보 오버레이",
+            variable=self.show_acquisition_overlay,
+            command=self.refresh_overlay_display,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(tab, text="오버레이 항목 설정", command=self.open_overlay_settings).pack(side="left", padx=(8, 0))
+
+    def _build_image_toolbar(self, tab: ttk.Frame) -> None:
+        self.open_file_button = ttk.Button(tab, text="DICOM 열기", command=self.open_file)
+        self.open_file_button.pack(side="left")
+        self.open_folder_button = ttk.Button(tab, text="폴더 열기", command=self.open_folder)
+        self.open_folder_button.pack(side="left", padx=(8, 0))
+        self.prev_image_button = ttk.Button(tab, text="이전 이미지", command=lambda: self.change_file(-1))
+        self.prev_image_button.pack(side="left", padx=(16, 0))
+        self.next_image_button = ttk.Button(tab, text="다음 이미지", command=lambda: self.change_file(1))
+        self.next_image_button.pack(side="left", padx=(8, 0))
+        self.prev_frame_button = ttk.Button(tab, text="이전 프레임", command=lambda: self.change_frame(-1))
+        self.prev_frame_button.pack(side="left", padx=(16, 0))
+        self.next_frame_button = ttk.Button(tab, text="다음 프레임", command=lambda: self.change_frame(1))
+        self.next_frame_button.pack(side="left", padx=(8, 0))
+        self.window_level_reset_button = ttk.Button(tab, text="W/L 리셋", command=self.reset_window_level)
+        self.window_level_reset_button.pack(side="left", padx=(16, 0))
+        ttk.Checkbutton(
+            tab,
+            text="Invert",
+            variable=self.invert_display,
+            command=self._refresh_single_view_image,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(
+            tab,
+            text="Grid",
+            variable=self.show_grid_overlay,
+            command=self._refresh_grid_overlay,
+        ).pack(side="left", padx=(8, 0))
+
+    def _build_measure_toolbar(self, tab: ttk.Frame) -> None:
+        ttk.Radiobutton(tab, text="Pan", value="pan", variable=self.measurement_mode).pack(side="left")
+        ttk.Radiobutton(tab, text="ROI", value="roi", variable=self.measurement_mode).pack(side="left", padx=(4, 0))
+        ttk.Radiobutton(tab, text="Line", value="line", variable=self.measurement_mode).pack(side="left", padx=(4, 0))
+        ttk.Button(tab, text="임시 측정 지우기", command=self.clear_temporary_measurements).pack(side="left", padx=(16, 0))
+        ttk.Button(tab, text="영구 측정 지우기", command=self.clear_persistent_measurements).pack(side="left", padx=(4, 0))
+        ttk.Button(tab, text="측정 CSV", command=self.export_measurements_csv).pack(side="left", padx=(4, 0))
+
+    def _build_analysis_toolbar(self, tab: ttk.Frame) -> None:
+        ttk.Button(tab, text="라인 프로파일", command=self.show_line_profile_for_selected_line).pack(side="left")
+        ttk.Button(tab, text="ROI 역할", command=self.assign_roi_role).pack(side="left", padx=(8, 0))
+        ttk.Button(tab, text="SNR/CNR", command=self.calculate_snr_cnr).pack(side="left", padx=(8, 0))
+
+    def _build_export_toolbar(self, tab: ttk.Frame) -> None:
+        ttk.Button(tab, text="세트 저장", command=self.save_measurement_set).pack(side="left")
+        ttk.Button(tab, text="세트 적용", command=self.apply_measurement_set).pack(side="left", padx=(8, 0))
+        ttk.Button(tab, text="세트 JSON", command=self.export_measurement_sets_json).pack(side="left", padx=(8, 0))
+        ttk.Button(tab, text="세트 불러오기", command=self.import_measurement_sets_json).pack(side="left", padx=(8, 0))
+        ttk.Button(tab, text="뷰 내보내기", command=self.export_view_screenshot).pack(side="left", padx=(16, 0))
+        ttk.Button(tab, text="Figure 내보내기", command=self.export_clean_figure).pack(side="left", padx=(8, 0))
+
+    def _build_status_row(self, parent: ttk.Frame) -> None:
+        status = ttk.Frame(parent)
+        status.pack(fill="x", pady=(10, 0))
+        ttk.Label(status, textvariable=self.view_mode_var).pack(side="left")
+        ttk.Label(status, textvariable=self.compare_sync_status_var).pack(side="left", padx=(12, 0))
+        ttk.Label(status, textvariable=self.source_var).pack(side="left", padx=(12, 0))
+        ttk.Label(status, textvariable=self.image_var).pack(side="left", padx=(12, 0))
+        ttk.Label(status, textvariable=self.frame_var).pack(side="left", padx=(12, 0))
+        ttk.Label(status, textvariable=self.zoom_var).pack(side="left", padx=(12, 0))
+        ttk.Label(status, textvariable=self.window_level_var).pack(side="left", padx=(12, 0))
+        ttk.Label(status, textvariable=self.cursor_var).pack(side="left", padx=(12, 0))
 
     def _bind_shortcuts(self) -> None:
         bindings = [
