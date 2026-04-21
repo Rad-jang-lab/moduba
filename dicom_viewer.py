@@ -72,6 +72,8 @@ class DicomViewer:
         self.temporary_measurements: list[dict[str, Any]] = []
         self._active_temporary_measurement: dict[str, Any] | None = None
         self.persistent_measurements: list[Measurement] = []
+        self.selected_persistent_measurement_id: str | None = None
+        self._persistent_canvas_item_to_measurement_id: dict[int, str] = {}
         self.measurement_sets: dict[str, MeasurementSet] = {}
         self._image_bbox: tuple[float, float, float, float] | None = None
         self.zoom_scale = 1.0
@@ -192,9 +194,9 @@ class DicomViewer:
         self.canvas.bind("<B1-Motion>", self._handle_left_button_drag)
         self.canvas.bind("<ButtonRelease-1>", self._handle_left_button_release)
         self.canvas.bind("<Motion>", self._update_cursor_coordinates)
-        self.canvas.bind("<ButtonPress-3>", self._start_window_level_drag)
-        self.canvas.bind("<B3-Motion>", self._update_window_level_drag)
-        self.canvas.bind("<ButtonRelease-3>", self._end_window_level_drag)
+        self.canvas.bind("<ButtonPress-3>", self._handle_right_button_press)
+        self.canvas.bind("<B3-Motion>", self._handle_right_button_drag)
+        self.canvas.bind("<ButtonRelease-3>", self._handle_right_button_release)
         self.canvas.bind("<MouseWheel>", self._handle_mousewheel)
         self.canvas.bind("<Button-4>", self._handle_mousewheel)
         self.canvas.bind("<Button-5>", self._handle_mousewheel)
@@ -349,6 +351,8 @@ class DicomViewer:
             values=(4, 8, 16, 32),
             textvariable=self.grid_roi_size_px,
         ).pack(side="left", padx=(4, 0))
+        ttk.Button(tab, text="실행 취소", command=self.undo_last_measurement).pack(side="left", padx=(16, 0))
+        ttk.Button(tab, text="선택 측정 삭제", command=self.clear_selected_measurement).pack(side="left", padx=(4, 0))
         ttk.Button(tab, text="임시 측정 지우기", command=self.clear_temporary_measurements).pack(side="left", padx=(16, 0))
         ttk.Button(tab, text="영구 측정 지우기", command=self.clear_persistent_measurements).pack(side="left", padx=(4, 0))
         ttk.Button(tab, text="라인 프로파일", command=self.show_line_profile_for_selected_line).pack(side="left", padx=(12, 0))
@@ -396,6 +400,8 @@ class DicomViewer:
             ("<Next>", self._handle_next_image_shortcut),
             ("<Shift-Prior>", self._handle_prev_frame_shortcut),
             ("<Shift-Next>", self._handle_next_frame_shortcut),
+            ("<Control-z>", self._handle_undo_shortcut),
+            ("<Delete>", self._handle_delete_selected_shortcut),
         ]
         for sequence, handler in bindings:
             self.root.bind(sequence, handler)
@@ -3309,6 +3315,8 @@ class DicomViewer:
         self._window_drag_base = None
 
     def _handle_left_button_press(self, event: tk.Event) -> None:
+        if self._select_persistent_measurement_at_event(event):
+            return
         if self.measurement_mode.get() == "pan":
             self._start_pan(event)
             return
@@ -3325,6 +3333,21 @@ class DicomViewer:
             self._end_pan(event)
             return
         self._finish_temporary_measurement(event)
+
+    def _handle_right_button_press(self, event: tk.Event) -> None:
+        if self.measurement_mode.get() == "grid_roi" and self._show_grid_roi_combined_summary():
+            return
+        self._start_window_level_drag(event)
+
+    def _handle_right_button_drag(self, event: tk.Event) -> None:
+        if self.measurement_mode.get() == "grid_roi":
+            return
+        self._update_window_level_drag(event)
+
+    def _handle_right_button_release(self, event: tk.Event) -> None:
+        if self.measurement_mode.get() == "grid_roi":
+            return
+        self._end_window_level_drag(event)
 
     def _start_pan(self, event: tk.Event) -> None:
         if not self.frames:
@@ -3452,10 +3475,97 @@ class DicomViewer:
         y1 = int(np.clip(y0 + roi_size, 0, max(height - 1, 0)))
         image_start = (x0, y0)
         image_end = (x1, y1)
-        self.temporary_measurements.append({"mode": "roi", "start": image_start, "end": image_end})
+        if self._toggle_grid_roi_measurement(image_start, image_end):
+            self._draw_temporary_measurements()
+            self._draw_persistent_measurements()
+            return
+        self.temporary_measurements.append({"mode": "roi", "start": image_start, "end": image_end, "source_mode": "grid_roi"})
         self._append_persistent_measurement("roi", image_start, image_end, source_mode="grid_roi")
         self._draw_temporary_measurements()
         self._draw_persistent_measurements()
+
+    def _toggle_grid_roi_measurement(self, image_start: tuple[int, int], image_end: tuple[int, int]) -> bool:
+        removed = False
+        filtered_temporary: list[dict[str, Any]] = []
+        for measurement in self.temporary_measurements:
+            if (
+                measurement.get("mode") == "roi"
+                and tuple(measurement.get("start", ())) == image_start
+                and tuple(measurement.get("end", ())) == image_end
+                and measurement.get("source_mode") == "grid_roi"
+            ):
+                removed = True
+                continue
+            filtered_temporary.append(measurement)
+        if removed:
+            self.temporary_measurements = filtered_temporary
+        if not removed:
+            return False
+        self.persistent_measurements = [
+            item
+            for item in self.persistent_measurements
+            if not (
+                item.kind == "roi"
+                and tuple(int(round(v)) for v in item.start) == image_start
+                and tuple(int(round(v)) for v in item.end) == image_end
+                and item.meta.get("source_mode") == "grid_roi"
+                and item.frame_index == self.current_frame
+                and self._geometry_matches(item.geometry_key, self._get_current_geometry_key())
+            )
+        ]
+        return True
+
+    def _current_grid_roi_measurements(self) -> list[Measurement]:
+        current_geometry = self._get_current_geometry_key()
+        return [
+            item
+            for item in self.persistent_measurements
+            if item.kind == "roi"
+            and item.meta.get("source_mode") == "grid_roi"
+            and item.frame_index == self.current_frame
+            and self._geometry_matches(item.geometry_key, current_geometry)
+        ]
+
+    def _show_grid_roi_combined_summary(self) -> bool:
+        selected = self._current_grid_roi_measurements()
+        if not selected:
+            return False
+        x0_values: list[int] = []
+        y0_values: list[int] = []
+        x1_values: list[int] = []
+        y1_values: list[int] = []
+        area_px_sum = 0
+        for measurement in selected:
+            x0 = int(round(min(measurement.start[0], measurement.end[0])))
+            y0 = int(round(min(measurement.start[1], measurement.end[1])))
+            x1 = int(round(max(measurement.start[0], measurement.end[0])))
+            y1 = int(round(max(measurement.start[1], measurement.end[1])))
+            width_px = max(x1 - x0, 0)
+            height_px = max(y1 - y0, 0)
+            area_px_sum += width_px * height_px
+            x0_values.append(x0)
+            y0_values.append(y0)
+            x1_values.append(x1)
+            y1_values.append(y1)
+        width_px_total = max(max(x1_values) - min(x0_values), 0)
+        height_px_total = max(max(y1_values) - min(y0_values), 0)
+        spacing = self._get_pixel_spacing_mm()
+        if spacing is None:
+            width_mm_text = "N/A mm"
+            height_mm_text = "N/A mm"
+            area_mm_text = "N/A mm²"
+        else:
+            row_mm, col_mm = spacing
+            width_mm_text = f"{width_px_total * col_mm:.1f} mm"
+            height_mm_text = f"{height_px_total * row_mm:.1f} mm"
+            area_mm_text = f"{area_px_sum * row_mm * col_mm:.1f} mm²"
+        summary = (
+            f"Width: {width_mm_text} ({width_px_total} px)\n"
+            f"Height: {height_mm_text} ({height_px_total} px)\n"
+            f"Selected Area: {area_mm_text} ({area_px_sum} px²)"
+        )
+        messagebox.showinfo("Grid ROI Combined Summary", summary)
+        return True
 
     def _get_pixel_spacing_mm(self) -> tuple[float, float] | None:
         if self.dataset is None:
@@ -3593,7 +3703,66 @@ class DicomViewer:
 
     def clear_persistent_measurements(self) -> None:
         self.persistent_measurements = []
+        self.selected_persistent_measurement_id = None
+        self._persistent_canvas_item_to_measurement_id = {}
+        self.temporary_measurements = []
         self.canvas.delete("persistent_measurement")
+        self.canvas.delete("temp_measurement")
+        if self.view_mode == "single":
+            self._draw_single_view_overlays()
+
+    def undo_last_measurement(self) -> None:
+        if not self.persistent_measurements:
+            return
+        removed = self.persistent_measurements.pop()
+        self._remove_temporary_for_measurement(removed)
+        if self.selected_persistent_measurement_id == removed.id:
+            self.selected_persistent_measurement_id = None
+        self._draw_temporary_measurements()
+        self._draw_persistent_measurements()
+        if self.view_mode == "single":
+            self._draw_single_view_overlays()
+
+    def clear_selected_measurement(self) -> None:
+        if self.selected_persistent_measurement_id is None:
+            messagebox.showinfo("안내", "삭제할 측정을 먼저 선택하세요.")
+            return
+        target = next((item for item in self.persistent_measurements if item.id == self.selected_persistent_measurement_id), None)
+        if target is None:
+            self.selected_persistent_measurement_id = None
+            self._draw_persistent_measurements()
+            return
+        self.persistent_measurements = [item for item in self.persistent_measurements if item.id != target.id]
+        self._remove_temporary_for_measurement(target)
+        self.selected_persistent_measurement_id = None
+        self._draw_temporary_measurements()
+        self._draw_persistent_measurements()
+        if self.view_mode == "single":
+            self._draw_single_view_overlays()
+
+    def _remove_temporary_for_measurement(self, measurement: Measurement) -> None:
+        start = tuple(int(round(v)) for v in measurement.start)
+        end = tuple(int(round(v)) for v in measurement.end)
+        for index in range(len(self.temporary_measurements) - 1, -1, -1):
+            item = self.temporary_measurements[index]
+            if item.get("mode") == measurement.kind and tuple(item.get("start", ())) == start and tuple(item.get("end", ())) == end:
+                del self.temporary_measurements[index]
+                return
+
+    def _select_persistent_measurement_at_event(self, event: tk.Event) -> bool:
+        if self.view_mode != "single":
+            return False
+        canvas_x = self.canvas.canvasx(event.x)
+        canvas_y = self.canvas.canvasy(event.y)
+        overlapping = list(reversed(self.canvas.find_overlapping(canvas_x - 3, canvas_y - 3, canvas_x + 3, canvas_y + 3)))
+        for item_id in overlapping:
+            measurement_id = self._persistent_canvas_item_to_measurement_id.get(item_id)
+            if measurement_id is None:
+                continue
+            self.selected_persistent_measurement_id = measurement_id
+            self._draw_persistent_measurements()
+            return True
+        return False
 
     def _get_current_geometry_key(self) -> str | None:
         if self.dataset is None or not self.frames:
@@ -3643,6 +3812,7 @@ class DicomViewer:
 
     def _draw_persistent_measurements(self) -> None:
         self.canvas.delete("persistent_measurement")
+        self._persistent_canvas_item_to_measurement_id = {}
         current_geometry = self._get_current_geometry_key()
         for measurement in self.persistent_measurements:
             if not self._geometry_matches(current_geometry, measurement.geometry_key):
@@ -3659,14 +3829,21 @@ class DicomViewer:
             summary = metrics["summary"]
             measurement.summary_text = summary
             measurement.meta["metrics"] = metrics
+            selected = measurement.id == self.selected_persistent_measurement_id
             if measurement.kind == "roi":
-                self.canvas.create_rectangle(sx, sy, ex, ey, outline="#ff7f50", width=2, tags=("persistent_measurement",))
+                outline = "#ffdc5e" if selected else "#ff7f50"
+                item_id = self.canvas.create_rectangle(
+                    sx, sy, ex, ey, outline=outline, width=3 if selected else 2, tags=("persistent_measurement",)
+                )
                 role = measurement.meta.get("roi_role", "none")
                 label = f"{summary} [{role}]"
             else:
-                self.canvas.create_line(sx, sy, ex, ey, fill="#00ffaa", width=2, tags=("persistent_measurement",))
+                color = "#e6ff7a" if selected else "#00ffaa"
+                item_id = self.canvas.create_line(
+                    sx, sy, ex, ey, fill=color, width=3 if selected else 2, tags=("persistent_measurement",)
+                )
                 label = summary
-            self.canvas.create_text(
+            label_id = self.canvas.create_text(
                 ex + 6,
                 ey - 6,
                 text=label,
@@ -3675,6 +3852,8 @@ class DicomViewer:
                 font=("TkDefaultFont", 9, "bold"),
                 tags=("persistent_measurement",),
             )
+            self._persistent_canvas_item_to_measurement_id[item_id] = measurement.id
+            self._persistent_canvas_item_to_measurement_id[label_id] = measurement.id
 
     def export_measurements_csv(self) -> None:
         if not self.persistent_measurements:
@@ -4204,6 +4383,18 @@ class DicomViewer:
         if len(self.frames) > 1:
             self.change_frame(1)
         return "break"
+
+    def _handle_undo_shortcut(self, _event: tk.Event) -> str:
+        if self.view_mode == "single":
+            self.undo_last_measurement()
+            return "break"
+        return ""
+
+    def _handle_delete_selected_shortcut(self, _event: tk.Event) -> str:
+        if self.view_mode == "single":
+            self.clear_selected_measurement()
+            return "break"
+        return ""
 
     @staticmethod
     def _get_mousewheel_direction(event: tk.Event) -> int:
