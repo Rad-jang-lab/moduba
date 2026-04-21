@@ -603,7 +603,8 @@ class DicomViewer:
         ttk.Button(analysis_group, text="Line Profile", command=self.show_line_profile_for_selected_line).grid(
             row=2, column=0, sticky="ew", pady=(4, 0)
         )
-        ttk.Button(analysis_group, text="ROI 역할", command=self.assign_roi_role).grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(analysis_group, text="ROI 분류(SNR/CNR)", command=self.assign_roi_role).grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        ttk.Label(analysis_group, text="Signal / Background / Noise").grid(row=4, column=0, sticky="w", pady=(4, 0))
 
         manage_group = ttk.LabelFrame(strip, text="Manage", padding=(8, 6))
         manage_group.pack(side="left", padx=(0, 8), fill="y")
@@ -2180,23 +2181,7 @@ class DicomViewer:
             width=max_width,
             tags=(tag_prefix, "overlay"),
         )
-        text_bbox = canvas.bbox(text_id)
-        if text_bbox is not None:
-            left, top, right, bottom = text_bbox
-            backdrop_id = canvas.create_rectangle(
-                left - 6,
-                top - 4,
-                right + 6,
-                bottom + 4,
-                fill=self.ui_colors["overlay_bg"],
-                outline=self.ui_colors["overlay_border"],
-                stipple="gray50",
-                width=1,
-                tags=(f"{tag_prefix}_backdrop", "overlay"),
-            )
-            canvas.tag_lower(backdrop_id, text_id)
-
-        shadow_offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        shadow_offsets = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1)]
         for index, (dx, dy) in enumerate(shadow_offsets):
             canvas.create_text(
                 x + dx,
@@ -3895,15 +3880,21 @@ class DicomViewer:
         y1 = int(np.clip(y0 + roi_height, 0, max(height - 1, 0)))
         image_start = (x0, y0)
         image_end = (x1, y1)
-        if self._toggle_grid_roi_measurement(image_start, image_end):
+        existing_measurement_id = self._find_grid_roi_measurement_id(image_start, image_end)
+        ctrl_pressed = bool(event.state & 0x4)
+        if existing_measurement_id is not None:
+            self._apply_measurement_selection(existing_measurement_id, toggle=ctrl_pressed)
             self._draw_preview_measurements()
             self._draw_persistent_measurements()
             return
         self._append_persistent_measurement("roi", image_start, image_end, source_mode="grid_roi")
+        created_measurement = self.persistent_measurements[-1] if self.persistent_measurements else None
+        if created_measurement is not None:
+            self._apply_measurement_selection(created_measurement.id, toggle=ctrl_pressed)
         self._draw_preview_measurements()
         self._draw_persistent_measurements()
 
-    def _toggle_grid_roi_measurement(self, image_start: tuple[int, int], image_end: tuple[int, int]) -> bool:
+    def _find_grid_roi_measurement_id(self, image_start: tuple[int, int], image_end: tuple[int, int]) -> str | None:
         target = next(
             (
                 item
@@ -3917,14 +3908,7 @@ class DicomViewer:
             ),
             None,
         )
-        if target is None:
-            return False
-        self.persistent_measurements = [
-            item
-            for item in self.persistent_measurements
-            if item.id != target.id
-        ]
-        return True
+        return target.id if target is not None else None
 
     def _current_grid_roi_measurements(self) -> list[Measurement]:
         current_geometry = self._get_current_geometry_key()
@@ -4237,17 +4221,20 @@ class DicomViewer:
             if measurement_id is None:
                 continue
             ctrl_pressed = bool(event.state & 0x4)
-            if ctrl_pressed:
-                if measurement_id in self.selected_persistent_measurement_ids:
-                    self.selected_persistent_measurement_ids.remove(measurement_id)
-                else:
-                    self.selected_persistent_measurement_ids.add(measurement_id)
-            else:
-                self.selected_persistent_measurement_ids = {measurement_id}
-            self.selected_persistent_measurement_id = next(iter(self.selected_persistent_measurement_ids), None)
+            self._apply_measurement_selection(measurement_id, toggle=ctrl_pressed)
             self._draw_persistent_measurements()
             return True
         return False
+
+    def _apply_measurement_selection(self, measurement_id: str, toggle: bool = False) -> None:
+        if toggle:
+            if measurement_id in self.selected_persistent_measurement_ids:
+                self.selected_persistent_measurement_ids.remove(measurement_id)
+            else:
+                self.selected_persistent_measurement_ids.add(measurement_id)
+        else:
+            self.selected_persistent_measurement_ids = {measurement_id}
+        self.selected_persistent_measurement_id = next(iter(self.selected_persistent_measurement_ids), None)
 
     def _get_current_geometry_key(self) -> str | None:
         if self.dataset is None or not self.frames:
@@ -4617,7 +4604,11 @@ class DicomViewer:
         if not rois:
             messagebox.showinfo("안내", "영구 ROI 측정이 없습니다.")
             return
-        role = simple_prompt(self.root, "ROI 역할", "역할 입력 (none/signal/background/noise):")
+        role = simple_prompt(
+            self.root,
+            "ROI 분류 (SNR/CNR)",
+            "분석용 ROI 분류 입력 (signal/background/noise 또는 none):",
+        )
         if role is None:
             return
         role = role.strip().lower()
