@@ -199,28 +199,45 @@ class DicomViewer:
         self.compare_sync_status_var = tk.StringVar(value="비교 동기: Off")
         self.snr_workflow_var = tk.StringVar(value="SNR: Idle")
         self.guided_snr_state: dict[str, Any] | None = None
-        self.analysis_inputs: dict[str, tk.StringVar] = {
+        self.signal_analysis_inputs: dict[str, tk.StringVar] = {
             "snr_signal_roi_id": tk.StringVar(value=""),
-            "snr_noise_roi_id": tk.StringVar(value=""),
+            "snr_background_roi_id": tk.StringVar(value=""),
             "cnr_formula": tk.StringVar(value="standard_noise"),
             "cnr_target_roi_id": tk.StringVar(value=""),
             "cnr_reference_roi_id": tk.StringVar(value=""),
             "cnr_noise_roi_id": tk.StringVar(value=""),
             "line_profile_line_id": tk.StringVar(value=""),
         }
-        self.analysis_results: dict[str, tk.StringVar] = {
+        self.signal_analysis_results: dict[str, tk.StringVar] = {
             "snr_preview": tk.StringVar(value="Preview: -"),
             "snr_result": tk.StringVar(value="Result: -"),
             "cnr_preview": tk.StringVar(value="Preview: -"),
             "cnr_result": tk.StringVar(value="Result: -"),
             "line_info": tk.StringVar(value="Line: -"),
         }
+        self.image_analysis_inputs: dict[str, tk.StringVar] = {
+            "reference_image_id": tk.StringVar(value=""),
+            "target_image_id": tk.StringVar(value=""),
+            "scope_type": tk.StringVar(value="full"),
+            "scope_roi_id": tk.StringVar(value=""),
+        }
+        self.image_analysis_results: dict[str, tk.StringVar] = {
+            "image_formula": tk.StringVar(value="Formula: MSE/PSNR/SSIM/Histogram"),
+            "image_result": tk.StringVar(value="Result: -"),
+        }
+        self.analysis_inputs = self.signal_analysis_inputs
+        self.analysis_results = self.signal_analysis_results
         self._analysis_option_maps: dict[str, dict[str, str]] = {
             "roi": {},
             "line": {},
         }
+        self._image_analysis_option_maps: dict[str, dict[str, str]] = {
+            "image": {},
+            "roi": {},
+        }
         self.analysis_last_run: dict[str, dict[str, Any]] = {}
         self._analysis_comboboxes: dict[str, ttk.Combobox] = {}
+        self._image_analysis_comboboxes: dict[str, ttk.Combobox] = {}
         self._cnr_noise_widgets: list[tk.Widget] = []
         self.shortcut_var = tk.StringVar(
             value=(
@@ -236,6 +253,11 @@ class DicomViewer:
         self.path_info_label: ttk.Label | None = None
         self.summary_info_label: ttk.Label | None = None
         self.shortcut_info_label: ttk.Label | None = None
+        self.main_vertical_split: tk.PanedWindow | None = None
+        self.top_controls_container: ttk.Frame | None = None
+        self.viewer_container: ttk.Frame | None = None
+        self.controls_min_height = 170
+        self.viewer_min_height = 280
         self.ui_colors = {
             "bg_root": "#FAFAFA",
             "bg_surface": "#FFFFFF",
@@ -295,32 +317,44 @@ class DicomViewer:
         )
 
     def _build_ui(self) -> None:
-        toolbar_container = ttk.Frame(self.root, padding=12)
-        toolbar_container.pack(fill="x")
+        self.main_vertical_split = tk.PanedWindow(
+            self.root,
+            orient=tk.VERTICAL,
+            sashrelief=tk.RAISED,
+            sashwidth=8,
+            opaqueresize=True,
+            bg=self.ui_colors["bg_root"],
+            bd=0,
+            relief="flat",
+        )
+        self.main_vertical_split.pack(fill="both", expand=True)
+
+        toolbar_container = ttk.Frame(self.main_vertical_split, padding=12)
+        self.top_controls_container = toolbar_container
         self._build_toolbar_tabs(toolbar_container)
         self._build_status_row(toolbar_container)
-        self._build_collapsible_info_panel()
+        self._build_collapsible_info_panel(toolbar_container)
+        self.main_vertical_split.add(toolbar_container, minsize=self.controls_min_height, stretch="never")
 
-        self.content_container = ttk.Frame(self.root, padding=(12, 0, 12, 12))
-        self.content_container.pack(fill="both", expand=True)
+        self.content_container = ttk.Frame(self.main_vertical_split, padding=(12, 0, 12, 12))
+        self.viewer_container = self.content_container
         self.content_container.columnconfigure(0, weight=1)
         self.content_container.rowconfigure(0, weight=1)
+        self.main_vertical_split.add(self.content_container, minsize=self.viewer_min_height, stretch="always")
 
         self.single_view_container = ttk.Frame(self.content_container)
         self.single_view_container.grid(row=0, column=0, sticky="nsew")
-        self.single_view_container.columnconfigure(1, weight=1)
+        self.single_view_container.columnconfigure(0, weight=1)
         self.single_view_container.rowconfigure(0, weight=1)
-
-        self._build_draw_tool_sidebar(self.single_view_container)
 
         self.canvas = tk.Canvas(self.single_view_container, bg="black", highlightthickness=0)
         x_scroll = ttk.Scrollbar(self.single_view_container, orient="horizontal", command=self.canvas.xview)
         y_scroll = ttk.Scrollbar(self.single_view_container, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(xscrollcommand=x_scroll.set, yscrollcommand=y_scroll.set)
 
-        self.canvas.grid(row=0, column=1, sticky="nsew")
-        y_scroll.grid(row=0, column=2, sticky="ns")
-        x_scroll.grid(row=1, column=1, sticky="ew")
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
         self.canvas.bind("<Configure>", self._on_canvas_resize)
         self.canvas.bind("<ButtonPress-1>", self._handle_left_button_press)
         self.canvas.bind("<B1-Motion>", self._handle_left_button_drag)
@@ -380,6 +414,19 @@ class DicomViewer:
         self._bind_shortcuts()
         self._update_multiview_controls()
         self._update_compare_controls()
+        self.root.after(0, self._set_initial_split_sash)
+
+    def _set_initial_split_sash(self) -> None:
+        if self.main_vertical_split is None:
+            return
+        total_height = max(self.main_vertical_split.winfo_height(), self.root.winfo_height())
+        desired_controls_height = int(np.clip(total_height * 0.32, self.controls_min_height, 360))
+        max_controls_height = max(total_height - self.viewer_min_height, self.controls_min_height)
+        target_y = min(desired_controls_height, max_controls_height)
+        try:
+            self.main_vertical_split.sash_place(0, 0, target_y)
+        except tk.TclError:
+            return
 
     def _build_toolbar_tabs(self, parent: ttk.Frame) -> None:
         notebook = ttk.Notebook(parent)
@@ -612,15 +659,13 @@ class DicomViewer:
         ttk.Button(sections["Transform"], text="Rotate 180°", command=lambda: self.rotate_current_image(180)).pack(side="left", padx=(8, 0))
         ttk.Button(sections["Transform"], text="Rotate 270°", command=lambda: self.rotate_current_image(270)).pack(side="left", padx=(8, 0))
 
-    def _build_draw_tool_sidebar(self, parent: ttk.Frame) -> None:
-        sidebar = ttk.LabelFrame(parent, text="Tools", padding=(6, 6))
-        sidebar.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
-        sidebar.columnconfigure(0, weight=1)
+    def _build_draw_tool_panel(self, parent: ttk.Widget) -> None:
+        parent.columnconfigure(0, weight=1)
         for row, (label, mode) in enumerate(
             [("Pan", "pan"), ("Line", "line"), ("ROI", "roi"), ("Polygon", "polygon")]
         ):
             button = tk.Button(
-                sidebar,
+                parent,
                 text=label,
                 width=10,
                 anchor="w",
@@ -629,11 +674,11 @@ class DicomViewer:
             )
             button.grid(row=row, column=0, sticky="ew", pady=(0, 4))
             self._draw_tool_buttons[mode] = button
-        ttk.Separator(sidebar, orient="horizontal").grid(row=4, column=0, sticky="ew", pady=(2, 6))
-        ttk.Label(sidebar, text="ROI mode").grid(row=5, column=0, sticky="w")
-        ttk.Radiobutton(sidebar, text="Grid ROI", value="grid", variable=self.roi_draw_mode).grid(row=6, column=0, sticky="w")
-        ttk.Radiobutton(sidebar, text="Free ROI", value="free", variable=self.roi_draw_mode).grid(row=7, column=0, sticky="w")
-        ttk.Label(sidebar, text="Grid ON → polygon snap").grid(row=8, column=0, sticky="w", pady=(6, 0))
+        ttk.Separator(parent, orient="horizontal").grid(row=4, column=0, sticky="ew", pady=(2, 6))
+        ttk.Label(parent, text="ROI mode").grid(row=5, column=0, sticky="w")
+        ttk.Radiobutton(parent, text="Grid ROI", value="grid", variable=self.roi_draw_mode).grid(row=6, column=0, sticky="w")
+        ttk.Radiobutton(parent, text="Free ROI", value="free", variable=self.roi_draw_mode).grid(row=7, column=0, sticky="w")
+        ttk.Label(parent, text="Grid ON → polygon snap").grid(row=8, column=0, sticky="w", pady=(6, 0))
 
     def _set_measurement_mode(self, mode: str) -> None:
         self.measurement_mode.set(mode)
@@ -654,6 +699,10 @@ class DicomViewer:
 
     def _build_measure_toolbar(self, tab: ttk.Frame) -> None:
         strip = self._build_grouped_toolbar_strip(tab)
+
+        tools_group = ttk.LabelFrame(strip, text="Tools", padding=(8, 6))
+        tools_group.pack(side="left", padx=(0, 8), fill="y")
+        self._build_draw_tool_panel(tools_group)
 
         grid_group = ttk.LabelFrame(strip, text="Grid", padding=(8, 6))
         grid_group.pack(side="left", padx=(0, 8), fill="y")
@@ -731,102 +780,94 @@ class DicomViewer:
         )
 
     def _build_analysis_toolbar(self, tab: ttk.Frame) -> None:
-        strip = self._build_grouped_toolbar_strip(tab)
+        analysis_notebook = ttk.Notebook(tab)
+        analysis_notebook.pack(fill="x")
 
+        signal_tab = ttk.Frame(analysis_notebook, padding=(4, 4, 4, 4))
+        image_tab = ttk.Frame(analysis_notebook, padding=(4, 4, 4, 4))
+        analysis_notebook.add(signal_tab, text="Signal Analysis")
+        analysis_notebook.add(image_tab, text="Image Analysis")
+
+        signal_strip = self._build_grouped_toolbar_strip(signal_tab)
+        self._build_signal_analysis_toolbar(signal_strip)
+        self._build_image_analysis_toolbar(image_tab)
+        self.analysis_inputs["cnr_formula"].trace_add("write", self._update_cnr_formula_ui)
+        self.image_analysis_inputs["scope_type"].trace_add("write", self._update_image_scope_ui)
+        self._update_cnr_formula_ui()
+        self._update_image_scope_ui()
+        self._refresh_analysis_selectors()
+
+    def _build_signal_analysis_toolbar(self, strip: ttk.Frame) -> None:
         snr_group = ttk.LabelFrame(strip, text="SNR", padding=(8, 6))
         snr_group.pack(side="left", padx=(0, 8), fill="y")
         ttk.Label(snr_group, text="Input: Signal ROI").grid(row=0, column=0, sticky="w")
-        self._analysis_comboboxes["snr_signal"] = ttk.Combobox(
-            snr_group,
-            state="readonly",
-            width=46,
-        )
+        self._analysis_comboboxes["snr_signal"] = ttk.Combobox(snr_group, state="readonly", width=42)
         self._analysis_comboboxes["snr_signal"].grid(row=1, column=0, sticky="ew", pady=(2, 4))
-        ttk.Label(snr_group, text="Input: Noise ROI").grid(row=2, column=0, sticky="w")
-        self._analysis_comboboxes["snr_noise"] = ttk.Combobox(
-            snr_group,
-            state="readonly",
-            width=46,
-        )
+        ttk.Label(snr_group, text="Input: Background ROI").grid(row=2, column=0, sticky="w")
+        self._analysis_comboboxes["snr_noise"] = ttk.Combobox(snr_group, state="readonly", width=42)
         self._analysis_comboboxes["snr_noise"].grid(row=3, column=0, sticky="ew", pady=(2, 4))
-        ttk.Label(snr_group, text="Formula: mean(Signal ROI) / std(Noise ROI)").grid(row=4, column=0, sticky="w")
-        ttk.Label(snr_group, textvariable=self.analysis_results["snr_preview"]).grid(row=5, column=0, sticky="w", pady=(2, 0))
-        ttk.Label(snr_group, textvariable=self.analysis_results["snr_result"]).grid(row=6, column=0, sticky="w", pady=(2, 0))
+        ttk.Label(snr_group, text="Formula: mean(Signal ROI) / std(Background ROI)").grid(row=4, column=0, sticky="w")
+        ttk.Label(snr_group, textvariable=self.signal_analysis_results["snr_preview"]).grid(row=5, column=0, sticky="w", pady=(2, 0))
+        ttk.Label(snr_group, textvariable=self.signal_analysis_results["snr_result"]).grid(row=6, column=0, sticky="w", pady=(2, 0))
         ttk.Button(snr_group, text="Calculate SNR", command=self.calculate_snr_from_inputs).grid(row=7, column=0, sticky="ew", pady=(6, 0))
 
         cnr_group = ttk.LabelFrame(strip, text="CNR", padding=(8, 6))
         cnr_group.pack(side="left", padx=(0, 8), fill="y")
         formula_cards = ttk.LabelFrame(cnr_group, text="Formula Selection", padding=(6, 4))
         formula_cards.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        ttk.Radiobutton(
-            formula_cards,
-            text=(
-                "Option A | |S_A - S_B| / sigma_o\n"
-                "Uses background noise std.\n"
-                "Required: Region A ROI, Region B ROI, Noise ROI"
-            ),
-            value="standard_noise",
-            variable=self.analysis_inputs["cnr_formula"],
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(
-            formula_cards,
-            text=(
-                "Option B | |S_A - S_B| / sqrt(sigma_A^2 + sigma_B^2)\n"
-                "Uses both region variances.\n"
-                "Required: Region A ROI, Region B ROI"
-            ),
-            value="dual_variance",
-            variable=self.analysis_inputs["cnr_formula"],
-        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
-
-        ttk.Label(cnr_group, text="Input: Region A ROI").grid(row=1, column=0, sticky="w")
-        self._analysis_comboboxes["cnr_target"] = ttk.Combobox(
-            cnr_group,
-            state="readonly",
-            width=46,
-        )
+        ttk.Radiobutton(formula_cards, text="Option A | |S_A - S_B| / sigma_o", value="standard_noise", variable=self.analysis_inputs["cnr_formula"]).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(formula_cards, text="Option B | |S_A - S_B| / sqrt(sigma_A^2 + sigma_B^2)", value="dual_variance", variable=self.analysis_inputs["cnr_formula"]).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(cnr_group, text="Input: Signal ROI").grid(row=1, column=0, sticky="w")
+        self._analysis_comboboxes["cnr_target"] = ttk.Combobox(cnr_group, state="readonly", width=42)
         self._analysis_comboboxes["cnr_target"].grid(row=2, column=0, sticky="ew", pady=(2, 4))
-        ttk.Label(cnr_group, text="Input: Region B ROI").grid(row=3, column=0, sticky="w")
-        self._analysis_comboboxes["cnr_reference"] = ttk.Combobox(
-            cnr_group,
-            state="readonly",
-            width=46,
-        )
+        ttk.Label(cnr_group, text="Input: Reference ROI").grid(row=3, column=0, sticky="w")
+        self._analysis_comboboxes["cnr_reference"] = ttk.Combobox(cnr_group, state="readonly", width=42)
         self._analysis_comboboxes["cnr_reference"].grid(row=4, column=0, sticky="ew", pady=(2, 4))
-        noise_label = ttk.Label(cnr_group, text="Input: Noise ROI")
+        noise_label = ttk.Label(cnr_group, text="Input: Background ROI")
         noise_label.grid(row=5, column=0, sticky="w")
-        self._analysis_comboboxes["cnr_noise"] = ttk.Combobox(
-            cnr_group,
-            state="readonly",
-            width=46,
-        )
+        self._analysis_comboboxes["cnr_noise"] = ttk.Combobox(cnr_group, state="readonly", width=42)
         self._analysis_comboboxes["cnr_noise"].grid(row=6, column=0, sticky="ew", pady=(2, 4))
         self._cnr_noise_widgets = [noise_label, self._analysis_comboboxes["cnr_noise"]]
-        ttk.Label(cnr_group, textvariable=self.analysis_results["cnr_preview"]).grid(row=7, column=0, sticky="w", pady=(2, 0))
-        ttk.Label(cnr_group, textvariable=self.analysis_results["cnr_result"]).grid(row=8, column=0, sticky="w", pady=(2, 0))
+        ttk.Label(cnr_group, textvariable=self.signal_analysis_results["cnr_preview"]).grid(row=7, column=0, sticky="w", pady=(2, 0))
+        ttk.Label(cnr_group, textvariable=self.signal_analysis_results["cnr_result"]).grid(row=8, column=0, sticky="w", pady=(2, 0))
         ttk.Button(cnr_group, text="Calculate CNR", command=self.calculate_cnr_from_inputs).grid(row=9, column=0, sticky="ew", pady=(6, 0))
 
         line_group = ttk.LabelFrame(strip, text="Line Profile", padding=(8, 6))
         line_group.pack(side="left", padx=(0, 8), fill="y")
         ttk.Label(line_group, text="Input: Profile Line").grid(row=0, column=0, sticky="w")
-        self._analysis_comboboxes["line_profile"] = ttk.Combobox(
-            line_group,
-            state="readonly",
-            width=46,
-        )
+        self._analysis_comboboxes["line_profile"] = ttk.Combobox(line_group, state="readonly", width=42)
         self._analysis_comboboxes["line_profile"].grid(row=1, column=0, sticky="ew", pady=(2, 4))
         ttk.Label(line_group, text="Formula: intensity(x) sampled along selected line").grid(row=2, column=0, sticky="w")
-        ttk.Label(line_group, textvariable=self.analysis_results["line_info"]).grid(row=3, column=0, sticky="w", pady=(2, 0))
-        ttk.Button(line_group, text="Show Line Profile", command=self.show_line_profile_for_selected_line).grid(
-            row=4, column=0, sticky="ew", pady=(6, 0)
-        )
-        ttk.Button(line_group, text="ROI 역할 분류(CNR 고급)", command=self.assign_roi_role).grid(
-            row=5, column=0, sticky="ew", pady=(4, 0)
-        )
-        ttk.Label(line_group, textvariable=self.snr_workflow_var).grid(row=6, column=0, sticky="w", pady=(2, 0))
-        self.analysis_inputs["cnr_formula"].trace_add("write", self._update_cnr_formula_ui)
-        self._update_cnr_formula_ui()
-        self._refresh_analysis_selectors()
+        ttk.Label(line_group, textvariable=self.signal_analysis_results["line_info"]).grid(row=3, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(line_group, text="Show Line Profile", command=self.show_line_profile_for_selected_line).grid(row=4, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(line_group, textvariable=self.snr_workflow_var).grid(row=5, column=0, sticky="w", pady=(2, 0))
+
+    def _build_image_analysis_toolbar(self, tab: ttk.Frame) -> None:
+        frame = ttk.Frame(tab)
+        frame.pack(fill="x")
+        pairing_group = ttk.LabelFrame(frame, text="Image Pairing", padding=(8, 6))
+        pairing_group.pack(side="left", padx=(0, 8), fill="y")
+        ttk.Label(pairing_group, text="Reference Image").grid(row=0, column=0, sticky="w")
+        self._image_analysis_comboboxes["reference_image"] = ttk.Combobox(pairing_group, state="readonly", width=52)
+        self._image_analysis_comboboxes["reference_image"].grid(row=1, column=0, sticky="ew", pady=(2, 4))
+        ttk.Label(pairing_group, text="Target Image").grid(row=2, column=0, sticky="w")
+        self._image_analysis_comboboxes["target_image"] = ttk.Combobox(pairing_group, state="readonly", width=52)
+        self._image_analysis_comboboxes["target_image"].grid(row=3, column=0, sticky="ew", pady=(2, 4))
+        ttk.Button(pairing_group, text="현재 이미지를 Reference로", command=self._set_current_image_as_reference).grid(row=4, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(pairing_group, text="현재 이미지를 Target으로", command=self._set_current_image_as_target).grid(row=5, column=0, sticky="ew", pady=(4, 0))
+
+        scope_group = ttk.LabelFrame(frame, text="Scope", padding=(8, 6))
+        scope_group.pack(side="left", padx=(0, 8), fill="y")
+        ttk.Radiobutton(scope_group, text="Full Image", value="full", variable=self.image_analysis_inputs["scope_type"]).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(scope_group, text="Selected ROI", value="roi", variable=self.image_analysis_inputs["scope_type"]).grid(row=1, column=0, sticky="w")
+        self._image_analysis_comboboxes["scope_roi"] = ttk.Combobox(scope_group, state="readonly", width=42)
+        self._image_analysis_comboboxes["scope_roi"].grid(row=2, column=0, sticky="ew", pady=(6, 0))
+
+        result_group = ttk.LabelFrame(frame, text="Image Metrics", padding=(8, 6))
+        result_group.pack(side="left", padx=(0, 8), fill="y")
+        ttk.Label(result_group, textvariable=self.image_analysis_results["image_formula"]).grid(row=0, column=0, sticky="w")
+        ttk.Label(result_group, textvariable=self.image_analysis_results["image_result"]).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(result_group, text="Calculate SSIM / PSNR / MSE / HIST", command=self.calculate_image_comparison_metrics).grid(row=2, column=0, sticky="ew", pady=(8, 0))
 
     def _refresh_analysis_selectors(self) -> None:
         roi_options = self._build_roi_analysis_options()
@@ -841,11 +882,37 @@ class DicomViewer:
         if "line_profile" in self._analysis_comboboxes:
             self._analysis_comboboxes["line_profile"]["values"] = line_labels
         self._sync_analysis_display_value("roi", "snr_signal", "snr_signal_roi_id")
-        self._sync_analysis_display_value("roi", "snr_noise", "snr_noise_roi_id")
+        self._sync_analysis_display_value("roi", "snr_noise", "snr_background_roi_id")
         self._sync_analysis_display_value("roi", "cnr_target", "cnr_target_roi_id")
         self._sync_analysis_display_value("roi", "cnr_reference", "cnr_reference_roi_id")
         self._sync_analysis_display_value("roi", "cnr_noise", "cnr_noise_roi_id")
         self._sync_analysis_display_value("line", "line_profile", "line_profile_line_id")
+        self._refresh_image_analysis_selectors()
+
+    def _refresh_image_analysis_selectors(self) -> None:
+        image_options = self._build_image_analysis_options()
+        roi_options = self._build_roi_analysis_options()
+        self._image_analysis_option_maps["image"] = {label: image_id for image_id, label in image_options}
+        self._image_analysis_option_maps["roi"] = {label: measurement_id for measurement_id, label in roi_options}
+        image_labels = [label for _, label in image_options]
+        roi_labels = [label for _, label in roi_options]
+        for key in ("reference_image", "target_image"):
+            if key in self._image_analysis_comboboxes:
+                self._image_analysis_comboboxes[key]["values"] = image_labels
+        if "scope_roi" in self._image_analysis_comboboxes:
+            self._image_analysis_comboboxes["scope_roi"]["values"] = roi_labels
+        self._sync_image_analysis_display_value("image", "reference_image", "reference_image_id")
+        self._sync_image_analysis_display_value("image", "target_image", "target_image_id")
+        self._sync_image_analysis_display_value("roi", "scope_roi", "scope_roi_id")
+
+    def _build_image_analysis_options(self) -> list[tuple[str, str]]:
+        options: list[tuple[str, str]] = []
+        for index, path in enumerate(self.file_paths):
+            options.append((path, f"Image {index + 1}: {Path(path).name}"))
+        if not options and self.path_var.get().strip():
+            current = self.path_var.get().strip()
+            options.append((current, f"Current: {Path(current).name}"))
+        return options
 
     def _update_cnr_formula_ui(self, *_args: object) -> None:
         formula = self.analysis_inputs["cnr_formula"].get()
@@ -863,6 +930,34 @@ class DicomViewer:
         else:
             self.analysis_results["cnr_preview"].set("Formula: |S_A - S_B| / sigma_o")
         self.analysis_results["cnr_result"].set("Result: -")
+
+    def _update_image_scope_ui(self, *_args: object) -> None:
+        is_roi_scope = self.image_analysis_inputs["scope_type"].get() == "roi"
+        scope_combobox = self._image_analysis_comboboxes.get("scope_roi")
+        if scope_combobox is None:
+            return
+        if is_roi_scope:
+            scope_combobox.grid()
+        else:
+            scope_combobox.grid_remove()
+            self.image_analysis_inputs["scope_roi_id"].set("")
+            scope_combobox.set("")
+
+    def _sync_image_analysis_display_value(self, kind: str, combobox_key: str, input_key: str) -> None:
+        combobox = self._image_analysis_comboboxes.get(combobox_key)
+        if combobox is None:
+            return
+        selected_id = self.image_analysis_inputs[input_key].get()
+        if not selected_id:
+            combobox.set("")
+            return
+        option_map = self._image_analysis_option_maps.get(kind, {})
+        for label, option_id in option_map.items():
+            if option_id == selected_id:
+                combobox.set(label)
+                return
+        self.image_analysis_inputs[input_key].set("")
+        combobox.set("")
 
     def _sync_analysis_display_value(self, kind: str, combobox_key: str, input_key: str) -> None:
         combobox = self._analysis_comboboxes.get(combobox_key)
@@ -929,19 +1024,27 @@ class DicomViewer:
         }
 
     def _get_selected_measurement_from_analysis(self, kind: str, input_key: str, combobox_key: str) -> Measurement | None:
-        selected_label = self._analysis_comboboxes.get(combobox_key).get() if combobox_key in self._analysis_comboboxes else ""
+        input_store = self.analysis_inputs if input_key in self.analysis_inputs else self.image_analysis_inputs
+        if combobox_key in self._analysis_comboboxes:
+            selected_label = self._analysis_comboboxes[combobox_key].get()
+            option_map = self._analysis_option_maps.get(kind, {})
+        else:
+            selected_label = self._image_analysis_comboboxes.get(combobox_key).get() if combobox_key in self._image_analysis_comboboxes else ""
+            option_map = self._image_analysis_option_maps.get(kind, {})
         if selected_label:
-            mapped_id = self._analysis_option_maps.get(kind, {}).get(selected_label, "")
+            mapped_id = option_map.get(selected_label, "")
             if mapped_id:
-                self.analysis_inputs[input_key].set(mapped_id)
-        selected_id = self.analysis_inputs[input_key].get()
+                input_store[input_key].set(mapped_id)
+        selected_id = input_store[input_key].get()
         selected = self._find_measurement_by_id(selected_id, expected_kind=kind)
         if selected is None:
             return None
         if not self._is_analysis_compatible_measurement(selected):
-            self.analysis_inputs[input_key].set("")
+            input_store[input_key].set("")
             if combobox_key in self._analysis_comboboxes:
                 self._analysis_comboboxes[combobox_key].set("")
+            elif combobox_key in self._image_analysis_comboboxes:
+                self._image_analysis_comboboxes[combobox_key].set("")
             return None
         return selected
 
@@ -967,8 +1070,8 @@ class DicomViewer:
         ttk.Label(status, textvariable=self.cursor_var).pack(side="left", padx=(12, 0))
         ttk.Button(status, textvariable=self.info_toggle_var, command=self._toggle_info_panel).pack(side="right")
 
-    def _build_collapsible_info_panel(self) -> None:
-        self.info_panel_frame = ttk.Frame(self.root, padding=(12, 4, 12, 6))
+    def _build_collapsible_info_panel(self, parent: ttk.Frame) -> None:
+        self.info_panel_frame = ttk.Frame(parent, padding=(12, 4, 12, 6))
         self.path_info_label = ttk.Label(self.info_panel_frame, textvariable=self.path_var)
         self.path_info_label.pack(fill="x", anchor="w")
         self.summary_info_label = ttk.Label(
@@ -4592,14 +4695,12 @@ class DicomViewer:
         ctrl_pressed = bool(event.state & 0x4)
         if existing_measurement_id is not None:
             self._apply_measurement_selection(existing_measurement_id, toggle=ctrl_pressed)
-            self._draw_preview_measurements()
-            self._draw_persistent_measurements()
+            self._show_frame()
             return
         created_measurement = self.select_roi_from_grid(row, col)
         if created_measurement is not None:
             self._apply_measurement_selection(created_measurement.id, toggle=ctrl_pressed)
-        self._draw_preview_measurements()
-        self._draw_persistent_measurements()
+        self._show_frame()
 
     def get_grid_cell(self, canvas_x: float, canvas_y: float) -> tuple[int, int] | None:
         image_point = self._canvas_to_image_pixel(canvas_x, canvas_y)
@@ -4660,14 +4761,12 @@ class DicomViewer:
     def _canonicalize_measurement_meta(self, measurement: Measurement, metrics: dict[str, Any]) -> dict[str, Any]:
         raw_meta = dict(measurement.meta or {})
         grid_cell = self._extract_grid_cell_meta(raw_meta)
-        roi_role = str(raw_meta.get("roi_role", "none"))
         geometry = dict(metrics.get("geometry") or {})
         analysis = dict(metrics.get("analysis") or {})
         canonical: dict[str, Any] = {
             "metrics": metrics,
             "geometry": geometry,
             "analysis": analysis,
-            "roi_role": roi_role,
         }
         if measurement.kind == "roi":
             roi_type = str(raw_meta.get("roi_type") or ("grid" if grid_cell is not None else "free"))
@@ -5173,7 +5272,10 @@ class DicomViewer:
             return True
         return False
 
-    def _apply_measurement_selection(self, measurement_id: str) -> None:
+    def _apply_measurement_selection(self, measurement_id: str, toggle: bool = False) -> None:
+        if toggle and self.selected_persistent_measurement_id == measurement_id:
+            self.selected_persistent_measurement_id = None
+            return
         self.selected_persistent_measurement_id = measurement_id
 
     def register_measurement_hit_target(self, item_id: int, measurement_id: str) -> None:
@@ -5224,7 +5326,7 @@ class DicomViewer:
             frame_index=int(self.current_frame),
             geometry_key=geometry_key,
             summary_text="",
-            meta={"roi_role": "none", **(extra_meta or {})},
+            meta={**(extra_meta or {})},
         )
         metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
         measurement.summary_text = metrics["summary"]
@@ -5696,7 +5798,7 @@ class DicomViewer:
 
     def calculate_snr_from_inputs(self) -> None:
         signal_roi = self._get_selected_measurement_from_analysis("roi", "snr_signal_roi_id", "snr_signal")
-        noise_roi = self._get_selected_measurement_from_analysis("roi", "snr_noise_roi_id", "snr_noise")
+        noise_roi = self._get_selected_measurement_from_analysis("roi", "snr_background_roi_id", "snr_noise")
         if signal_roi is None or noise_roi is None:
             self.analysis_results["snr_preview"].set("Preview: Select Signal ROI and Noise ROI")
             self.analysis_results["snr_result"].set("Result: -")
@@ -5787,24 +5889,110 @@ class DicomViewer:
             "result": float(cnr),
         }
 
-    def assign_roi_role(self) -> None:
-        rois = [item for item in self.persistent_measurements if item.kind == "roi"]
-        if not rois:
-            messagebox.showinfo("안내", "영구 ROI 측정이 없습니다.")
+    def _set_current_image_as_reference(self) -> None:
+        path = self._get_current_image_path()
+        if not path:
             return
-        role = simple_prompt(
-            self.root,
-            "ROI 분류 (SNR/CNR)",
-            "분석용 ROI 분류 입력 (signal/background/noise 또는 none):",
+        self.image_analysis_inputs["reference_image_id"].set(path)
+        self._sync_image_analysis_display_value("image", "reference_image", "reference_image_id")
+
+    def _set_current_image_as_target(self) -> None:
+        path = self._get_current_image_path()
+        if not path:
+            return
+        self.image_analysis_inputs["target_image_id"].set(path)
+        self._sync_image_analysis_display_value("image", "target_image", "target_image_id")
+
+    def _get_current_image_path(self) -> str:
+        if self.file_paths and 0 <= self.current_file_index < len(self.file_paths):
+            return self.file_paths[self.current_file_index]
+        return self.path_var.get().strip()
+
+    def _resolve_image_analysis_selection(self, input_key: str, combobox_key: str, kind: str) -> str:
+        label = self._image_analysis_comboboxes.get(combobox_key).get() if combobox_key in self._image_analysis_comboboxes else ""
+        if label:
+            mapped = self._image_analysis_option_maps.get(kind, {}).get(label, "")
+            if mapped:
+                self.image_analysis_inputs[input_key].set(mapped)
+        return self.image_analysis_inputs[input_key].get()
+
+    def _load_analysis_image_array(self, image_id: str) -> np.ndarray | None:
+        if not image_id:
+            return None
+        try:
+            _dataset, frames = self.dicom_loader.get_decoded_file(image_id)
+        except Exception:
+            return None
+        if not frames:
+            return None
+        frame = np.asarray(frames[0], dtype=np.float64)
+        if frame.ndim > 2:
+            frame = frame[..., 0]
+        return frame
+
+    @staticmethod
+    def _compute_simple_ssim(reference: np.ndarray, target: np.ndarray) -> float:
+        ref = reference.astype(np.float64)
+        tar = target.astype(np.float64)
+        c1 = (0.01 * 255) ** 2
+        c2 = (0.03 * 255) ** 2
+        mu_x = float(np.mean(ref))
+        mu_y = float(np.mean(tar))
+        sigma_x = float(np.var(ref))
+        sigma_y = float(np.var(tar))
+        sigma_xy = float(np.mean((ref - mu_x) * (tar - mu_y)))
+        numerator = (2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)
+        denominator = (mu_x**2 + mu_y**2 + c1) * (sigma_x + sigma_y + c2)
+        if denominator == 0:
+            return 0.0
+        return float(numerator / denominator)
+
+    def calculate_image_comparison_metrics(self) -> None:
+        reference_id = self._resolve_image_analysis_selection("reference_image_id", "reference_image", "image")
+        target_id = self._resolve_image_analysis_selection("target_image_id", "target_image", "image")
+        if not reference_id or not target_id:
+            self.image_analysis_results["image_result"].set("Result: Select reference and target image")
+            return
+        reference = self._load_analysis_image_array(reference_id)
+        target = self._load_analysis_image_array(target_id)
+        if reference is None or target is None:
+            self.image_analysis_results["image_result"].set("Result: Failed to load image pair")
+            return
+        min_h = min(reference.shape[0], target.shape[0])
+        min_w = min(reference.shape[1], target.shape[1])
+        reference = reference[:min_h, :min_w]
+        target = target[:min_h, :min_w]
+        if self.image_analysis_inputs["scope_type"].get() == "roi":
+            self._resolve_image_analysis_selection("scope_roi_id", "scope_roi", "roi")
+            roi = self._get_selected_measurement_from_analysis("roi", "scope_roi_id", "scope_roi")
+            if roi is None:
+                self.image_analysis_results["image_result"].set("Result: Select scope ROI")
+                return
+            x0 = int(max(min(roi.start[0], roi.end[0]), 0))
+            y0 = int(max(min(roi.start[1], roi.end[1]), 0))
+            x1 = int(min(max(roi.start[0], roi.end[0]), min_w - 1))
+            y1 = int(min(max(roi.start[1], roi.end[1]), min_h - 1))
+            if x1 <= x0 or y1 <= y0:
+                self.image_analysis_results["image_result"].set("Result: Invalid ROI scope")
+                return
+            reference = reference[y0:y1, x0:x1]
+            target = target[y0:y1, x0:x1]
+        diff = reference - target
+        mse = float(np.mean(diff**2))
+        max_val = float(max(np.max(reference), np.max(target), 1.0))
+        psnr = float("inf") if mse <= 0 else float(20 * np.log10(max_val / np.sqrt(mse)))
+        ssim = self._compute_simple_ssim(reference, target)
+        hist_ref, _ = np.histogram(reference, bins=64, range=(np.min(reference), np.max(reference) + 1e-6), density=True)
+        hist_tar, _ = np.histogram(target, bins=64, range=(np.min(target), np.max(target) + 1e-6), density=True)
+        hist_corr = float(np.corrcoef(hist_ref, hist_tar)[0, 1]) if np.std(hist_ref) > 0 and np.std(hist_tar) > 0 else 0.0
+        scope_text = "Full Image" if self.image_analysis_inputs["scope_type"].get() == "full" else "Selected ROI"
+        self.image_analysis_results["image_formula"].set(f"Formula: scope={scope_text}, SSIM/PSNR/MSE/HIST")
+        self.image_analysis_results["image_result"].set(
+            f"Result: MSE={mse:.4f} | PSNR={psnr:.4f} | SSIM={ssim:.4f} | HIST corr={hist_corr:.4f}"
         )
-        if role is None:
-            return
-        role = role.strip().lower()
-        if role not in {"none", "signal", "background", "noise"}:
-            messagebox.showwarning("오류", "지원되지 않는 역할입니다.")
-            return
-        rois[-1].meta["roi_role"] = role
-        self._draw_persistent_measurements()
+
+    def assign_roi_role(self) -> None:
+        messagebox.showinfo("안내", "ROI 역할 고정 저장은 제거되었습니다. Signal Analysis 입력 슬롯을 사용하세요.")
 
     def start_guided_snr_workflow(self) -> None:
         if not self.frames:
@@ -5845,7 +6033,6 @@ class DicomViewer:
             return
         step = state.get("step")
         if step == "signal":
-            measurement.meta["roi_role"] = "signal"
             state["signal_id"] = measurement.id
             state["step"] = "noise"
             self.snr_workflow_var.set("SNR Step 2/2: Select Noise ROI")
@@ -5853,7 +6040,6 @@ class DicomViewer:
             messagebox.showinfo("SNR Workflow", "Step 2/2: Select Noise ROI")
             return
         if step == "noise":
-            measurement.meta["roi_role"] = "noise"
             state["noise_id"] = measurement.id
             self._draw_persistent_measurements()
             self._finalize_guided_snr_workflow()
@@ -5920,30 +6106,7 @@ class DicomViewer:
         )
 
     def calculate_cnr_from_roles(self) -> None:
-        role_map = {"signal": None, "background": None, "noise": None}
-        for measurement in self.persistent_measurements:
-            if measurement.kind != "roi":
-                continue
-            role = measurement.meta.get("roi_role")
-            if role in role_map and role_map[role] is None:
-                role_map[role] = measurement
-        if role_map["signal"] is None or role_map["noise"] is None or role_map["background"] is None:
-            messagebox.showwarning("역할 부족", "CNR 계산에는 signal/background/noise ROI가 필요합니다.")
-            return
-        signal_stats = self._roi_stats(role_map["signal"])
-        noise_stats = self._roi_stats(role_map["noise"])
-        background_stats = self._roi_stats(role_map["background"])
-        if signal_stats is None or noise_stats is None or background_stats is None:
-            messagebox.showwarning("오류", "ROI 통계를 계산할 수 없습니다.")
-            return
-        signal_mean = signal_stats.mean
-        noise_std = noise_stats.std
-        if noise_std <= 0:
-            messagebox.showwarning("오류", "noise ROI 표준편차가 0입니다.")
-            return
-        background_mean = background_stats.mean
-        cnr = abs(signal_mean - background_mean) / noise_std
-        messagebox.showinfo("CNR", f"CNR = {cnr:.4f}")
+        self.calculate_cnr_from_inputs()
 
     def _render_measurements_on_image(
         self,
