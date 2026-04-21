@@ -149,8 +149,8 @@ class DicomViewer:
         self.compare_restore_state: dict[str, Any] | None = None
         self._load_overlay_preferences()
 
-        self.path_var = tk.StringVar(value="파일이 선택되지 않았습니다.")
-        self.info_var = tk.StringVar(value="파일을 열면 현재 선택 영상의 요약이 표시됩니다.")
+        self.path_var = tk.StringVar(value="")
+        self.info_var = tk.StringVar(value="")
         self.image_var = tk.StringVar(value="이미지: - / -")
         self.frame_var = tk.StringVar(value="프레임: - / -")
         self.window_level_var = tk.StringVar(value="W/L: - / -")
@@ -166,17 +166,74 @@ class DicomViewer:
                 "Home/End 첫/마지막 | PgUp/PgDn 이전/다음 | Shift+PgUp/PgDn 프레임"
             )
         )
+        self.info_panel_expanded = tk.BooleanVar(value=False)
+        self.info_toggle_var = tk.StringVar(value="정보 표시")
+        self.info_panel_frame: ttk.Frame | None = None
+        self.path_info_label: ttk.Label | None = None
+        self.summary_info_label: ttk.Label | None = None
+        self.shortcut_info_label: ttk.Label | None = None
+        self.ui_colors = {
+            "bg_root": "#FAFAFA",
+            "bg_surface": "#FFFFFF",
+            "bg_section": "#F2F4F7",
+            "border": "#E5E7EB",
+            "text_primary": "#1F2937",
+            "text_secondary": "#6B7280",
+            "button_default": "#EEF1F5",
+            "button_hover": "#E4E9F0",
+            "button_active": "#DCEAFE",
+            "overlay_bg": "#111827",
+            "overlay_border": "#374151",
+            "overlay_text": "#F9FAFB",
+        }
+        self._configure_ui_styles()
         self._build_ui()
+
+    def _configure_ui_styles(self) -> None:
+        style = ttk.Style(self.root)
+        self.root.configure(bg=self.ui_colors["bg_root"])
+        style.configure(".", background=self.ui_colors["bg_root"], foreground=self.ui_colors["text_primary"])
+        style.configure("TFrame", background=self.ui_colors["bg_root"])
+        style.configure("TLabel", background=self.ui_colors["bg_root"], foreground=self.ui_colors["text_primary"])
+        style.configure("TLabelframe", background=self.ui_colors["bg_section"], bordercolor=self.ui_colors["border"], relief="solid")
+        style.configure("TLabelframe.Label", background=self.ui_colors["bg_section"], foreground=self.ui_colors["text_primary"])
+        style.configure(
+            "TButton",
+            background=self.ui_colors["button_default"],
+            foreground=self.ui_colors["text_primary"],
+            bordercolor=self.ui_colors["border"],
+            focusthickness=1,
+            focuscolor=self.ui_colors["border"],
+            padding=(8, 4),
+        )
+        style.map(
+            "TButton",
+            background=[
+                ("pressed", self.ui_colors["button_active"]),
+                ("active", self.ui_colors["button_hover"]),
+                ("disabled", "#F3F4F6"),
+            ],
+            foreground=[("disabled", "#9CA3AF")],
+        )
+        style.configure("ToolbarNav.TButton", padding=(8, 4), font=("TkDefaultFont", 10, "bold"))
+        style.map(
+            "ToolbarNav.TButton",
+            foreground=[("disabled", "#9CA3AF"), ("!disabled", self.ui_colors["text_primary"])],
+            background=[
+                ("pressed", self.ui_colors["button_active"]),
+                ("active", self.ui_colors["button_hover"]),
+                ("!disabled", self.ui_colors["button_default"]),
+                ("disabled", "#F3F4F6"),
+            ],
+            relief=[("pressed", "sunken"), ("!pressed", "raised")],
+        )
 
     def _build_ui(self) -> None:
         toolbar_container = ttk.Frame(self.root, padding=12)
         toolbar_container.pack(fill="x")
         self._build_toolbar_tabs(toolbar_container)
         self._build_status_row(toolbar_container)
-
-        ttk.Label(self.root, textvariable=self.path_var, padding=(12, 0)).pack(fill="x")
-        ttk.Label(self.root, textvariable=self.info_var, padding=(12, 6), justify="left", wraplength=1040).pack(fill="x")
-        ttk.Label(self.root, textvariable=self.shortcut_var, padding=(12, 0, 12, 6)).pack(fill="x")
+        self._build_collapsible_info_panel()
 
         self.content_container = ttk.Frame(self.root, padding=(12, 0, 12, 12))
         self.content_container.pack(fill="both", expand=True)
@@ -333,26 +390,80 @@ class DicomViewer:
         wrapper = ttk.Frame(parent)
         wrapper.pack(fill="x")
         wrapper.columnconfigure(1, weight=1)
-
-        canvas = tk.Canvas(wrapper, height=108, highlightthickness=0)
+        canvas_background = self.ui_colors["bg_surface"]
+        canvas = tk.Canvas(wrapper, height=156, highlightthickness=0, bg=canvas_background, bd=0)
         canvas.grid(row=0, column=1, sticky="ew")
-        left_button = ttk.Button(wrapper, text="◀", width=3, command=lambda: canvas.xview_scroll(-2, "units"))
-        right_button = ttk.Button(wrapper, text="▶", width=3, command=lambda: canvas.xview_scroll(2, "units"))
+        canvas.configure(yscrollincrement=16)
+        y_scrollbar = ttk.Scrollbar(wrapper, orient="vertical", command=canvas.yview)
+        y_scrollbar.grid(row=0, column=3, sticky="ns", padx=(4, 0))
+        canvas.configure(yscrollcommand=y_scrollbar.set)
+        left_button = ttk.Button(
+            wrapper,
+            text="◀",
+            width=3,
+            command=lambda: canvas.xview_scroll(-2, "units"),
+            style="ToolbarNav.TButton",
+        )
+        right_button = ttk.Button(
+            wrapper,
+            text="▶",
+            width=3,
+            command=lambda: canvas.xview_scroll(2, "units"),
+            style="ToolbarNav.TButton",
+        )
         left_button.grid(row=0, column=0, padx=(0, 4))
         right_button.grid(row=0, column=2, padx=(4, 0))
 
         strip = ttk.Frame(canvas, padding=(0, 2))
         window_id = canvas.create_window((0, 0), window=strip, anchor="nw")
 
+        def _update_nav_buttons() -> None:
+            left_start, right_end = canvas.xview()
+            left_button.configure(state="disabled" if left_start <= 0.001 else "normal")
+            right_button.configure(state="disabled" if right_end >= 0.999 else "normal")
+
         def _refresh_scroll_region(_event: tk.Event | None = None) -> None:
             canvas.configure(scrollregion=canvas.bbox("all"))
+            _update_nav_buttons()
 
         def _resize_inner(_event: tk.Event) -> None:
             canvas.itemconfigure(window_id, height=max(canvas.winfo_height(), strip.winfo_reqheight()))
             _refresh_scroll_region()
 
+        def _on_mousewheel(event: tk.Event) -> None:
+            if event.state & 0x0001:
+                delta = -2 if event.delta > 0 else 2
+                canvas.xview_scroll(delta, "units")
+            else:
+                delta = -2 if event.delta > 0 else 2
+                canvas.yview_scroll(delta, "units")
+            _update_nav_buttons()
+
+        def _on_linux_mousewheel(event: tk.Event) -> None:
+            if event.num == 4:
+                canvas.yview_scroll(-2, "units")
+            elif event.num == 5:
+                canvas.yview_scroll(2, "units")
+            _update_nav_buttons()
+
         strip.bind("<Configure>", _refresh_scroll_region)
         canvas.bind("<Configure>", _resize_inner)
+        canvas.bind("<MouseWheel>", _on_mousewheel)
+        canvas.bind("<Shift-MouseWheel>", _on_mousewheel)
+        canvas.bind("<Button-4>", _on_linux_mousewheel)
+        canvas.bind("<Button-5>", _on_linux_mousewheel)
+
+        def _bind_wheel(widget: tk.Misc) -> None:
+            widget.bind("<MouseWheel>", _on_mousewheel, add="+")
+            widget.bind("<Shift-MouseWheel>", _on_mousewheel, add="+")
+            widget.bind("<Button-4>", _on_linux_mousewheel, add="+")
+            widget.bind("<Button-5>", _on_linux_mousewheel, add="+")
+            for child in widget.winfo_children():
+                _bind_wheel(child)
+
+        strip.bind("<Map>", lambda _event: _bind_wheel(strip), add="+")
+        canvas.configure(xscrollcommand=lambda _first, _last: _update_nav_buttons())
+        _update_nav_buttons()
         return strip
 
     def _build_home_toolbar(self, tab: ttk.Frame) -> None:
@@ -522,6 +633,61 @@ class DicomViewer:
         ttk.Label(status, textvariable=self.zoom_var).pack(side="left", padx=(12, 0))
         ttk.Label(status, textvariable=self.window_level_var).pack(side="left", padx=(12, 0))
         ttk.Label(status, textvariable=self.cursor_var).pack(side="left", padx=(12, 0))
+        ttk.Button(status, textvariable=self.info_toggle_var, command=self._toggle_info_panel).pack(side="right")
+
+    def _build_collapsible_info_panel(self) -> None:
+        self.info_panel_frame = ttk.Frame(self.root, padding=(12, 4, 12, 6))
+        self.path_info_label = ttk.Label(self.info_panel_frame, textvariable=self.path_var)
+        self.path_info_label.pack(fill="x", anchor="w")
+        self.summary_info_label = ttk.Label(
+            self.info_panel_frame,
+            textvariable=self.info_var,
+            justify="left",
+            wraplength=1040,
+            foreground=self.ui_colors["text_secondary"],
+        )
+        self.summary_info_label.pack(fill="x", anchor="w", pady=(2, 0))
+        self.shortcut_info_label = ttk.Label(
+            self.info_panel_frame,
+            textvariable=self.shortcut_var,
+            foreground=self.ui_colors["text_secondary"],
+        )
+        self.shortcut_info_label.pack(fill="x", anchor="w", pady=(2, 0))
+
+        self.path_var.trace_add("write", self._sync_info_panel_visibility)
+        self.info_var.trace_add("write", self._sync_info_panel_visibility)
+        self.info_panel_expanded.trace_add("write", self._sync_info_panel_visibility)
+        self._sync_info_panel_visibility()
+
+    def _toggle_info_panel(self) -> None:
+        self.info_panel_expanded.set(not self.info_panel_expanded.get())
+
+    def _sync_info_panel_visibility(self, *_args: object) -> None:
+        has_path = bool(self.path_var.get().strip())
+        has_info = bool(self.info_var.get().strip())
+        has_content = has_path or has_info
+        is_expanded = self.info_panel_expanded.get()
+        self.info_toggle_var.set("정보 숨기기" if is_expanded else "정보 표시")
+
+        if self.info_panel_frame is None:
+            return
+
+        if is_expanded and has_content:
+            self.info_panel_frame.pack(fill="x")
+            if self.path_info_label is not None:
+                if has_path:
+                    self.path_info_label.pack(fill="x", anchor="w")
+                else:
+                    self.path_info_label.pack_forget()
+            if self.summary_info_label is not None:
+                if has_info:
+                    self.summary_info_label.pack(fill="x", anchor="w", pady=(2, 0))
+                else:
+                    self.summary_info_label.pack_forget()
+            if self.shortcut_info_label is not None:
+                self.shortcut_info_label.pack(fill="x", anchor="w", pady=(2, 0))
+        else:
+            self.info_panel_frame.pack_forget()
 
     def _bind_shortcuts(self) -> None:
         bindings = [
@@ -2003,6 +2169,33 @@ class DicomViewer:
         if not text:
             return
 
+        text_id = canvas.create_text(
+            x,
+            y,
+            text=text,
+            anchor=anchor,
+            fill=self.ui_colors["overlay_text"],
+            font=font,
+            justify=justify,
+            width=max_width,
+            tags=(tag_prefix, "overlay"),
+        )
+        text_bbox = canvas.bbox(text_id)
+        if text_bbox is not None:
+            left, top, right, bottom = text_bbox
+            backdrop_id = canvas.create_rectangle(
+                left - 6,
+                top - 4,
+                right + 6,
+                bottom + 4,
+                fill=self.ui_colors["overlay_bg"],
+                outline=self.ui_colors["overlay_border"],
+                stipple="gray50",
+                width=1,
+                tags=(f"{tag_prefix}_backdrop", "overlay"),
+            )
+            canvas.tag_lower(backdrop_id, text_id)
+
         shadow_offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
         for index, (dx, dy) in enumerate(shadow_offsets):
             canvas.create_text(
@@ -2010,24 +2203,62 @@ class DicomViewer:
                 y + dy,
                 text=text,
                 anchor=anchor,
-                fill="black",
+                fill="#0B1220",
                 font=font,
                 justify=justify,
                 width=max_width,
                 tags=(f"{tag_prefix}_shadow_{index}", "overlay"),
             )
+            canvas.tag_lower(f"{tag_prefix}_shadow_{index}", text_id)
 
-        canvas.create_text(
+    def _build_measurement_label_parts(self, kind: str, metrics: dict[str, Any], role: str | None = None) -> tuple[str, str]:
+        if kind == "line":
+            primary = f"{self._format_mm_value(metrics['length_mm'])} mm"
+            secondary = f"{metrics['length_px']:.1f} px"
+            return primary, secondary
+
+        width_px = int(round(metrics["width_px"]))
+        height_px = int(round(metrics["height_px"]))
+        area_px = int(round(metrics["area_px"]))
+        primary_lines = [
+            f"W {self._format_mm_value(metrics['width_mm'])} mm",
+            f"H {self._format_mm_value(metrics['height_mm'])} mm",
+            f"A {self._format_mm_value(metrics['area_mm2'])} mm²",
+        ]
+        secondary_lines = [f"W {width_px} px", f"H {height_px} px", f"A {area_px} px²"]
+        if role:
+            secondary_lines.append(f"Role: {role}")
+        return "\n".join(primary_lines), "\n".join(secondary_lines)
+
+    def _draw_measurement_label(
+        self,
+        canvas: tk.Canvas,
+        x: float,
+        y: float,
+        primary_text: str,
+        secondary_text: str,
+        tags: tuple[str, ...],
+        anchor: str = "sw",
+    ) -> list[int]:
+        primary_id = canvas.create_text(
             x,
             y,
-            text=text,
+            text=primary_text,
+            fill="#F9FAFB",
             anchor=anchor,
-            fill="white",
-            font=font,
-            justify=justify,
-            width=max_width,
-            tags=(tag_prefix, "overlay"),
+            font=("TkDefaultFont", 9, "bold"),
+            tags=tags,
         )
+        secondary_id = canvas.create_text(
+            x,
+            y + 16,
+            text=secondary_text,
+            fill="#CBD5E1",
+            anchor=anchor,
+            font=("TkDefaultFont", 8),
+            tags=tags,
+        )
+        return [primary_id, secondary_id]
 
     def _truncate_text_to_width(self, text: str, max_width: int, font: tkfont.Font) -> str:
         if font.measure(text) <= max_width:
@@ -2852,8 +3083,8 @@ class DicomViewer:
         self.zoom_var.set("Zoom: -")
         self.window_level_var.set("W/L: - / -")
         self.multiview_page_var.set("페이지: - / -")
-        self.path_var.set("파일이 선택되지 않았습니다.")
-        self.info_var.set("파일을 열면 현재 선택 영상의 요약이 표시됩니다.")
+        self.path_var.set("")
+        self.info_var.set("")
         self.cursor_var.set("Cursor: -, -")
         for field in self.overlay_field_definitions:
             self.current_overlay_values[field["key"]] = "N/A"
@@ -3922,7 +4153,8 @@ class DicomViewer:
             )
             if image_start is None or image_end is None:
                 return
-            label = self._build_measurement_metrics("roi", image_start, image_end)["summary"]
+            metrics = self._build_measurement_metrics("roi", image_start, image_end)
+            primary_label, secondary_label = self._build_measurement_label_parts("roi", metrics)
         else:
             self.canvas.create_line(
                 start_x,
@@ -3935,15 +4167,16 @@ class DicomViewer:
             )
             if image_start is None or image_end is None:
                 return
-            label = self._build_measurement_metrics("line", image_start, image_end)["summary"]
-        self.canvas.create_text(
+            metrics = self._build_measurement_metrics("line", image_start, image_end)
+            primary_label, secondary_label = self._build_measurement_label_parts("line", metrics)
+        self._draw_measurement_label(
+            self.canvas,
             end_x + 6,
             end_y - 6,
-            text=label,
-            fill="white",
-            anchor="sw",
-            font=("TkDefaultFont", 9, "bold"),
+            primary_label,
+            secondary_label,
             tags=("temp_measurement",),
+            anchor="sw",
         )
 
     def clear_preview_overlay(self) -> None:
@@ -4093,24 +4326,25 @@ class DicomViewer:
                     grid_roi_measurements.append(measurement)
                     continue
                 role = measurement.meta.get("roi_role", "none")
-                label = f"{summary} [{role}]"
+                primary_label, secondary_label = self._build_measurement_label_parts("roi", metrics, role=role)
             else:
                 color = "#e6ff7a" if selected else "#00ffaa"
                 item_id = self.canvas.create_line(
                     sx, sy, ex, ey, fill=color, width=3 if selected else 2, tags=("persistent_measurement",)
                 )
                 self._persistent_canvas_item_to_measurement_id[item_id] = measurement.id
-                label = summary
-            label_id = self.canvas.create_text(
+                primary_label, secondary_label = self._build_measurement_label_parts("line", metrics)
+            label_ids = self._draw_measurement_label(
+                self.canvas,
                 ex + 6,
                 ey - 6,
-                text=label,
-                fill="#f8f8f8",
-                anchor="sw",
-                font=("TkDefaultFont", 9, "bold"),
+                primary_label,
+                secondary_label,
                 tags=("persistent_measurement",),
+                anchor="sw",
             )
-            self._persistent_canvas_item_to_measurement_id[label_id] = measurement.id
+            for label_id in label_ids:
+                self._persistent_canvas_item_to_measurement_id[label_id] = measurement.id
 
         regions = self._build_grid_roi_regions(grid_roi_measurements)
         placed_boxes: list[tuple[float, float, float, float]] = []
