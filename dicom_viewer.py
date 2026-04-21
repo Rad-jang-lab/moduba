@@ -1,15 +1,42 @@
 from pathlib import Path
+import copy
+import csv
+from dataclasses import dataclass, field
+from datetime import datetime
 import json
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any
+import uuid
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pydicom
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
 from pydicom.errors import InvalidDicomError
 from dicom_loader import DicomLoader
+
+
+@dataclass
+class Measurement:
+    id: str
+    kind: str
+    start: tuple[float, float]
+    end: tuple[float, float]
+    frame_index: int
+    geometry_key: str
+    summary_text: str
+    meta: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class MeasurementSet:
+    id: str
+    name: str
+    geometry_key: str
+    created_at: str
+    measurements: list[Measurement] = field(default_factory=list)
 
 
 class DicomViewer:
@@ -42,6 +69,8 @@ class DicomViewer:
         self.measurement_mode = tk.StringVar(value="pan")
         self.temporary_measurements: list[dict[str, Any]] = []
         self._active_temporary_measurement: dict[str, Any] | None = None
+        self.persistent_measurements: list[Measurement] = []
+        self.measurement_sets: dict[str, MeasurementSet] = {}
         self._image_bbox: tuple[float, float, float, float] | None = None
         self.zoom_scale = 1.0
         self.min_zoom_scale = 0.05
@@ -131,76 +160,18 @@ class DicomViewer:
     def _build_ui(self) -> None:
         top = ttk.Frame(self.root, padding=12)
         top.pack(fill="x")
+        self._build_toolbar_tabs(top)
 
-        self.open_file_button = ttk.Button(top, text="DICOM 열기", command=self.open_file)
-        self.open_file_button.pack(side="left")
-        self.open_folder_button = ttk.Button(top, text="폴더 열기", command=self.open_folder)
-        self.open_folder_button.pack(side="left", padx=(8, 0))
-        self.diagnose_button = ttk.Button(top, text="폴더 진단", command=self.diagnose_folder)
-        self.diagnose_button.pack(side="left", padx=(8, 0))
-        self.toggle_view_button = ttk.Button(top, text="단일/멀티 전환", command=self.toggle_view_mode)
-        self.toggle_view_button.pack(side="left", padx=(16, 0))
-        self.prev_image_button = ttk.Button(top, text="이전 이미지", command=lambda: self.change_file(-1))
-        self.prev_image_button.pack(side="left", padx=(16, 0))
-        self.next_image_button = ttk.Button(top, text="다음 이미지", command=lambda: self.change_file(1))
-        self.next_image_button.pack(side="left", padx=(8, 0))
-        self.prev_frame_button = ttk.Button(top, text="이전 프레임", command=lambda: self.change_frame(-1))
-        self.prev_frame_button.pack(side="left", padx=(16, 0))
-        self.next_frame_button = ttk.Button(top, text="다음 프레임", command=lambda: self.change_frame(1))
-        self.next_frame_button.pack(side="left", padx=(8, 0))
-        self.window_level_reset_button = ttk.Button(top, text="W/L 리셋", command=self.reset_window_level)
-        self.window_level_reset_button.pack(side="left", padx=(16, 0))
-        ttk.Checkbutton(
-            top,
-            text="Invert",
-            variable=self.invert_display,
-            command=self._refresh_single_view_image,
-        ).pack(side="left", padx=(8, 0))
-        ttk.Checkbutton(
-            top,
-            text="Grid",
-            variable=self.show_grid_overlay,
-            command=self._refresh_grid_overlay,
-        ).pack(side="left", padx=(8, 0))
-        ttk.Radiobutton(top, text="Pan", value="pan", variable=self.measurement_mode).pack(side="left", padx=(12, 0))
-        ttk.Radiobutton(top, text="ROI", value="roi", variable=self.measurement_mode).pack(side="left", padx=(4, 0))
-        ttk.Radiobutton(top, text="Line", value="line", variable=self.measurement_mode).pack(side="left", padx=(4, 0))
-        ttk.Button(top, text="임시 측정 지우기", command=self.clear_temporary_measurements).pack(side="left", padx=(8, 0))
-        ttk.Checkbutton(
-            top,
-            text="Compare Mode",
-            variable=self.compare_mode_enabled,
-            command=self.toggle_compare_mode,
-        ).pack(side="left", padx=(16, 0))
-        ttk.Checkbutton(
-            top,
-            text="Sync",
-            variable=self.compare_sync_enabled,
-            command=self._update_compare_sync_status,
-        ).pack(side="left", padx=(8, 0))
-        ttk.Button(top, text="Swap Left/Right", command=self.swap_compare_panels).pack(side="left", padx=(8, 0))
-        ttk.Checkbutton(
-            top,
-            text="기본 정보 오버레이",
-            variable=self.show_basic_overlay,
-            command=self.refresh_overlay_display,
-        ).pack(side="left", padx=(16, 0))
-        ttk.Checkbutton(
-            top,
-            text="촬영 정보 오버레이",
-            variable=self.show_acquisition_overlay,
-            command=self.refresh_overlay_display,
-        ).pack(side="left", padx=(8, 0))
-        ttk.Button(top, text="오버레이 항목 설정", command=self.open_overlay_settings).pack(side="left", padx=(12, 0))
-
-        ttk.Label(top, textvariable=self.view_mode_var).pack(side="left", padx=(12, 0))
-        ttk.Label(top, textvariable=self.compare_sync_status_var).pack(side="left", padx=(12, 0))
-        ttk.Label(top, textvariable=self.source_var).pack(side="left", padx=(12, 0))
-        ttk.Label(top, textvariable=self.image_var).pack(side="left", padx=(12, 0))
-        ttk.Label(top, textvariable=self.frame_var).pack(side="left", padx=(12, 0))
-        ttk.Label(top, textvariable=self.zoom_var).pack(side="left", padx=(12, 0))
-        ttk.Label(top, textvariable=self.window_level_var).pack(side="left", padx=(12, 0))
-        ttk.Label(top, textvariable=self.cursor_var).pack(side="left", padx=(12, 0))
+        status_row = ttk.Frame(top)
+        status_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(status_row, textvariable=self.view_mode_var).pack(side="left", padx=(0, 12))
+        ttk.Label(status_row, textvariable=self.compare_sync_status_var).pack(side="left", padx=(0, 12))
+        ttk.Label(status_row, textvariable=self.source_var).pack(side="left", padx=(0, 12))
+        ttk.Label(status_row, textvariable=self.image_var).pack(side="left", padx=(0, 12))
+        ttk.Label(status_row, textvariable=self.frame_var).pack(side="left", padx=(0, 12))
+        ttk.Label(status_row, textvariable=self.zoom_var).pack(side="left", padx=(0, 12))
+        ttk.Label(status_row, textvariable=self.window_level_var).pack(side="left", padx=(0, 12))
+        ttk.Label(status_row, textvariable=self.cursor_var).pack(side="left", padx=(0, 12))
 
         ttk.Label(self.root, textvariable=self.path_var, padding=(12, 0)).pack(fill="x")
         ttk.Label(self.root, textvariable=self.info_var, padding=(12, 6), justify="left", wraplength=1040).pack(fill="x")
@@ -283,6 +254,103 @@ class DicomViewer:
         self._bind_shortcuts()
         self._update_multiview_controls()
         self._update_compare_controls()
+
+    def _build_toolbar_tabs(self, parent: ttk.Frame) -> None:
+        notebook = ttk.Notebook(parent)
+        notebook.pack(fill="x")
+
+        home_tab = ttk.Frame(notebook, padding=(8, 8, 8, 8))
+        image_tab = ttk.Frame(notebook, padding=(8, 8, 8, 8))
+        measure_tab = ttk.Frame(notebook, padding=(8, 8, 8, 8))
+        analysis_tab = ttk.Frame(notebook, padding=(8, 8, 8, 8))
+        export_tab = ttk.Frame(notebook, padding=(8, 8, 8, 8))
+
+        notebook.add(home_tab, text="HOME")
+        notebook.add(image_tab, text="IMAGE")
+        notebook.add(measure_tab, text="MEASURE")
+        notebook.add(analysis_tab, text="ANALYSIS")
+        notebook.add(export_tab, text="EXPORT")
+
+        self.open_file_button = self._add_toolbar_control(home_tab, ttk.Button, text="DICOM 열기", command=self.open_file)
+        self.open_folder_button = self._add_toolbar_control(home_tab, ttk.Button, text="폴더 열기", command=self.open_folder)
+        self.diagnose_button = self._add_toolbar_control(home_tab, ttk.Button, text="폴더 진단", command=self.diagnose_folder)
+        self.toggle_view_button = self._add_toolbar_control(home_tab, ttk.Button, text="단일/멀티 전환", command=self.toggle_view_mode)
+        self._add_toolbar_control(
+            home_tab,
+            ttk.Checkbutton,
+            text="Compare Mode",
+            variable=self.compare_mode_enabled,
+            command=self.toggle_compare_mode,
+        )
+        self._add_toolbar_control(
+            home_tab,
+            ttk.Checkbutton,
+            text="Sync",
+            variable=self.compare_sync_enabled,
+            command=self._update_compare_sync_status,
+        )
+        self._add_toolbar_control(home_tab, ttk.Button, text="Swap Left/Right", command=self.swap_compare_panels)
+        self._add_toolbar_control(
+            home_tab,
+            ttk.Checkbutton,
+            text="기본 정보 오버레이",
+            variable=self.show_basic_overlay,
+            command=self.refresh_overlay_display,
+        )
+        self._add_toolbar_control(
+            home_tab,
+            ttk.Checkbutton,
+            text="촬영 정보 오버레이",
+            variable=self.show_acquisition_overlay,
+            command=self.refresh_overlay_display,
+        )
+        self._add_toolbar_control(home_tab, ttk.Button, text="오버레이 항목 설정", command=self.open_overlay_settings)
+
+        self._add_toolbar_control(image_tab, ttk.Button, text="DICOM 열기", command=self.open_file)
+        self._add_toolbar_control(image_tab, ttk.Button, text="폴더 열기", command=self.open_folder)
+        self.prev_image_button = self._add_toolbar_control(image_tab, ttk.Button, text="이전 이미지", command=lambda: self.change_file(-1))
+        self.next_image_button = self._add_toolbar_control(image_tab, ttk.Button, text="다음 이미지", command=lambda: self.change_file(1))
+        self.prev_frame_button = self._add_toolbar_control(image_tab, ttk.Button, text="이전 프레임", command=lambda: self.change_frame(-1))
+        self.next_frame_button = self._add_toolbar_control(image_tab, ttk.Button, text="다음 프레임", command=lambda: self.change_frame(1))
+        self.window_level_reset_button = self._add_toolbar_control(image_tab, ttk.Button, text="W/L 리셋", command=self.reset_window_level)
+        self._add_toolbar_control(
+            image_tab,
+            ttk.Checkbutton,
+            text="Invert",
+            variable=self.invert_display,
+            command=self._refresh_single_view_image,
+        )
+        self._add_toolbar_control(
+            image_tab,
+            ttk.Checkbutton,
+            text="Grid",
+            variable=self.show_grid_overlay,
+            command=self._refresh_grid_overlay,
+        )
+
+        self._add_toolbar_control(measure_tab, ttk.Radiobutton, text="Pan", value="pan", variable=self.measurement_mode)
+        self._add_toolbar_control(measure_tab, ttk.Radiobutton, text="ROI", value="roi", variable=self.measurement_mode)
+        self._add_toolbar_control(measure_tab, ttk.Radiobutton, text="Line", value="line", variable=self.measurement_mode)
+        self._add_toolbar_control(measure_tab, ttk.Button, text="임시 측정 지우기", command=self.clear_temporary_measurements)
+        self._add_toolbar_control(measure_tab, ttk.Button, text="영구 측정 지우기", command=self.clear_persistent_measurements)
+        self._add_toolbar_control(measure_tab, ttk.Button, text="측정 CSV", command=self.export_measurements_csv)
+
+        self._add_toolbar_control(analysis_tab, ttk.Button, text="라인 프로파일", command=self.show_line_profile_for_selected_line)
+        self._add_toolbar_control(analysis_tab, ttk.Button, text="ROI 역할", command=self.assign_roi_role)
+        self._add_toolbar_control(analysis_tab, ttk.Button, text="SNR/CNR", command=self.calculate_snr_cnr)
+
+        self._add_toolbar_control(export_tab, ttk.Button, text="세트 저장", command=self.save_measurement_set)
+        self._add_toolbar_control(export_tab, ttk.Button, text="세트 적용", command=self.apply_measurement_set)
+        self._add_toolbar_control(export_tab, ttk.Button, text="세트 JSON", command=self.export_measurement_sets_json)
+        self._add_toolbar_control(export_tab, ttk.Button, text="세트 불러오기", command=self.import_measurement_sets_json)
+        self._add_toolbar_control(export_tab, ttk.Button, text="뷰 내보내기", command=self.export_view_screenshot)
+        self._add_toolbar_control(export_tab, ttk.Button, text="Figure 내보내기", command=self.export_clean_figure)
+
+    @staticmethod
+    def _add_toolbar_control(parent: ttk.Frame, widget_class: Any, **kwargs: Any):
+        control = widget_class(parent, **kwargs)
+        control.pack(side="left", padx=(0, 8))
+        return control
 
     def _bind_shortcuts(self) -> None:
         bindings = [
@@ -3263,6 +3331,17 @@ class DicomViewer:
         self.cursor_var.set(f"Cursor: ({x}, {y})")
 
     def _canvas_to_image_pixel(self, canvas_x: float, canvas_y: float) -> tuple[int, int] | None:
+        image_coords = self._canvas_to_image_coords(canvas_x, canvas_y)
+        if image_coords is None:
+            return None
+        x_coord, y_coord = image_coords
+        frame_array = np.asarray(self.frames[self.current_frame])
+        if frame_array.ndim < 2:
+            return None
+        height, width = frame_array.shape[:2]
+        return int(np.clip(np.floor(x_coord), 0, width - 1)), int(np.clip(np.floor(y_coord), 0, height - 1))
+
+    def _canvas_to_image_coords(self, canvas_x: float, canvas_y: float) -> tuple[float, float] | None:
         if self._image_bbox is None or not self.frames:
             return None
         left, top, right, bottom = self._image_bbox
@@ -3277,9 +3356,7 @@ class DicomViewer:
         display_height = max(bottom - top, 1.0)
         x_ratio = (canvas_x - left) / display_width
         y_ratio = (canvas_y - top) / display_height
-        pixel_x = int(np.clip(np.floor(x_ratio * width), 0, width - 1))
-        pixel_y = int(np.clip(np.floor(y_ratio * height), 0, height - 1))
-        return pixel_x, pixel_y
+        return float(np.clip(x_ratio * width, 0, max(width - 1, 0))), float(np.clip(y_ratio * height, 0, max(height - 1, 0)))
 
     def _start_temporary_measurement(self, event: tk.Event) -> None:
         if not self.frames or self.view_mode != "single":
@@ -3327,9 +3404,14 @@ class DicomViewer:
         if image_start is None or image_end is None:
             return
         self.temporary_measurements.append({"mode": mode, "start": image_start, "end": image_end})
+        self._append_persistent_measurement(mode, image_start, image_end)
         self._draw_temporary_measurements()
+        self._draw_persistent_measurements()
 
     def _image_pixel_to_canvas(self, pixel_x: int, pixel_y: int) -> tuple[float, float] | None:
+        return self._image_coords_to_canvas(float(pixel_x), float(pixel_y))
+
+    def _image_coords_to_canvas(self, image_x: float, image_y: float) -> tuple[float, float] | None:
         if self._image_bbox is None or not self.frames:
             return None
         frame_array = np.asarray(self.frames[self.current_frame])
@@ -3341,8 +3423,8 @@ class DicomViewer:
         left, top, right, bottom = self._image_bbox
         display_width = right - left
         display_height = bottom - top
-        canvas_x = left + (float(pixel_x) / width) * display_width
-        canvas_y = top + (float(pixel_y) / height) * display_height
+        canvas_x = left + (float(image_x) / width) * display_width
+        canvas_y = top + (float(image_y) / height) * display_height
         return canvas_x, canvas_y
 
     def _draw_temporary_measurements(self) -> None:
@@ -3394,6 +3476,402 @@ class DicomViewer:
         self.temporary_measurements = []
         self._active_temporary_measurement = None
         self.canvas.delete("temp_measurement")
+
+    def clear_persistent_measurements(self) -> None:
+        self.persistent_measurements = []
+        self.canvas.delete("persistent_measurement")
+
+    def _get_current_geometry_key(self) -> str | None:
+        if self.dataset is None or not self.frames:
+            return None
+        frame = np.asarray(self.frames[self.current_frame])
+        if frame.ndim < 2:
+            return None
+        key = {
+            "rows": int(frame.shape[0]),
+            "cols": int(frame.shape[1]),
+            "spacing": getattr(self.dataset, "PixelSpacing", None),
+            "thickness": getattr(self.dataset, "SliceThickness", None),
+            "orientation": getattr(self.dataset, "ImageOrientationPatient", None),
+            "position": getattr(self.dataset, "ImagePositionPatient", None),
+            "sop": getattr(self.dataset, "SOPInstanceUID", None),
+            "frame_index": int(self.current_frame),
+        }
+        return json.dumps(key, sort_keys=True, default=str)
+
+    @staticmethod
+    def _geometry_matches(left: str | None, right: str | None) -> bool:
+        return bool(left) and bool(right) and left == right
+
+    def _append_persistent_measurement(
+        self,
+        mode: str,
+        image_start: tuple[int, int],
+        image_end: tuple[int, int],
+    ) -> None:
+        geometry_key = self._get_current_geometry_key()
+        if geometry_key is None:
+            return
+        if mode == "roi":
+            summary_text = f"{abs(image_end[0]-image_start[0])} x {abs(image_end[1]-image_start[1])}px"
+        else:
+            summary_text = f"{float(np.hypot(image_end[0]-image_start[0], image_end[1]-image_start[1])):.1f}px"
+        measurement = Measurement(
+            id=str(uuid.uuid4()),
+            kind=mode,
+            start=(float(image_start[0]), float(image_start[1])),
+            end=(float(image_end[0]), float(image_end[1])),
+            frame_index=int(self.current_frame),
+            geometry_key=geometry_key,
+            summary_text=summary_text,
+            meta={"roi_role": "none"},
+        )
+        self.persistent_measurements.append(measurement)
+
+    def _draw_persistent_measurements(self) -> None:
+        self.canvas.delete("persistent_measurement")
+        current_geometry = self._get_current_geometry_key()
+        for measurement in self.persistent_measurements:
+            if not self._geometry_matches(current_geometry, measurement.geometry_key):
+                continue
+            start = self._image_coords_to_canvas(*measurement.start)
+            end = self._image_coords_to_canvas(*measurement.end)
+            if start is None or end is None:
+                continue
+            sx, sy = start
+            ex, ey = end
+            if measurement.kind == "roi":
+                self.canvas.create_rectangle(sx, sy, ex, ey, outline="#ff7f50", width=2, tags=("persistent_measurement",))
+                role = measurement.meta.get("roi_role", "none")
+                label = f"{measurement.summary_text} [{role}]"
+            else:
+                self.canvas.create_line(sx, sy, ex, ey, fill="#00ffaa", width=2, tags=("persistent_measurement",))
+                label = measurement.summary_text
+            self.canvas.create_text(
+                ex + 6,
+                ey - 6,
+                text=label,
+                fill="#f8f8f8",
+                anchor="sw",
+                font=("TkDefaultFont", 9, "bold"),
+                tags=("persistent_measurement",),
+            )
+
+    def export_measurements_csv(self) -> None:
+        if not self.persistent_measurements:
+            messagebox.showinfo("안내", "내보낼 영구 측정값이 없습니다.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="측정 CSV 저장",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("All Files", "*.*")],
+        )
+        if not path:
+            return
+        with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["id", "kind", "frame_index", "start_x", "start_y", "end_x", "end_y", "summary", "geometry_key", "meta"])
+            for item in self.persistent_measurements:
+                writer.writerow(
+                    [
+                        item.id,
+                        item.kind,
+                        item.frame_index,
+                        f"{item.start[0]:.4f}",
+                        f"{item.start[1]:.4f}",
+                        f"{item.end[0]:.4f}",
+                        f"{item.end[1]:.4f}",
+                        item.summary_text,
+                        item.geometry_key,
+                        json.dumps(item.meta, ensure_ascii=False, sort_keys=True),
+                    ]
+                )
+        messagebox.showinfo("저장 완료", f"CSV 저장 완료:\n{path}")
+
+    def _serialize_measurement_set(self, measurement_set: MeasurementSet) -> dict[str, Any]:
+        return {
+            "id": measurement_set.id,
+            "name": measurement_set.name,
+            "geometry_key": measurement_set.geometry_key,
+            "created_at": measurement_set.created_at,
+            "measurements": [
+                {
+                    "id": measurement.id,
+                    "kind": measurement.kind,
+                    "start": list(measurement.start),
+                    "end": list(measurement.end),
+                    "frame_index": measurement.frame_index,
+                    "geometry_key": measurement.geometry_key,
+                    "summary_text": measurement.summary_text,
+                    "meta": measurement.meta,
+                }
+                for measurement in measurement_set.measurements
+            ],
+        }
+
+    def _deserialize_measurement_set(self, payload: dict[str, Any]) -> MeasurementSet:
+        measurements = [
+            Measurement(
+                id=str(item.get("id", uuid.uuid4())),
+                kind=str(item.get("kind", "line")),
+                start=(float(item["start"][0]), float(item["start"][1])),
+                end=(float(item["end"][0]), float(item["end"][1])),
+                frame_index=int(item.get("frame_index", 0)),
+                geometry_key=str(item.get("geometry_key", "")),
+                summary_text=str(item.get("summary_text", "")),
+                meta=dict(item.get("meta") or {}),
+            )
+            for item in payload.get("measurements", [])
+        ]
+        return MeasurementSet(
+            id=str(payload.get("id", uuid.uuid4())),
+            name=str(payload.get("name", "Imported Set")),
+            geometry_key=str(payload.get("geometry_key", "")),
+            created_at=str(payload.get("created_at", datetime.utcnow().isoformat())),
+            measurements=measurements,
+        )
+
+    def save_measurement_set(self) -> None:
+        if not self.persistent_measurements:
+            messagebox.showinfo("안내", "저장할 영구 측정값이 없습니다.")
+            return
+        geometry_key = self._get_current_geometry_key()
+        if geometry_key is None:
+            return
+        name = simple_prompt(self.root, "세트 이름", "측정 세트 이름을 입력하세요:")
+        if not name:
+            return
+        selected = [m for m in self.persistent_measurements if self._geometry_matches(m.geometry_key, geometry_key)]
+        measurement_set = MeasurementSet(
+            id=str(uuid.uuid4()),
+            name=name,
+            geometry_key=geometry_key,
+            created_at=datetime.utcnow().isoformat(),
+            measurements=copy.deepcopy(selected),
+        )
+        self.measurement_sets[measurement_set.id] = measurement_set
+        messagebox.showinfo("저장 완료", f"세트 저장: {measurement_set.name} ({len(selected)}개)")
+
+    def apply_measurement_set(self) -> None:
+        if not self.measurement_sets:
+            messagebox.showinfo("안내", "적용할 측정 세트가 없습니다.")
+            return
+        geometry_key = self._get_current_geometry_key()
+        if geometry_key is None:
+            return
+        candidates = [item for item in self.measurement_sets.values() if self._geometry_matches(item.geometry_key, geometry_key)]
+        if not candidates:
+            messagebox.showwarning("기하 불일치", "현재 영상 기하와 일치하는 세트가 없습니다.")
+            return
+        selected = candidates[-1]
+        copied = copy.deepcopy(selected.measurements)
+        for item in copied:
+            item.id = str(uuid.uuid4())
+        self.persistent_measurements.extend(copied)
+        self._draw_persistent_measurements()
+        messagebox.showinfo("적용 완료", f"{selected.name} 세트를 추가 적용했습니다.")
+
+    def export_measurement_sets_json(self) -> None:
+        if not self.measurement_sets:
+            messagebox.showinfo("안내", "내보낼 세트가 없습니다.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="측정 세트 JSON 저장",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("All Files", "*.*")],
+        )
+        if not path:
+            return
+        payload = {"measurement_sets": [self._serialize_measurement_set(item) for item in self.measurement_sets.values()]}
+        Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        messagebox.showinfo("저장 완료", f"JSON 저장 완료:\n{path}")
+
+    def import_measurement_sets_json(self) -> None:
+        path = filedialog.askopenfilename(title="측정 세트 JSON 선택", filetypes=[("JSON", "*.json"), ("All Files", "*.*")])
+        if not path:
+            return
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        imported = 0
+        for item in payload.get("measurement_sets", []):
+            measurement_set = self._deserialize_measurement_set(item)
+            while measurement_set.id in self.measurement_sets:
+                measurement_set.id = str(uuid.uuid4())
+            self.measurement_sets[measurement_set.id] = measurement_set
+            imported += 1
+        messagebox.showinfo("불러오기 완료", f"{imported}개 세트를 가져왔습니다.")
+
+    def _get_frame_pixel_array(self, frame_index: int) -> np.ndarray | None:
+        if not self.frames or not (0 <= frame_index < len(self.frames)):
+            return None
+        frame = np.asarray(self.frames[frame_index], dtype=np.float32)
+        if frame.ndim == 3:
+            frame = frame.mean(axis=-1)
+        if frame.ndim != 2:
+            return None
+        return frame
+
+    def _sample_line_profile(self, measurement: Measurement) -> tuple[np.ndarray, np.ndarray] | None:
+        frame = self._get_frame_pixel_array(measurement.frame_index)
+        if frame is None:
+            return None
+        x0, y0 = measurement.start
+        x1, y1 = measurement.end
+        length = int(max(np.hypot(x1 - x0, y1 - y0), 1))
+        xs = np.linspace(x0, x1, num=length)
+        ys = np.linspace(y0, y1, num=length)
+        xi = np.clip(np.round(xs).astype(int), 0, frame.shape[1] - 1)
+        yi = np.clip(np.round(ys).astype(int), 0, frame.shape[0] - 1)
+        intensity = frame[yi, xi]
+        distance = np.linspace(0.0, float(np.hypot(x1 - x0, y1 - y0)), num=length)
+        return distance, intensity
+
+    def show_line_profile_for_selected_line(self) -> None:
+        lines = [item for item in self.persistent_measurements if item.kind == "line"]
+        if not lines:
+            messagebox.showinfo("안내", "영구 Line 측정이 없습니다.")
+            return
+        measurement = lines[-1]
+        profile = self._sample_line_profile(measurement)
+        if profile is None:
+            return
+        distance, intensity = profile
+        plt.figure(figsize=(7, 4))
+        plt.plot(distance, intensity, color="#0a84ff")
+        plt.xlabel("Distance (px)")
+        plt.ylabel("Intensity")
+        plt.title("Line Profile")
+        plt.tight_layout()
+        plt.show(block=False)
+        save_path = filedialog.asksaveasfilename(
+            title="라인 프로파일 CSV 저장",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("All Files", "*.*")],
+        )
+        if save_path:
+            with open(save_path, "w", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["distance_px", "intensity"])
+                for d, v in zip(distance, intensity):
+                    writer.writerow([f"{float(d):.6f}", f"{float(v):.6f}"])
+
+    def assign_roi_role(self) -> None:
+        rois = [item for item in self.persistent_measurements if item.kind == "roi"]
+        if not rois:
+            messagebox.showinfo("안내", "영구 ROI 측정이 없습니다.")
+            return
+        role = simple_prompt(self.root, "ROI 역할", "역할 입력 (none/signal/background/noise):")
+        if role is None:
+            return
+        role = role.strip().lower()
+        if role not in {"none", "signal", "background", "noise"}:
+            messagebox.showwarning("오류", "지원되지 않는 역할입니다.")
+            return
+        rois[-1].meta["roi_role"] = role
+        self._draw_persistent_measurements()
+
+    def _roi_stats(self, measurement: Measurement) -> tuple[float, float] | None:
+        frame = self._get_frame_pixel_array(measurement.frame_index)
+        if frame is None:
+            return None
+        x0, y0 = measurement.start
+        x1, y1 = measurement.end
+        xmin, xmax = sorted((int(round(x0)), int(round(x1))))
+        ymin, ymax = sorted((int(round(y0)), int(round(y1))))
+        xmin = int(np.clip(xmin, 0, frame.shape[1] - 1))
+        xmax = int(np.clip(xmax, 0, frame.shape[1] - 1))
+        ymin = int(np.clip(ymin, 0, frame.shape[0] - 1))
+        ymax = int(np.clip(ymax, 0, frame.shape[0] - 1))
+        roi = frame[ymin : ymax + 1, xmin : xmax + 1]
+        if roi.size == 0:
+            return None
+        return float(np.mean(roi)), float(np.std(roi))
+
+    def calculate_snr_cnr(self) -> None:
+        role_map = {"signal": None, "background": None, "noise": None}
+        for measurement in self.persistent_measurements:
+            if measurement.kind != "roi":
+                continue
+            role = measurement.meta.get("roi_role")
+            if role in role_map and role_map[role] is None:
+                role_map[role] = measurement
+        if role_map["signal"] is None or role_map["noise"] is None:
+            messagebox.showwarning("역할 부족", "SNR 계산에는 signal/noise ROI가 필요합니다.")
+            return
+        signal_stats = self._roi_stats(role_map["signal"])
+        noise_stats = self._roi_stats(role_map["noise"])
+        if signal_stats is None or noise_stats is None:
+            messagebox.showwarning("오류", "ROI 통계를 계산할 수 없습니다.")
+            return
+        signal_mean, _ = signal_stats
+        _, noise_std = noise_stats
+        if noise_std <= 0:
+            messagebox.showwarning("오류", "noise ROI 표준편차가 0입니다.")
+            return
+        snr = signal_mean / noise_std
+        cnr_text = "N/A (background ROI 없음)"
+        if role_map["background"] is not None:
+            background_stats = self._roi_stats(role_map["background"])
+            if background_stats is not None:
+                background_mean, _ = background_stats
+                cnr = abs(signal_mean - background_mean) / noise_std
+                cnr_text = f"{cnr:.4f}"
+        messagebox.showinfo("SNR/CNR", f"SNR = {snr:.4f}\nCNR = {cnr_text}")
+
+    def _render_measurements_on_image(self, image: Image.Image, include_labels: bool = True, include_grid: bool = False) -> Image.Image:
+        composed = image.convert("RGB")
+        draw = ImageDraw.Draw(composed)
+        width, height = composed.size
+        frame = np.asarray(self.frames[self.current_frame])
+        source_h, source_w = frame.shape[:2]
+        current_geometry = self._get_current_geometry_key()
+        for measurement in self.persistent_measurements:
+            if not self._geometry_matches(current_geometry, measurement.geometry_key):
+                continue
+            sx = measurement.start[0] / max(source_w, 1) * width
+            sy = measurement.start[1] / max(source_h, 1) * height
+            ex = measurement.end[0] / max(source_w, 1) * width
+            ey = measurement.end[1] / max(source_h, 1) * height
+            if measurement.kind == "roi":
+                draw.rectangle((sx, sy, ex, ey), outline="#ff7f50", width=2)
+                if include_labels:
+                    draw.text((ex + 4, ey - 14), f"{measurement.summary_text} [{measurement.meta.get('roi_role', 'none')}]", fill="white")
+            else:
+                draw.line((sx, sy, ex, ey), fill="#00ffaa", width=2)
+                if include_labels:
+                    draw.text((ex + 4, ey - 14), measurement.summary_text, fill="white")
+        if include_grid:
+            for c in range(1, 8):
+                x = int(width * c / 8)
+                draw.line((x, 0, x, height), fill="#5bc0de", width=1)
+            for r in range(1, 8):
+                y = int(height * r / 8)
+                draw.line((0, y, width, y), fill="#5bc0de", width=1)
+        return composed
+
+    def export_view_screenshot(self) -> None:
+        if not self.frames:
+            return
+        path = filedialog.asksaveasfilename(title="뷰 이미지 저장", defaultextension=".png", filetypes=[("PNG", "*.png")])
+        if not path:
+            return
+        frame = self.frames[self.current_frame]
+        base = Image.fromarray(self._normalize_frame(frame))
+        base = self._resize_image_for_display(base)
+        image = self._render_measurements_on_image(base, include_labels=True, include_grid=self.show_grid_overlay.get())
+        image.save(path)
+        messagebox.showinfo("저장 완료", f"뷰 이미지를 저장했습니다.\n{path}")
+
+    def export_clean_figure(self) -> None:
+        if not self.frames:
+            return
+        path = filedialog.asksaveasfilename(title="Clean Figure 저장", defaultextension=".png", filetypes=[("PNG", "*.png")])
+        if not path:
+            return
+        frame = self.frames[self.current_frame]
+        base = Image.fromarray(self._normalize_frame(frame))
+        image = self._render_measurements_on_image(base, include_labels=False, include_grid=False)
+        image.save(path)
+        messagebox.showinfo("저장 완료", f"Figure를 저장했습니다.\n{path}")
 
     def _draw_grid_overlay(self) -> None:
         self.canvas.delete("grid_overlay")
@@ -3666,6 +4144,7 @@ class DicomViewer:
             self._restore_view_center_ratio(center_ratio)
         self._draw_single_view_overlays()
         self._draw_grid_overlay()
+        self._draw_persistent_measurements()
         self._draw_temporary_measurements()
         self.frame_var.set(f"프레임: {self.current_frame + 1} / {len(self.frames)}")
         self._update_zoom_label()
@@ -3859,6 +4338,11 @@ class DicomViewer:
             return np.zeros(array.shape, dtype=np.uint8)
         scaled = (array - minimum) / (maximum - minimum)
         return np.clip(scaled * 255.0, 0, 255).astype(np.uint8)
+
+
+def simple_prompt(parent: tk.Misc, title: str, prompt: str) -> str | None:
+    return simpledialog.askstring(title, prompt, parent=parent)
+
 
 def main() -> None:
     root = tk.Tk()
