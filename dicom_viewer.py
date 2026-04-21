@@ -978,6 +978,7 @@ class DicomViewer:
     def _build_roi_analysis_options(self) -> list[tuple[str, str]]:
         options: list[tuple[str, str]] = []
         current_geometry = self._get_current_geometry_key()
+        roi_index = 0
         for measurement in self.persistent_measurements:
             if measurement.kind != "roi":
                 continue
@@ -985,13 +986,18 @@ class DicomViewer:
                 continue
             if measurement.frame_index != self.current_frame:
                 continue
+            roi_index += 1
             metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
             signal_stats = dict(metrics.get("signal_stats") or {})
             mean = float(signal_stats.get("mean", 0.0))
+            min_val = float(signal_stats.get("min", 0.0))
             std = float(signal_stats.get("std", 0.0))
             area_mm2 = metrics.get("area_mm2")
             area_text = f"{area_mm2:.1f} mm²" if isinstance(area_mm2, (int, float)) else f"{metrics['area_px']:.1f} px²"
-            label = f"ROI {measurement.id[:8]} | mean {mean:.1f} | std {std:.1f} | area {area_text}"
+            label = (
+                f"{roi_index}번 ROI | 최소값 {min_val:.1f} | 평균값 {mean:.1f} | "
+                f"표준편차 {std:.1f} | 면적 {area_text}"
+            )
             options.append((measurement.id, label))
         return options
 
