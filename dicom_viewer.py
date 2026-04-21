@@ -65,6 +65,7 @@ class DicomViewer:
         self._window_drag_base: tuple[float, float] | None = None
         self.invert_display = tk.BooleanVar(value=False)
         self.show_grid_overlay = tk.BooleanVar(value=False)
+        self.grid_spacing_px = tk.IntVar(value=8)
         self.cursor_var = tk.StringVar(value="Cursor: -, -")
         self.measurement_mode = tk.StringVar(value="pan")
         self.temporary_measurements: list[dict[str, Any]] = []
@@ -252,13 +253,11 @@ class DicomViewer:
         home_tab = self._add_toolbar_tab(notebook, "HOME")
         image_tab = self._add_toolbar_tab(notebook, "IMAGE")
         measure_tab = self._add_toolbar_tab(notebook, "MEASURE")
-        analysis_tab = self._add_toolbar_tab(notebook, "ANALYSIS")
         export_tab = self._add_toolbar_tab(notebook, "EXPORT")
 
         self._build_home_toolbar(home_tab)
         self._build_image_toolbar(image_tab)
         self._build_measure_toolbar(measure_tab)
-        self._build_analysis_toolbar(analysis_tab)
         self._build_export_toolbar(export_tab)
 
     @staticmethod
@@ -320,25 +319,33 @@ class DicomViewer:
             variable=self.invert_display,
             command=self._refresh_single_view_image,
         ).pack(side="left", padx=(8, 0))
-        ttk.Checkbutton(
-            tab,
-            text="Grid",
-            variable=self.show_grid_overlay,
-            command=self._refresh_grid_overlay,
-        ).pack(side="left", padx=(8, 0))
 
     def _build_measure_toolbar(self, tab: ttk.Frame) -> None:
         ttk.Radiobutton(tab, text="Pan", value="pan", variable=self.measurement_mode).pack(side="left")
         ttk.Radiobutton(tab, text="ROI", value="roi", variable=self.measurement_mode).pack(side="left", padx=(4, 0))
         ttk.Radiobutton(tab, text="Line", value="line", variable=self.measurement_mode).pack(side="left", padx=(4, 0))
+        ttk.Radiobutton(tab, text="Grid ROI", value="grid_roi", variable=self.measurement_mode).pack(side="left", padx=(4, 0))
+        ttk.Checkbutton(
+            tab,
+            text="Grid",
+            variable=self.show_grid_overlay,
+            command=self._refresh_grid_overlay,
+        ).pack(side="left", padx=(16, 0))
+        ttk.Label(tab, text="Grid Spacing(px)").pack(side="left", padx=(8, 0))
+        ttk.Combobox(
+            tab,
+            width=6,
+            state="readonly",
+            values=(4, 8, 16),
+            textvariable=self.grid_spacing_px,
+        ).pack(side="left", padx=(4, 0))
+        self.grid_spacing_px.trace_add("write", lambda *_args: self._refresh_grid_overlay())
         ttk.Button(tab, text="임시 측정 지우기", command=self.clear_temporary_measurements).pack(side="left", padx=(16, 0))
         ttk.Button(tab, text="영구 측정 지우기", command=self.clear_persistent_measurements).pack(side="left", padx=(4, 0))
+        ttk.Button(tab, text="라인 프로파일", command=self.show_line_profile_for_selected_line).pack(side="left", padx=(12, 0))
+        ttk.Button(tab, text="ROI 역할", command=self.assign_roi_role).pack(side="left", padx=(4, 0))
+        ttk.Button(tab, text="SNR/CNR", command=self.calculate_snr_cnr).pack(side="left", padx=(4, 0))
         ttk.Button(tab, text="측정 CSV", command=self.export_measurements_csv).pack(side="left", padx=(4, 0))
-
-    def _build_analysis_toolbar(self, tab: ttk.Frame) -> None:
-        ttk.Button(tab, text="라인 프로파일", command=self.show_line_profile_for_selected_line).pack(side="left")
-        ttk.Button(tab, text="ROI 역할", command=self.assign_roi_role).pack(side="left", padx=(8, 0))
-        ttk.Button(tab, text="SNR/CNR", command=self.calculate_snr_cnr).pack(side="left", padx=(8, 0))
 
     def _build_export_toolbar(self, tab: ttk.Frame) -> None:
         ttk.Button(tab, text="세트 저장", command=self.save_measurement_set).pack(side="left")
@@ -3370,6 +3377,9 @@ class DicomViewer:
         if not self.frames or self.view_mode != "single":
             return
         mode = self.measurement_mode.get()
+        if mode == "grid_roi":
+            self._create_grid_aligned_roi(event)
+            return
         if mode not in {"roi", "line"}:
             return
         start_x = self.canvas.canvasx(event.x)
@@ -3416,6 +3426,87 @@ class DicomViewer:
         self._draw_temporary_measurements()
         self._draw_persistent_measurements()
 
+    def _create_grid_aligned_roi(self, event: tk.Event) -> None:
+        spacing = max(int(self.grid_spacing_px.get()), 1)
+        canvas_x = self.canvas.canvasx(event.x)
+        canvas_y = self.canvas.canvasy(event.y)
+        image_point = self._canvas_to_image_pixel(canvas_x, canvas_y)
+        if image_point is None:
+            return
+        frame_array = np.asarray(self.frames[self.current_frame])
+        if frame_array.ndim < 2:
+            return
+        height, width = frame_array.shape[:2]
+        x0 = int(np.clip((image_point[0] // spacing) * spacing, 0, max(width - 1, 0)))
+        y0 = int(np.clip((image_point[1] // spacing) * spacing, 0, max(height - 1, 0)))
+        x1 = int(np.clip(x0 + spacing, 0, max(width - 1, 0)))
+        y1 = int(np.clip(y0 + spacing, 0, max(height - 1, 0)))
+        image_start = (x0, y0)
+        image_end = (x1, y1)
+        self.temporary_measurements.append({"mode": "roi", "start": image_start, "end": image_end})
+        self._append_persistent_measurement("roi", image_start, image_end, source_mode="grid_roi")
+        self._draw_temporary_measurements()
+        self._draw_persistent_measurements()
+
+    def _get_pixel_spacing_mm(self) -> tuple[float, float] | None:
+        if self.dataset is None:
+            return None
+        value = getattr(self.dataset, "PixelSpacing", None)
+        if value is None:
+            return None
+        try:
+            row = float(value[0])
+            col = float(value[1] if len(value) > 1 else value[0])
+            if row <= 0 or col <= 0:
+                return None
+            return row, col
+        except Exception:
+            return None
+
+    def _build_measurement_metrics(self, mode: str, start: tuple[int, int], end: tuple[int, int]) -> dict[str, Any]:
+        dx_px = abs(int(end[0]) - int(start[0]))
+        dy_px = abs(int(end[1]) - int(start[1]))
+        spacing = self._get_pixel_spacing_mm()
+        metrics: dict[str, Any] = {
+            "pixel_spacing_mm": spacing,
+            "width_px": float(dx_px),
+            "height_px": float(dy_px),
+            "length_px": float(np.hypot(dx_px, dy_px)),
+            "width_mm": None,
+            "height_mm": None,
+            "length_mm": None,
+        }
+        if spacing is not None:
+            row_mm, col_mm = spacing
+            metrics["width_mm"] = dx_px * col_mm
+            metrics["height_mm"] = dy_px * row_mm
+            metrics["length_mm"] = float(np.hypot(dx_px * col_mm, dy_px * row_mm))
+        if mode == "roi":
+            metrics["summary"] = self._format_roi_measurement_summary(metrics)
+        else:
+            metrics["summary"] = self._format_line_measurement_summary(metrics)
+        return metrics
+
+    @staticmethod
+    def _format_mm_value(value: float | None) -> str:
+        if value is None:
+            return "N/A"
+        return f"{value:.2f}"
+
+    def _format_roi_measurement_summary(self, metrics: dict[str, Any]) -> str:
+        px_text = f"{int(round(metrics['width_px']))} x {int(round(metrics['height_px']))}px"
+        if metrics["width_mm"] is None or metrics["height_mm"] is None:
+            return f"{px_text} | N/Amm x N/Amm"
+        return (
+            f"{px_text} | "
+            f"{self._format_mm_value(metrics['width_mm'])}mm x {self._format_mm_value(metrics['height_mm'])}mm"
+        )
+
+    def _format_line_measurement_summary(self, metrics: dict[str, Any]) -> str:
+        px_text = f"{metrics['length_px']:.1f}px"
+        mm_value = self._format_mm_value(metrics["length_mm"])
+        return f"{px_text} | {mm_value}mm"
+
     def _image_pixel_to_canvas(self, pixel_x: int, pixel_y: int) -> tuple[float, float] | None:
         return self._image_coords_to_canvas(float(pixel_x), float(pixel_y))
 
@@ -3455,9 +3546,8 @@ class DicomViewer:
                     dash=(4, 2),
                     tags=("temp_measurement",),
                 )
-                width_px = abs(measurement["end"][0] - measurement["start"][0])
-                height_px = abs(measurement["end"][1] - measurement["start"][1])
-                label = f"{width_px} x {height_px}px"
+                metrics = self._build_measurement_metrics("roi", measurement["start"], measurement["end"])
+                label = metrics["summary"]
             else:
                 self.canvas.create_line(
                     start_x,
@@ -3468,8 +3558,8 @@ class DicomViewer:
                     width=2,
                     tags=("temp_measurement",),
                 )
-                length_px = float(np.hypot(measurement["end"][0] - measurement["start"][0], measurement["end"][1] - measurement["start"][1]))
-                label = f"{length_px:.1f}px"
+                metrics = self._build_measurement_metrics("line", measurement["start"], measurement["end"])
+                label = metrics["summary"]
             self.canvas.create_text(
                 end_x + 6,
                 end_y - 6,
@@ -3516,14 +3606,13 @@ class DicomViewer:
         mode: str,
         image_start: tuple[int, int],
         image_end: tuple[int, int],
+        source_mode: str | None = None,
     ) -> None:
         geometry_key = self._get_current_geometry_key()
         if geometry_key is None:
             return
-        if mode == "roi":
-            summary_text = f"{abs(image_end[0]-image_start[0])} x {abs(image_end[1]-image_start[1])}px"
-        else:
-            summary_text = f"{float(np.hypot(image_end[0]-image_start[0], image_end[1]-image_start[1])):.1f}px"
+        metrics = self._build_measurement_metrics(mode, image_start, image_end)
+        summary_text = metrics["summary"]
         measurement = Measurement(
             id=str(uuid.uuid4()),
             kind=mode,
@@ -3532,7 +3621,7 @@ class DicomViewer:
             frame_index=int(self.current_frame),
             geometry_key=geometry_key,
             summary_text=summary_text,
-            meta={"roi_role": "none"},
+            meta={"roi_role": "none", "source_mode": source_mode or mode, "metrics": metrics},
         )
         self.persistent_measurements.append(measurement)
 
@@ -3548,13 +3637,19 @@ class DicomViewer:
                 continue
             sx, sy = start
             ex, ey = end
+            start_px = (int(round(measurement.start[0])), int(round(measurement.start[1])))
+            end_px = (int(round(measurement.end[0])), int(round(measurement.end[1])))
+            metrics = self._build_measurement_metrics(measurement.kind, start_px, end_px)
+            summary = metrics["summary"]
+            measurement.summary_text = summary
+            measurement.meta["metrics"] = metrics
             if measurement.kind == "roi":
                 self.canvas.create_rectangle(sx, sy, ex, ey, outline="#ff7f50", width=2, tags=("persistent_measurement",))
                 role = measurement.meta.get("roi_role", "none")
-                label = f"{measurement.summary_text} [{role}]"
+                label = f"{summary} [{role}]"
             else:
                 self.canvas.create_line(sx, sy, ex, ey, fill="#00ffaa", width=2, tags=("persistent_measurement",))
-                label = measurement.summary_text
+                label = summary
             self.canvas.create_text(
                 ex + 6,
                 ey - 6,
@@ -3578,8 +3673,30 @@ class DicomViewer:
             return
         with open(path, "w", newline="", encoding="utf-8-sig") as handle:
             writer = csv.writer(handle)
-            writer.writerow(["id", "kind", "frame_index", "start_x", "start_y", "end_x", "end_y", "summary", "geometry_key", "meta"])
+            writer.writerow(
+                [
+                    "id",
+                    "kind",
+                    "frame_index",
+                    "start_x",
+                    "start_y",
+                    "end_x",
+                    "end_y",
+                    "summary",
+                    "width_px",
+                    "height_px",
+                    "length_px",
+                    "width_mm",
+                    "height_mm",
+                    "length_mm",
+                    "geometry_key",
+                    "meta",
+                ]
+            )
             for item in self.persistent_measurements:
+                start = (int(round(item.start[0])), int(round(item.start[1])))
+                end = (int(round(item.end[0])), int(round(item.end[1])))
+                metrics = self._build_measurement_metrics(item.kind, start, end)
                 writer.writerow(
                     [
                         item.id,
@@ -3590,6 +3707,12 @@ class DicomViewer:
                         f"{item.end[0]:.4f}",
                         f"{item.end[1]:.4f}",
                         item.summary_text,
+                        f"{metrics['width_px']:.4f}",
+                        f"{metrics['height_px']:.4f}",
+                        f"{metrics['length_px']:.4f}",
+                        "" if metrics["width_mm"] is None else f"{metrics['width_mm']:.4f}",
+                        "" if metrics["height_mm"] is None else f"{metrics['height_mm']:.4f}",
+                        "" if metrics["length_mm"] is None else f"{metrics['length_mm']:.4f}",
                         item.geometry_key,
                         json.dumps(item.meta, ensure_ascii=False, sort_keys=True),
                     ]
@@ -3839,21 +3962,31 @@ class DicomViewer:
             sy = measurement.start[1] / max(source_h, 1) * height
             ex = measurement.end[0] / max(source_w, 1) * width
             ey = measurement.end[1] / max(source_h, 1) * height
+            start_px = (int(round(measurement.start[0])), int(round(measurement.start[1])))
+            end_px = (int(round(measurement.end[0])), int(round(measurement.end[1])))
+            label_summary = self._build_measurement_metrics(measurement.kind, start_px, end_px)["summary"]
             if measurement.kind == "roi":
                 draw.rectangle((sx, sy, ex, ey), outline="#ff7f50", width=2)
                 if include_labels:
-                    draw.text((ex + 4, ey - 14), f"{measurement.summary_text} [{measurement.meta.get('roi_role', 'none')}]", fill="white")
+                    draw.text((ex + 4, ey - 14), f"{label_summary} [{measurement.meta.get('roi_role', 'none')}]", fill="white")
             else:
                 draw.line((sx, sy, ex, ey), fill="#00ffaa", width=2)
                 if include_labels:
-                    draw.text((ex + 4, ey - 14), measurement.summary_text, fill="white")
+                    draw.text((ex + 4, ey - 14), label_summary, fill="white")
         if include_grid:
-            for c in range(1, 8):
-                x = int(width * c / 8)
-                draw.line((x, 0, x, height), fill="#5bc0de", width=1)
-            for r in range(1, 8):
-                y = int(height * r / 8)
-                draw.line((0, y, width, y), fill="#5bc0de", width=1)
+            spacing = max(int(self.grid_spacing_px.get()), 1)
+            source_step_x = spacing / max(source_w, 1)
+            source_step_y = spacing / max(source_h, 1)
+            x = source_step_x
+            while x < 1.0:
+                draw_x = int(width * x)
+                draw.line((draw_x, 0, draw_x, height), fill="#5bc0de", width=1)
+                x += source_step_x
+            y = source_step_y
+            while y < 1.0:
+                draw_y = int(height * y)
+                draw.line((0, draw_y, width, draw_y), fill="#5bc0de", width=1)
+                y += source_step_y
         return composed
 
     def export_view_screenshot(self) -> None:
@@ -3885,17 +4018,26 @@ class DicomViewer:
         self.canvas.delete("grid_overlay")
         if not self.show_grid_overlay.get() or self._image_bbox is None:
             return
+        if not self.frames:
+            return
+        frame_array = np.asarray(self.frames[self.current_frame])
+        if frame_array.ndim < 2:
+            return
         left, top, right, bottom = self._image_bbox
-        width = right - left
-        height = bottom - top
-        columns = 8
-        rows = 8
-        for column in range(1, columns):
-            x = left + (width * column / columns)
-            self.canvas.create_line(x, top, x, bottom, fill="#5bc0de", width=1, dash=(2, 3), tags=("grid_overlay",))
-        for row in range(1, rows):
-            y = top + (height * row / rows)
-            self.canvas.create_line(left, y, right, y, fill="#5bc0de", width=1, dash=(2, 3), tags=("grid_overlay",))
+        height, width = frame_array.shape[:2]
+        spacing = max(int(self.grid_spacing_px.get()), 1)
+        for column in range(spacing, width, spacing):
+            point = self._image_coords_to_canvas(float(column), 0.0)
+            if point is None:
+                continue
+            x, _ = point
+            self.canvas.create_line(x, top, x, bottom, fill="#5bc0de", width=1, dash=(1, 2), tags=("grid_overlay",))
+        for row in range(spacing, height, spacing):
+            point = self._image_coords_to_canvas(0.0, float(row))
+            if point is None:
+                continue
+            _, y = point
+            self.canvas.create_line(left, y, right, y, fill="#5bc0de", width=1, dash=(1, 2), tags=("grid_overlay",))
 
     def _refresh_single_view_image(self) -> None:
         if self.view_mode != "single" or not self.frames:
