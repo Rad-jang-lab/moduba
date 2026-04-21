@@ -1001,6 +1001,21 @@ class DicomViewer:
             options.append((measurement.id, label))
         return options
 
+    def _get_roi_display_index(self, measurement_id: str) -> int | None:
+        current_geometry = self._get_current_geometry_key()
+        roi_index = 0
+        for measurement in self.persistent_measurements:
+            if measurement.kind != "roi":
+                continue
+            if not self._geometry_matches(measurement.geometry_key, current_geometry):
+                continue
+            if measurement.frame_index != self.current_frame:
+                continue
+            roi_index += 1
+            if measurement.id == measurement_id:
+                return roi_index
+        return None
+
     def _build_line_analysis_options(self) -> list[tuple[str, str]]:
         options: list[tuple[str, str]] = []
         current_geometry = self._get_current_geometry_key()
@@ -5455,6 +5470,34 @@ class DicomViewer:
                     sx, sy, ex, ey, outline=outline, width=3 if selected else 2, tags=("persistent_measurement",)
                 )
                 self.register_measurement_hit_target(item_id, measurement.id)
+                roi_index = self._get_roi_display_index(measurement.id)
+                if roi_index is not None:
+                    badge_x = min(sx, ex) + 4
+                    badge_y = min(sy, ey) + 4
+                    badge_id = self.canvas.create_text(
+                        badge_x,
+                        badge_y,
+                        text=f"{roi_index}",
+                        fill="#111827",
+                        anchor="nw",
+                        font=("TkDefaultFont", 9, "bold"),
+                        tags=("persistent_measurement",),
+                    )
+                    badge_bounds = self.canvas.bbox(badge_id)
+                    if badge_bounds is not None:
+                        bx0, by0, bx1, by1 = badge_bounds
+                        bg_id = self.canvas.create_rectangle(
+                            bx0 - 3,
+                            by0 - 1,
+                            bx1 + 3,
+                            by1 + 1,
+                            outline="",
+                            fill="#fef08a",
+                            tags=("persistent_measurement",),
+                        )
+                        self.canvas.tag_raise(badge_id, bg_id)
+                        self.canvas.itemconfig(bg_id, state="disabled")
+                    self.canvas.itemconfig(badge_id, state="disabled")
                 if measurement.meta.get("grid_cell") is not None:
                     grid_roi_measurements.append(measurement)
                     continue
