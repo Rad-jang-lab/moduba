@@ -104,17 +104,20 @@ class DicomViewer:
         self.grid_cell_size_var = tk.StringVar(value="Grid cell size: 8 px")
         self.cursor_var = tk.StringVar(value="Cursor: -, -")
         self.measurement_mode = tk.StringVar(value="pan")
+        self.roi_draw_mode = tk.StringVar(value="grid")
         self.roi_propagation_enabled = tk.BooleanVar(value=False)
         self.roi_propagation_scope = tk.StringVar(value="next")
         self._active_preview_measurement: dict[str, Any] | None = None
         self._line_snap_anchor: tuple[int, int] | None = None
+        self._polygon_points: list[tuple[int, int]] = []
+        self._polygon_cursor_point: tuple[int, int] | None = None
+        self._draw_tool_buttons: dict[str, tk.Button] = {}
         self.crop_mode_active = tk.BooleanVar(value=False)
         self._active_crop_start: tuple[float, float] | None = None
         self._active_crop_end: tuple[float, float] | None = None
         self._active_crop_item_id: int | None = None
         self.persistent_measurements: list[Measurement] = []
         self.selected_persistent_measurement_id: str | None = None
-        self.selected_persistent_measurement_ids: set[str] = set()
         self._persistent_canvas_item_to_measurement_id: dict[int, str] = {}
         self.measurement_sets: dict[str, MeasurementSet] = {}
         self._image_bbox: tuple[float, float, float, float] | None = None
@@ -196,6 +199,29 @@ class DicomViewer:
         self.compare_sync_status_var = tk.StringVar(value="비교 동기: Off")
         self.snr_workflow_var = tk.StringVar(value="SNR: Idle")
         self.guided_snr_state: dict[str, Any] | None = None
+        self.analysis_inputs: dict[str, tk.StringVar] = {
+            "snr_signal_roi_id": tk.StringVar(value=""),
+            "snr_noise_roi_id": tk.StringVar(value=""),
+            "cnr_formula": tk.StringVar(value="standard_noise"),
+            "cnr_target_roi_id": tk.StringVar(value=""),
+            "cnr_reference_roi_id": tk.StringVar(value=""),
+            "cnr_noise_roi_id": tk.StringVar(value=""),
+            "line_profile_line_id": tk.StringVar(value=""),
+        }
+        self.analysis_results: dict[str, tk.StringVar] = {
+            "snr_preview": tk.StringVar(value="Preview: -"),
+            "snr_result": tk.StringVar(value="Result: -"),
+            "cnr_preview": tk.StringVar(value="Preview: -"),
+            "cnr_result": tk.StringVar(value="Result: -"),
+            "line_info": tk.StringVar(value="Line: -"),
+        }
+        self._analysis_option_maps: dict[str, dict[str, str]] = {
+            "roi": {},
+            "line": {},
+        }
+        self.analysis_last_run: dict[str, dict[str, Any]] = {}
+        self._analysis_comboboxes: dict[str, ttk.Combobox] = {}
+        self._cnr_noise_widgets: list[tk.Widget] = []
         self.shortcut_var = tk.StringVar(
             value=(
                 "단축키: F 창맞춤 | 0/Ctrl+0 100% | R W/L 리셋 | "
@@ -226,6 +252,8 @@ class DicomViewer:
         }
         self._configure_ui_styles()
         self._build_ui()
+        self.measurement_mode.trace_add("write", self._on_measurement_mode_changed)
+        self._on_measurement_mode_changed()
 
     def _configure_ui_styles(self) -> None:
         style = ttk.Style(self.root)
@@ -280,17 +308,19 @@ class DicomViewer:
 
         self.single_view_container = ttk.Frame(self.content_container)
         self.single_view_container.grid(row=0, column=0, sticky="nsew")
-        self.single_view_container.columnconfigure(0, weight=1)
+        self.single_view_container.columnconfigure(1, weight=1)
         self.single_view_container.rowconfigure(0, weight=1)
+
+        self._build_draw_tool_sidebar(self.single_view_container)
 
         self.canvas = tk.Canvas(self.single_view_container, bg="black", highlightthickness=0)
         x_scroll = ttk.Scrollbar(self.single_view_container, orient="horizontal", command=self.canvas.xview)
         y_scroll = ttk.Scrollbar(self.single_view_container, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(xscrollcommand=x_scroll.set, yscrollcommand=y_scroll.set)
 
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-        y_scroll.grid(row=0, column=1, sticky="ns")
-        x_scroll.grid(row=1, column=0, sticky="ew")
+        self.canvas.grid(row=0, column=1, sticky="nsew")
+        y_scroll.grid(row=0, column=2, sticky="ns")
+        x_scroll.grid(row=1, column=1, sticky="ew")
         self.canvas.bind("<Configure>", self._on_canvas_resize)
         self.canvas.bind("<ButtonPress-1>", self._handle_left_button_press)
         self.canvas.bind("<B1-Motion>", self._handle_left_button_drag)
@@ -358,11 +388,13 @@ class DicomViewer:
         home_tab = self._add_toolbar_tab(notebook, "HOME")
         image_tab = self._add_toolbar_tab(notebook, "IMAGE")
         measure_tab = self._add_toolbar_tab(notebook, "MEASURE")
+        analysis_tab = self._add_toolbar_tab(notebook, "ANALYSIS")
         export_tab = self._add_toolbar_tab(notebook, "EXPORT")
 
         self._build_home_toolbar(home_tab)
         self._build_image_toolbar(image_tab)
         self._build_measure_toolbar(measure_tab)
+        self._build_analysis_toolbar(analysis_tab)
         self._build_export_toolbar(export_tab)
 
     @staticmethod
@@ -580,14 +612,48 @@ class DicomViewer:
         ttk.Button(sections["Transform"], text="Rotate 180°", command=lambda: self.rotate_current_image(180)).pack(side="left", padx=(8, 0))
         ttk.Button(sections["Transform"], text="Rotate 270°", command=lambda: self.rotate_current_image(270)).pack(side="left", padx=(8, 0))
 
+    def _build_draw_tool_sidebar(self, parent: ttk.Frame) -> None:
+        sidebar = ttk.LabelFrame(parent, text="Tools", padding=(6, 6))
+        sidebar.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
+        sidebar.columnconfigure(0, weight=1)
+        for row, (label, mode) in enumerate(
+            [("Pan", "pan"), ("Line", "line"), ("ROI", "roi"), ("Polygon", "polygon")]
+        ):
+            button = tk.Button(
+                sidebar,
+                text=label,
+                width=10,
+                anchor="w",
+                relief="raised",
+                command=lambda target=mode: self._set_measurement_mode(target),
+            )
+            button.grid(row=row, column=0, sticky="ew", pady=(0, 4))
+            self._draw_tool_buttons[mode] = button
+        ttk.Separator(sidebar, orient="horizontal").grid(row=4, column=0, sticky="ew", pady=(2, 6))
+        ttk.Label(sidebar, text="ROI mode").grid(row=5, column=0, sticky="w")
+        ttk.Radiobutton(sidebar, text="Grid ROI", value="grid", variable=self.roi_draw_mode).grid(row=6, column=0, sticky="w")
+        ttk.Radiobutton(sidebar, text="Free ROI", value="free", variable=self.roi_draw_mode).grid(row=7, column=0, sticky="w")
+        ttk.Label(sidebar, text="Grid ON → polygon snap").grid(row=8, column=0, sticky="w", pady=(6, 0))
+
+    def _set_measurement_mode(self, mode: str) -> None:
+        self.measurement_mode.set(mode)
+
+    def _on_measurement_mode_changed(self, *_args: Any) -> None:
+        active_mode = self.measurement_mode.get()
+        for mode, button in self._draw_tool_buttons.items():
+            is_active = mode == active_mode
+            button.configure(
+                bg="#2f7dd1" if is_active else "#f2f4f7",
+                fg="#ffffff" if is_active else "#1f2937",
+                relief="sunken" if is_active else "raised",
+            )
+        if active_mode != "polygon":
+            self._cancel_polygon_draft()
+        elif self.view_mode == "single":
+            self.cursor_var.set("Cursor: Polygon 모드 (점 추가 후 첫 점 클릭 또는 Enter로 닫기)")
+
     def _build_measure_toolbar(self, tab: ttk.Frame) -> None:
         strip = self._build_grouped_toolbar_strip(tab)
-
-        draw_group = ttk.LabelFrame(strip, text="Draw", padding=(8, 6))
-        draw_group.pack(side="left", padx=(0, 8), fill="y")
-        ttk.Radiobutton(draw_group, text="Line", value="line", variable=self.measurement_mode).grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(draw_group, text="ROI", value="roi", variable=self.measurement_mode).grid(row=0, column=1, padx=(6, 0), sticky="w")
-        ttk.Radiobutton(draw_group, text="Pan", value="pan", variable=self.measurement_mode).grid(row=0, column=2, padx=(6, 0), sticky="w")
 
         grid_group = ttk.LabelFrame(strip, text="Grid", padding=(8, 6))
         grid_group.pack(side="left", padx=(0, 8), fill="y")
@@ -628,17 +694,9 @@ class DicomViewer:
         self._sync_grid_spacing_from_mode()
         self._sync_grid_roi_size_from_mode()
 
-        selection_group = ttk.LabelFrame(strip, text="Selection", padding=(8, 6))
-        selection_group.pack(side="left", padx=(0, 8), fill="y")
-        ttk.Label(selection_group, text="Single: click measurement").grid(row=0, column=0, sticky="w")
-        ttk.Label(selection_group, text="Multi: Ctrl + click toggle").grid(row=1, column=0, sticky="w", pady=(2, 0))
-        ttk.Button(selection_group, text="Clear Selected", command=self.clear_selected_measurement).grid(
-            row=2, column=0, sticky="ew", pady=(6, 0)
-        )
-
         measurement_group = ttk.LabelFrame(strip, text="Measurement", padding=(8, 6))
         measurement_group.pack(side="left", padx=(0, 8), fill="y")
-        ttk.Label(measurement_group, text="ROI: Width / Height / Area").grid(row=0, column=0, sticky="w")
+        ttk.Label(measurement_group, text="ROI Geometry: X/Y, Width, Height, Area").grid(row=0, column=0, sticky="w")
         ttk.Label(measurement_group, text="Display: mm first, px second").grid(row=1, column=0, sticky="w", pady=(2, 0))
         ttk.Button(measurement_group, text="Grid ROI Summary", command=self._show_grid_roi_combined_summary).grid(
             row=2, column=0, sticky="ew", pady=(6, 0)
@@ -661,23 +719,231 @@ class DicomViewer:
             variable=self.roi_propagation_scope,
         ).grid(row=5, column=0, sticky="w")
 
-        analysis_group = ttk.LabelFrame(strip, text="Analysis", padding=(8, 6))
-        analysis_group.pack(side="left", padx=(0, 8), fill="y")
-        ttk.Button(analysis_group, text="SNR", command=self.start_guided_snr_workflow).grid(row=0, column=0, sticky="ew")
-        ttk.Button(analysis_group, text="CNR", command=self.calculate_cnr_from_roles).grid(row=1, column=0, sticky="ew", pady=(4, 0))
-        ttk.Button(analysis_group, text="Line Profile", command=self.show_line_profile_for_selected_line).grid(
-            row=2, column=0, sticky="ew", pady=(4, 0)
-        )
-        ttk.Button(analysis_group, text="ROI 분류(CNR 고급)", command=self.assign_roi_role).grid(row=3, column=0, sticky="ew", pady=(4, 0))
-        ttk.Label(analysis_group, textvariable=self.snr_workflow_var).grid(row=4, column=0, sticky="w", pady=(4, 0))
-
         manage_group = ttk.LabelFrame(strip, text="Manage", padding=(8, 6))
         manage_group.pack(side="left", padx=(0, 8), fill="y")
         ttk.Button(manage_group, text="Undo", command=self.undo_last_measurement).grid(row=0, column=0, sticky="ew")
         ttk.Button(manage_group, text="Clear All", command=self.clear_persistent_measurements).grid(row=1, column=0, sticky="ew", pady=(4, 0))
-        ttk.Button(manage_group, text="Export CSV", command=self.export_measurements_csv).grid(
+        ttk.Button(manage_group, text="Delete Selected", command=self.clear_selected_measurement).grid(
             row=2, column=0, sticky="ew", pady=(4, 0)
         )
+        ttk.Button(manage_group, text="Export CSV", command=self.export_measurements_csv).grid(
+            row=3, column=0, sticky="ew", pady=(4, 0)
+        )
+
+    def _build_analysis_toolbar(self, tab: ttk.Frame) -> None:
+        strip = self._build_grouped_toolbar_strip(tab)
+
+        snr_group = ttk.LabelFrame(strip, text="SNR", padding=(8, 6))
+        snr_group.pack(side="left", padx=(0, 8), fill="y")
+        ttk.Label(snr_group, text="Input: Signal ROI").grid(row=0, column=0, sticky="w")
+        self._analysis_comboboxes["snr_signal"] = ttk.Combobox(
+            snr_group,
+            state="readonly",
+            width=46,
+        )
+        self._analysis_comboboxes["snr_signal"].grid(row=1, column=0, sticky="ew", pady=(2, 4))
+        ttk.Label(snr_group, text="Input: Noise ROI").grid(row=2, column=0, sticky="w")
+        self._analysis_comboboxes["snr_noise"] = ttk.Combobox(
+            snr_group,
+            state="readonly",
+            width=46,
+        )
+        self._analysis_comboboxes["snr_noise"].grid(row=3, column=0, sticky="ew", pady=(2, 4))
+        ttk.Label(snr_group, text="Formula: mean(Signal ROI) / std(Noise ROI)").grid(row=4, column=0, sticky="w")
+        ttk.Label(snr_group, textvariable=self.analysis_results["snr_preview"]).grid(row=5, column=0, sticky="w", pady=(2, 0))
+        ttk.Label(snr_group, textvariable=self.analysis_results["snr_result"]).grid(row=6, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(snr_group, text="Calculate SNR", command=self.calculate_snr_from_inputs).grid(row=7, column=0, sticky="ew", pady=(6, 0))
+
+        cnr_group = ttk.LabelFrame(strip, text="CNR", padding=(8, 6))
+        cnr_group.pack(side="left", padx=(0, 8), fill="y")
+        formula_cards = ttk.LabelFrame(cnr_group, text="Formula Selection", padding=(6, 4))
+        formula_cards.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Radiobutton(
+            formula_cards,
+            text=(
+                "Option A | |S_A - S_B| / sigma_o\n"
+                "Uses background noise std.\n"
+                "Required: Region A ROI, Region B ROI, Noise ROI"
+            ),
+            value="standard_noise",
+            variable=self.analysis_inputs["cnr_formula"],
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(
+            formula_cards,
+            text=(
+                "Option B | |S_A - S_B| / sqrt(sigma_A^2 + sigma_B^2)\n"
+                "Uses both region variances.\n"
+                "Required: Region A ROI, Region B ROI"
+            ),
+            value="dual_variance",
+            variable=self.analysis_inputs["cnr_formula"],
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+        ttk.Label(cnr_group, text="Input: Region A ROI").grid(row=1, column=0, sticky="w")
+        self._analysis_comboboxes["cnr_target"] = ttk.Combobox(
+            cnr_group,
+            state="readonly",
+            width=46,
+        )
+        self._analysis_comboboxes["cnr_target"].grid(row=2, column=0, sticky="ew", pady=(2, 4))
+        ttk.Label(cnr_group, text="Input: Region B ROI").grid(row=3, column=0, sticky="w")
+        self._analysis_comboboxes["cnr_reference"] = ttk.Combobox(
+            cnr_group,
+            state="readonly",
+            width=46,
+        )
+        self._analysis_comboboxes["cnr_reference"].grid(row=4, column=0, sticky="ew", pady=(2, 4))
+        noise_label = ttk.Label(cnr_group, text="Input: Noise ROI")
+        noise_label.grid(row=5, column=0, sticky="w")
+        self._analysis_comboboxes["cnr_noise"] = ttk.Combobox(
+            cnr_group,
+            state="readonly",
+            width=46,
+        )
+        self._analysis_comboboxes["cnr_noise"].grid(row=6, column=0, sticky="ew", pady=(2, 4))
+        self._cnr_noise_widgets = [noise_label, self._analysis_comboboxes["cnr_noise"]]
+        ttk.Label(cnr_group, textvariable=self.analysis_results["cnr_preview"]).grid(row=7, column=0, sticky="w", pady=(2, 0))
+        ttk.Label(cnr_group, textvariable=self.analysis_results["cnr_result"]).grid(row=8, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(cnr_group, text="Calculate CNR", command=self.calculate_cnr_from_inputs).grid(row=9, column=0, sticky="ew", pady=(6, 0))
+
+        line_group = ttk.LabelFrame(strip, text="Line Profile", padding=(8, 6))
+        line_group.pack(side="left", padx=(0, 8), fill="y")
+        ttk.Label(line_group, text="Input: Profile Line").grid(row=0, column=0, sticky="w")
+        self._analysis_comboboxes["line_profile"] = ttk.Combobox(
+            line_group,
+            state="readonly",
+            width=46,
+        )
+        self._analysis_comboboxes["line_profile"].grid(row=1, column=0, sticky="ew", pady=(2, 4))
+        ttk.Label(line_group, text="Formula: intensity(x) sampled along selected line").grid(row=2, column=0, sticky="w")
+        ttk.Label(line_group, textvariable=self.analysis_results["line_info"]).grid(row=3, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(line_group, text="Show Line Profile", command=self.show_line_profile_for_selected_line).grid(
+            row=4, column=0, sticky="ew", pady=(6, 0)
+        )
+        ttk.Button(line_group, text="ROI 역할 분류(CNR 고급)", command=self.assign_roi_role).grid(
+            row=5, column=0, sticky="ew", pady=(4, 0)
+        )
+        ttk.Label(line_group, textvariable=self.snr_workflow_var).grid(row=6, column=0, sticky="w", pady=(2, 0))
+        self.analysis_inputs["cnr_formula"].trace_add("write", self._update_cnr_formula_ui)
+        self._update_cnr_formula_ui()
+        self._refresh_analysis_selectors()
+
+    def _refresh_analysis_selectors(self) -> None:
+        roi_options = self._build_roi_analysis_options()
+        line_options = self._build_line_analysis_options()
+        self._analysis_option_maps["roi"] = {label: measurement_id for measurement_id, label in roi_options}
+        self._analysis_option_maps["line"] = {label: measurement_id for measurement_id, label in line_options}
+        roi_labels = [label for _, label in roi_options]
+        line_labels = [label for _, label in line_options]
+        for key in ("snr_signal", "snr_noise", "cnr_target", "cnr_reference", "cnr_noise"):
+            if key in self._analysis_comboboxes:
+                self._analysis_comboboxes[key]["values"] = roi_labels
+        if "line_profile" in self._analysis_comboboxes:
+            self._analysis_comboboxes["line_profile"]["values"] = line_labels
+        self._sync_analysis_display_value("roi", "snr_signal", "snr_signal_roi_id")
+        self._sync_analysis_display_value("roi", "snr_noise", "snr_noise_roi_id")
+        self._sync_analysis_display_value("roi", "cnr_target", "cnr_target_roi_id")
+        self._sync_analysis_display_value("roi", "cnr_reference", "cnr_reference_roi_id")
+        self._sync_analysis_display_value("roi", "cnr_noise", "cnr_noise_roi_id")
+        self._sync_analysis_display_value("line", "line_profile", "line_profile_line_id")
+
+    def _update_cnr_formula_ui(self, *_args: object) -> None:
+        formula = self.analysis_inputs["cnr_formula"].get()
+        show_noise = formula == "standard_noise"
+        for widget in self._cnr_noise_widgets:
+            if show_noise:
+                widget.grid()
+            else:
+                widget.grid_remove()
+        if not show_noise:
+            self.analysis_inputs["cnr_noise_roi_id"].set("")
+            if "cnr_noise" in self._analysis_comboboxes:
+                self._analysis_comboboxes["cnr_noise"].set("")
+            self.analysis_results["cnr_preview"].set("Formula: |S_A - S_B| / sqrt(sigma_A^2 + sigma_B^2)")
+        else:
+            self.analysis_results["cnr_preview"].set("Formula: |S_A - S_B| / sigma_o")
+        self.analysis_results["cnr_result"].set("Result: -")
+
+    def _sync_analysis_display_value(self, kind: str, combobox_key: str, input_key: str) -> None:
+        combobox = self._analysis_comboboxes.get(combobox_key)
+        if combobox is None:
+            return
+        selected_id = self.analysis_inputs[input_key].get()
+        if not selected_id:
+            combobox.set("")
+            return
+        option_map = self._analysis_option_maps.get(kind, {})
+        for label, measurement_id in option_map.items():
+            if measurement_id == selected_id:
+                combobox.set(label)
+                return
+        self.analysis_inputs[input_key].set("")
+        combobox.set("")
+
+    def _build_roi_analysis_options(self) -> list[tuple[str, str]]:
+        options: list[tuple[str, str]] = []
+        current_geometry = self._get_current_geometry_key()
+        for measurement in self.persistent_measurements:
+            if measurement.kind != "roi":
+                continue
+            if not self._geometry_matches(measurement.geometry_key, current_geometry):
+                continue
+            if measurement.frame_index != self.current_frame:
+                continue
+            metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
+            signal_stats = dict(metrics.get("signal_stats") or {})
+            mean = float(signal_stats.get("mean", 0.0))
+            std = float(signal_stats.get("std", 0.0))
+            area_mm2 = metrics.get("area_mm2")
+            area_text = f"{area_mm2:.1f} mm²" if isinstance(area_mm2, (int, float)) else f"{metrics['area_px']:.1f} px²"
+            label = f"ROI {measurement.id[:8]} | mean {mean:.1f} | std {std:.1f} | area {area_text}"
+            options.append((measurement.id, label))
+        return options
+
+    def _build_line_analysis_options(self) -> list[tuple[str, str]]:
+        options: list[tuple[str, str]] = []
+        current_geometry = self._get_current_geometry_key()
+        for measurement in self.persistent_measurements:
+            if measurement.kind != "line":
+                continue
+            if not self._geometry_matches(measurement.geometry_key, current_geometry):
+                continue
+            if measurement.frame_index != self.current_frame:
+                continue
+            metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
+            label = f"Line {measurement.id[:8]} | length {metrics['length_px']:.1f} px"
+            options.append((measurement.id, label))
+        return options
+
+    def _is_analysis_compatible_measurement(self, measurement: Measurement) -> bool:
+        current_geometry = self._get_current_geometry_key()
+        return self._geometry_matches(measurement.geometry_key, current_geometry) and measurement.frame_index == self.current_frame
+
+    def _collect_analysis_factors(self, measurement: Measurement) -> dict[str, Any]:
+        return {
+            "measurement_id": measurement.id,
+            "frame_index": int(measurement.frame_index),
+            "geometry_key": measurement.geometry_key,
+            "pixel_spacing_mm": self._get_pixel_spacing_mm(),
+            "roi_type": measurement.meta.get("roi_type"),
+        }
+
+    def _get_selected_measurement_from_analysis(self, kind: str, input_key: str, combobox_key: str) -> Measurement | None:
+        selected_label = self._analysis_comboboxes.get(combobox_key).get() if combobox_key in self._analysis_comboboxes else ""
+        if selected_label:
+            mapped_id = self._analysis_option_maps.get(kind, {}).get(selected_label, "")
+            if mapped_id:
+                self.analysis_inputs[input_key].set(mapped_id)
+        selected_id = self.analysis_inputs[input_key].get()
+        selected = self._find_measurement_by_id(selected_id, expected_kind=kind)
+        if selected is None:
+            return None
+        if not self._is_analysis_compatible_measurement(selected):
+            self.analysis_inputs[input_key].set("")
+            if combobox_key in self._analysis_comboboxes:
+                self._analysis_comboboxes[combobox_key].set("")
+            return None
+        return selected
 
     def _build_export_toolbar(self, tab: ttk.Frame) -> None:
         sections = self._build_subtoolbar_sections(tab, ["Measurement Sets", "Image Export"])
@@ -2270,6 +2536,10 @@ class DicomViewer:
             primary = f"{self._format_mm_value(metrics['length_mm'])} mm"
             secondary = f"{metrics['length_px']:.1f} px"
             return primary, secondary
+        if kind == "polygon":
+            primary = f"Area {self._format_mm_value(metrics['area_mm2'])} mm²"
+            secondary = f"{metrics['area_px']:.1f} px²"
+            return primary, secondary
 
         width_px = int(round(metrics["width_px"]))
         height_px = int(round(metrics["height_px"]))
@@ -3793,6 +4063,11 @@ class DicomViewer:
         if self.crop_mode_active.get():
             self._start_crop_selection(event)
             return
+        if self.measurement_mode.get() == "polygon":
+            if self._select_persistent_measurement_at_event(event):
+                return
+            self._handle_polygon_click(event)
+            return
         if self._should_use_grid_snapped_line_mode() and not self._is_ctrl_pressed(event):
             self._handle_grid_snapped_line_click(event)
             return
@@ -3972,6 +4247,8 @@ class DicomViewer:
             return
         x, y = coords
         self.cursor_var.set(f"Cursor: ({x}, {y})")
+        if self.measurement_mode.get() == "polygon":
+            self._update_polygon_preview(event)
 
     def _should_use_grid_snapped_line_mode(self) -> bool:
         return self.measurement_mode.get() == "line" and self.show_grid_overlay.get() and self.view_mode == "single"
@@ -4081,12 +4358,117 @@ class DicomViewer:
         y_ratio = (canvas_y - top) / display_height
         return float(np.clip(x_ratio * width, 0, max(width - 1, 0))), float(np.clip(y_ratio * height, 0, max(height - 1, 0)))
 
+    def _cancel_polygon_draft(self) -> None:
+        self._polygon_points = []
+        self._polygon_cursor_point = None
+        self.canvas.delete("temp_measurement")
+
+    def _get_polygon_point_from_event(self, event: tk.Event) -> tuple[int, int] | None:
+        point = self._canvas_to_image_pixel(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        if point is None:
+            return None
+        if self.show_grid_overlay.get():
+            return self._snap_image_point_to_grid_intersection(point)
+        return point
+
+    def _handle_polygon_click(self, event: tk.Event) -> None:
+        point = self._get_polygon_point_from_event(event)
+        if point is None:
+            return
+        if self._polygon_points and point == self._polygon_points[-1]:
+            return
+        if len(self._polygon_points) >= 3 and np.hypot(point[0] - self._polygon_points[0][0], point[1] - self._polygon_points[0][1]) <= 2.0:
+            self._finalize_polygon_measurement()
+            return
+        self._polygon_points.append(point)
+        self._polygon_cursor_point = point
+        self._draw_polygon_draft()
+
+    def _update_polygon_preview(self, event: tk.Event) -> None:
+        if not self._polygon_points:
+            return
+        point = self._get_polygon_point_from_event(event)
+        if point is None:
+            return
+        self._polygon_cursor_point = point
+        self._draw_polygon_draft()
+
+    def _draw_polygon_draft(self) -> None:
+        self.canvas.delete("temp_measurement")
+        if not self._polygon_points:
+            return
+        canvas_points: list[float] = []
+        for x, y in self._polygon_points:
+            canvas_point = self._image_pixel_to_canvas(x, y)
+            if canvas_point is None:
+                return
+            canvas_points.extend(canvas_point)
+        if len(canvas_points) >= 4:
+            self.canvas.create_line(*canvas_points, fill="#7bdff2", width=2, tags=("temp_measurement",))
+        for x, y in self._polygon_points:
+            center = self._image_pixel_to_canvas(x, y)
+            if center is None:
+                continue
+            cx, cy = center
+            self.canvas.create_oval(cx - 2, cy - 2, cx + 2, cy + 2, fill="#7bdff2", outline="#7bdff2", tags=("temp_measurement",))
+        if self._polygon_cursor_point is not None and self._polygon_points:
+            start = self._image_pixel_to_canvas(*self._polygon_points[-1])
+            end = self._image_pixel_to_canvas(*self._polygon_cursor_point)
+            if start is not None and end is not None:
+                self.canvas.create_line(*start, *end, fill="#7bdff2", width=1, dash=(3, 2), tags=("temp_measurement",))
+
+    def _finalize_polygon_measurement(self) -> None:
+        if len(self._polygon_points) < 3:
+            self._cancel_polygon_draft()
+            return
+        points = list(self._polygon_points)
+        points_closed = points + [points[0]]
+        segment_lengths = [
+            float(np.hypot(points_closed[i + 1][0] - points_closed[i][0], points_closed[i + 1][1] - points_closed[i][1]))
+            for i in range(len(points))
+        ]
+        for index in range(len(points)):
+            self._append_persistent_measurement("line", points_closed[index], points_closed[index + 1])
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        self._append_persistent_measurement(
+            "polygon",
+            (min(xs), min(ys)),
+            (max(xs), max(ys)),
+            extra_meta={
+                "points": [[int(x), int(y)] for x, y in points],
+                "closed": True,
+                "segment_lengths_px": segment_lengths,
+            },
+        )
+        self._cancel_polygon_draft()
+        self._draw_persistent_measurements()
+
     def _start_preview_measurement(self, event: tk.Event) -> None:
         if not self.frames or self.view_mode != "single":
             return
         mode = self.measurement_mode.get()
         if mode == "roi":
-            self._create_grid_aligned_roi(event)
+            if self.roi_draw_mode.get() == "grid":
+                self._create_grid_aligned_roi(event)
+                return
+            start_x = self.canvas.canvasx(event.x)
+            start_y = self.canvas.canvasy(event.y)
+            item_id = self.canvas.create_rectangle(
+                start_x,
+                start_y,
+                start_x,
+                start_y,
+                outline="#ffd34d",
+                width=2,
+                tags=("temp_measurement",),
+            )
+            self._active_preview_measurement = {
+                "mode": "roi",
+                "item_id": item_id,
+                "start": (start_x, start_y),
+                "end": (start_x, start_y),
+            }
             return
         if mode != "line":
             return
@@ -4103,8 +4485,6 @@ class DicomViewer:
         }
 
     def _update_preview_measurement(self, event: tk.Event) -> None:
-        if self.measurement_mode.get() == "roi":
-            return
         if self._active_preview_measurement is None:
             return
         end_x = self.canvas.canvasx(event.x)
@@ -4114,7 +4494,7 @@ class DicomViewer:
         self.canvas.coords(self._active_preview_measurement["item_id"], start_x, start_y, end_x, end_y)
 
     def _finish_preview_measurement(self, event: tk.Event) -> None:
-        if self.measurement_mode.get() == "roi":
+        if self.measurement_mode.get() == "roi" and self.roi_draw_mode.get() == "grid":
             return
         if self._active_preview_measurement is None:
             return
@@ -4128,7 +4508,10 @@ class DicomViewer:
         self._active_preview_measurement = None
         if image_start is None or image_end is None:
             return
-        measurement = self._append_persistent_measurement(mode, image_start, image_end)
+        extra_meta: dict[str, Any] | None = None
+        if mode == "roi":
+            extra_meta = {"roi_type": "free"}
+        measurement = self._append_persistent_measurement(mode, image_start, image_end, extra_meta=extra_meta)
         if measurement is not None:
             self._update_guided_snr_selection(measurement)
         self._draw_preview_measurements()
@@ -4238,7 +4621,7 @@ class DicomViewer:
         y0 = int(np.clip(row * cell_size_px, 0, max(height - 1, 0)))
         x1 = int(np.clip(x0 + (cell_size_px * roi_cells_w), 0, max(width - 1, 0)))
         y1 = int(np.clip(y0 + (cell_size_px * roi_cells_h), 0, max(height - 1, 0)))
-        measurement = self._append_persistent_measurement("roi", (x0, y0), (x1, y1))
+        measurement = self._append_persistent_measurement("roi", (x0, y0), (x1, y1), extra_meta={"roi_type": "grid"})
         if measurement is None:
             return None
         measurement.meta["grid_cell"] = {"row": int(row), "col": int(col)}
@@ -4250,13 +4633,12 @@ class DicomViewer:
     @staticmethod
     def compute_roi_statistics(roi_array: np.ndarray) -> dict[str, float]:
         if roi_array.size == 0:
-            return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0, "snr": 0.0}
+            return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
         mean_val = float(np.mean(roi_array))
         std_val = float(np.std(roi_array))
         min_val = float(np.min(roi_array))
         max_val = float(np.max(roi_array))
-        snr_val = float(mean_val / std_val) if std_val > 0 else 0.0
-        return {"mean": mean_val, "std": std_val, "min": min_val, "max": max_val, "snr": snr_val}
+        return {"mean": mean_val, "std": std_val, "min": min_val, "max": max_val}
 
     @staticmethod
     def _extract_grid_cell_meta(meta: dict[str, Any]) -> dict[str, int] | None:
@@ -4268,7 +4650,7 @@ class DicomViewer:
                 pass
         legacy_source = str(meta.get("source_mode", ""))
         if legacy_source == "grid_roi":
-            roi_id = str((meta.get("roi_stats") or {}).get("roi_id", ""))
+            roi_id = str((meta.get("roi_stats") or meta.get("signal_stats") or {}).get("roi_id", ""))
             if "_" in roi_id:
                 row_text, col_text = roi_id.split("_", 1)
                 if row_text.isdigit() and col_text.isdigit():
@@ -4279,18 +4661,32 @@ class DicomViewer:
         raw_meta = dict(measurement.meta or {})
         grid_cell = self._extract_grid_cell_meta(raw_meta)
         roi_role = str(raw_meta.get("roi_role", "none"))
+        geometry = dict(metrics.get("geometry") or {})
+        analysis = dict(metrics.get("analysis") or {})
         canonical: dict[str, Any] = {
             "metrics": metrics,
+            "geometry": geometry,
+            "analysis": analysis,
             "roi_role": roi_role,
         }
         if measurement.kind == "roi":
-            roi_stats = dict(metrics.get("roi_stats") or {})
+            roi_type = str(raw_meta.get("roi_type") or ("grid" if grid_cell is not None else "free"))
+            canonical["roi_type"] = roi_type
+            signal_stats = dict(metrics.get("signal_stats") or {})
             if grid_cell is not None:
                 canonical["grid_cell"] = grid_cell
-                roi_stats["roi_id"] = f"{grid_cell['row']}_{grid_cell['col']}"
-            elif "roi_id" not in roi_stats:
-                roi_stats["roi_id"] = measurement.id
-            canonical["roi_stats"] = roi_stats
+                signal_stats["roi_id"] = f"{grid_cell['row']}_{grid_cell['col']}"
+            elif "roi_id" not in signal_stats:
+                signal_stats["roi_id"] = measurement.id
+            canonical["signal_stats"] = signal_stats
+        if measurement.kind == "polygon":
+            points = raw_meta.get("points", [])
+            if isinstance(points, list):
+                canonical["points"] = points
+            canonical["closed"] = bool(raw_meta.get("closed", True))
+            segments = raw_meta.get("segment_lengths_px", [])
+            if isinstance(segments, list):
+                canonical["segment_lengths_px"] = [float(value) for value in segments]
         return canonical
 
     def _find_grid_roi_measurement_id_from_cell(self, row: int, col: int) -> str | None:
@@ -4447,26 +4843,34 @@ class DicomViewer:
         spacing = self._get_pixel_spacing_mm()
         row_mm = spacing[0] if spacing is not None else None
         col_mm = spacing[1] if spacing is not None else None
-        roi_stats: dict[str, Any] | None = None
+        signal_stats: dict[str, Any] | None = None
+        analysis: dict[str, Any] = {}
+        roi_x = int(min(start[0], end[0]))
+        roi_y = int(min(start[1], end[1]))
+        roi_width_px = int(dx_px)
+        roi_height_px = int(dy_px)
+        pixel_count = int(max(roi_width_px, 0) * max(roi_height_px, 0))
+        polygon_points: list[tuple[float, float]] = []
+        polygon_segment_lengths_px: list[float] = []
+        polygon_segment_lengths_mm: list[float] = []
+        polygon_area_px = 0.0
+        polygon_area_mm2: float | None = None
         if measurement.kind == "roi":
-            roi_id = str(measurement.meta.get("roi_stats", {}).get("roi_id") or measurement.id)
+            legacy_stats = measurement.meta.get("signal_stats") or measurement.meta.get("roi_stats") or {}
+            roi_id = str(legacy_stats.get("roi_id") or measurement.id)
             if image_array is None or image_array.ndim < 2:
-                roi_stats = {
+                signal_stats = {
                     "roi_id": roi_id,
                     "mean": 0.0,
                     "std": 0.0,
                     "min": 0.0,
                     "max": 0.0,
-                    "snr": 0.0,
-                    "pixel_width": int(dx_px),
-                    "pixel_height": int(dy_px),
-                    "width_mm": None if col_mm is None else float(dx_px * col_mm),
-                    "height_mm": None if row_mm is None else float(dy_px * row_mm),
+                    "pixel_count": int(pixel_count),
                 }
             else:
                 height, width = image_array.shape[:2]
-                x0 = int(np.clip(min(start[0], end[0]), 0, max(width - 1, 0)))
-                y0 = int(np.clip(min(start[1], end[1]), 0, max(height - 1, 0)))
+                x0 = int(np.clip(roi_x, 0, max(width - 1, 0)))
+                y0 = int(np.clip(roi_y, 0, max(height - 1, 0)))
                 x1 = int(np.clip(max(start[0], end[0]), 0, max(width - 1, 0)))
                 y1 = int(np.clip(max(start[1], end[1]), 0, max(height - 1, 0)))
                 if x1 <= x0:
@@ -4474,33 +4878,104 @@ class DicomViewer:
                 if y1 <= y0:
                     y1 = min(y0 + 1, height)
                 stats = self.compute_roi_statistics(image_array[y0:y1, x0:x1])
-                roi_stats = {
+                roi_width_px = int(max(x1 - x0, 0))
+                roi_height_px = int(max(y1 - y0, 0))
+                roi_x = int(x0)
+                roi_y = int(y0)
+                pixel_count = int(roi_width_px * roi_height_px)
+                signal_stats = {
                     "roi_id": roi_id,
                     "mean": stats["mean"],
                     "std": stats["std"],
                     "min": stats["min"],
                     "max": stats["max"],
-                    "snr": stats["snr"],
-                    "pixel_width": int(max(x1 - x0, 0)),
-                    "pixel_height": int(max(y1 - y0, 0)),
-                    "width_mm": None if col_mm is None else float(max(x1 - x0, 0) * col_mm),
-                    "height_mm": None if row_mm is None else float(max(y1 - y0, 0) * row_mm),
+                    "pixel_count": pixel_count,
                 }
+            std_value = float(signal_stats.get("std", 0.0)) if signal_stats is not None else 0.0
+            mean_value = float(signal_stats.get("mean", 0.0)) if signal_stats is not None else 0.0
+            analysis["snr"] = 0.0 if std_value <= 0 else float(mean_value / std_value)
+            dx_px = roi_width_px
+            dy_px = roi_height_px
+
+        if measurement.kind == "polygon":
+            raw_points = measurement.meta.get("points", [])
+            if isinstance(raw_points, list):
+                for item in raw_points:
+                    if isinstance(item, (list, tuple)) and len(item) >= 2:
+                        polygon_points.append((float(item[0]), float(item[1])))
+            if len(polygon_points) >= 3:
+                closed = polygon_points + [polygon_points[0]]
+                polygon_segment_lengths_px = [
+                    float(np.hypot(closed[i + 1][0] - closed[i][0], closed[i + 1][1] - closed[i][1]))
+                    for i in range(len(polygon_points))
+                ]
+                if row_mm is not None and col_mm is not None:
+                    polygon_segment_lengths_mm = [
+                        float(
+                            np.hypot(
+                                (closed[i + 1][0] - closed[i][0]) * col_mm,
+                                (closed[i + 1][1] - closed[i][1]) * row_mm,
+                            )
+                        )
+                        for i in range(len(polygon_points))
+                    ]
+                area_sum = 0.0
+                for i in range(len(polygon_points)):
+                    x0, y0 = polygon_points[i]
+                    x1, y1 = polygon_points[(i + 1) % len(polygon_points)]
+                    area_sum += x0 * y1 - x1 * y0
+                polygon_area_px = abs(area_sum) * 0.5
+                if row_mm is not None and col_mm is not None:
+                    polygon_area_mm2 = float(polygon_area_px * row_mm * col_mm)
+                dx_px = int(max(point[0] for point in polygon_points) - min(point[0] for point in polygon_points))
+                dy_px = int(max(point[1] for point in polygon_points) - min(point[1] for point in polygon_points))
+
+        geometry: dict[str, Any] = {
+            "x": float(roi_x if measurement.kind == "roi" else min(start[0], end[0])),
+            "y": float(roi_y if measurement.kind == "roi" else min(start[1], end[1])),
+            "width_px": float(dx_px),
+            "height_px": float(dy_px),
+            "area_px": float(polygon_area_px if measurement.kind == "polygon" else dx_px * dy_px),
+            "length_px": float(
+                np.sum(polygon_segment_lengths_px) if measurement.kind == "polygon" and polygon_segment_lengths_px else np.hypot(dx_px, dy_px)
+            ),
+            "width_mm": None if col_mm is None else float(dx_px * col_mm),
+            "height_mm": None if row_mm is None else float(dy_px * row_mm),
+            "area_mm2": polygon_area_mm2
+            if measurement.kind == "polygon"
+            else (None if (row_mm is None or col_mm is None) else float(dx_px * dy_px * row_mm * col_mm)),
+            "length_mm": None
+            if (row_mm is None or col_mm is None)
+            else (
+                float(np.sum(polygon_segment_lengths_mm))
+                if measurement.kind == "polygon" and polygon_segment_lengths_mm
+                else float(np.hypot(dx_px * col_mm, dy_px * row_mm))
+            ),
+            "pixel_count": int(pixel_count if measurement.kind == "roi" else max(dx_px, 0) * max(dy_px, 0)),
+        }
 
         result: dict[str, Any] = {
             "pixel_spacing_mm": spacing,
-            "width_px": float(dx_px),
-            "height_px": float(dy_px),
-            "area_px": float(dx_px * dy_px),
-            "length_px": float(np.hypot(dx_px, dy_px)),
-            "width_mm": None if col_mm is None else float(dx_px * col_mm),
-            "height_mm": None if row_mm is None else float(dy_px * row_mm),
-            "area_mm2": None if (row_mm is None or col_mm is None) else float(dx_px * dy_px * row_mm * col_mm),
-            "length_mm": None if (row_mm is None or col_mm is None) else float(np.hypot(dx_px * col_mm, dy_px * row_mm)),
-            "roi_stats": roi_stats,
+            "geometry": geometry,
+            "signal_stats": signal_stats,
+            "analysis": analysis,
+            "width_px": geometry["width_px"],
+            "height_px": geometry["height_px"],
+            "area_px": geometry["area_px"],
+            "length_px": geometry["length_px"],
+            "width_mm": geometry["width_mm"],
+            "height_mm": geometry["height_mm"],
+            "area_mm2": geometry["area_mm2"],
+            "length_mm": geometry["length_mm"],
+            "pixel_count": geometry["pixel_count"],
+            "segment_lengths_px": polygon_segment_lengths_px,
+            "segment_lengths_mm": polygon_segment_lengths_mm,
+            "point_count": len(polygon_points),
         }
         if measurement.kind == "roi":
             result["summary"] = self._format_roi_measurement_summary(result)
+        elif measurement.kind == "polygon":
+            result["summary"] = self._format_polygon_measurement_summary(result)
         else:
             result["summary"] = self._format_line_measurement_summary(result)
         return result
@@ -4515,10 +4990,14 @@ class DicomViewer:
         width_px = int(round(metrics["width_px"]))
         height_px = int(round(metrics["height_px"]))
         area_px = int(round(metrics["area_px"]))
+        geometry = dict(metrics.get("geometry") or {})
+        x_px = int(round(float(geometry.get("x", 0.0))))
+        y_px = int(round(float(geometry.get("y", 0.0))))
         width_mm_text = f"{self._format_mm_value(metrics['width_mm'])} mm"
         height_mm_text = f"{self._format_mm_value(metrics['height_mm'])} mm"
         area_mm_text = f"{self._format_mm_value(metrics['area_mm2'])} mm²"
         return (
+            f"X,Y: ({x_px}, {y_px})\n"
             f"W: {width_mm_text} ({width_px} px)\n"
             f"H: {height_mm_text} ({height_px} px)\n"
             f"Area: {area_mm_text} ({area_px} px²)"
@@ -4528,6 +5007,15 @@ class DicomViewer:
         px_text = f"{metrics['length_px']:.1f}px"
         mm_value = self._format_mm_value(metrics["length_mm"])
         return f"{px_text} | {mm_value}mm"
+
+    def _format_polygon_measurement_summary(self, metrics: dict[str, Any]) -> str:
+        area_mm_text = f"{self._format_mm_value(metrics['area_mm2'])} mm²"
+        perimeter_mm_text = f"{self._format_mm_value(metrics['length_mm'])} mm"
+        return (
+            f"Poly {int(metrics.get('point_count', 0))}pts\n"
+            f"Perimeter: {perimeter_mm_text} ({metrics['length_px']:.1f} px)\n"
+            f"Area: {area_mm_text} ({metrics['area_px']:.1f} px²)"
+        )
 
     def _image_pixel_to_canvas(self, pixel_x: int, pixel_y: int) -> tuple[float, float] | None:
         return self._image_coords_to_canvas(float(pixel_x), float(pixel_y))
@@ -4629,7 +5117,6 @@ class DicomViewer:
     def clear_persistent_measurements(self) -> None:
         self.persistent_measurements = []
         self.selected_persistent_measurement_id = None
-        self.selected_persistent_measurement_ids = set()
         self._persistent_canvas_item_to_measurement_id = {}
         self._cancel_guided_snr_workflow()
         self.canvas.delete("persistent_measurement")
@@ -4644,7 +5131,6 @@ class DicomViewer:
         state = self.guided_snr_state
         if state is not None and removed.id in {state.get("signal_id"), state.get("noise_id")}:
             self._cancel_guided_snr_workflow()
-        self.selected_persistent_measurement_ids.discard(removed.id)
         if self.selected_persistent_measurement_id == removed.id:
             self.selected_persistent_measurement_id = None
         self._draw_preview_measurements()
@@ -4653,24 +5139,20 @@ class DicomViewer:
             self._draw_single_view_overlays()
 
     def clear_selected_measurement(self) -> None:
-        selected_ids = set(self.selected_persistent_measurement_ids)
-        if self.selected_persistent_measurement_id is not None:
-            selected_ids.add(self.selected_persistent_measurement_id)
-        if not selected_ids:
+        selected_id = self.selected_persistent_measurement_id
+        if selected_id is None:
             messagebox.showinfo("안내", "삭제할 측정을 먼저 선택하세요.")
             return
-        remaining = [item for item in self.persistent_measurements if item.id not in selected_ids]
+        remaining = [item for item in self.persistent_measurements if item.id != selected_id]
         if len(remaining) == len(self.persistent_measurements):
             self.selected_persistent_measurement_id = None
-            self.selected_persistent_measurement_ids = set()
             self._draw_persistent_measurements()
             return
         state = self.guided_snr_state
-        if state is not None and selected_ids.intersection({state.get("signal_id"), state.get("noise_id")}):
+        if state is not None and selected_id in {state.get("signal_id"), state.get("noise_id")}:
             self._cancel_guided_snr_workflow()
         self.persistent_measurements = remaining
         self.selected_persistent_measurement_id = None
-        self.selected_persistent_measurement_ids = set()
         self._draw_preview_measurements()
         self._draw_persistent_measurements()
         if self.view_mode == "single":
@@ -4686,21 +5168,13 @@ class DicomViewer:
             measurement_id = self._persistent_canvas_item_to_measurement_id.get(item_id)
             if measurement_id is None:
                 continue
-            ctrl_pressed = bool(event.state & 0x4)
-            self._apply_measurement_selection(measurement_id, toggle=ctrl_pressed)
+            self._apply_measurement_selection(measurement_id)
             self._draw_persistent_measurements()
             return True
         return False
 
-    def _apply_measurement_selection(self, measurement_id: str, toggle: bool = False) -> None:
-        if toggle:
-            if measurement_id in self.selected_persistent_measurement_ids:
-                self.selected_persistent_measurement_ids.remove(measurement_id)
-            else:
-                self.selected_persistent_measurement_ids.add(measurement_id)
-        else:
-            self.selected_persistent_measurement_ids = {measurement_id}
-        self.selected_persistent_measurement_id = next(iter(self.selected_persistent_measurement_ids), None)
+    def _apply_measurement_selection(self, measurement_id: str) -> None:
+        self.selected_persistent_measurement_id = measurement_id
 
     def register_measurement_hit_target(self, item_id: int, measurement_id: str) -> None:
         self._persistent_canvas_item_to_measurement_id[item_id] = measurement_id
@@ -4737,6 +5211,7 @@ class DicomViewer:
         mode: str,
         image_start: tuple[int, int],
         image_end: tuple[int, int],
+        extra_meta: dict[str, Any] | None = None,
     ) -> Measurement | None:
         geometry_key = self._get_current_geometry_key()
         if geometry_key is None:
@@ -4749,7 +5224,7 @@ class DicomViewer:
             frame_index=int(self.current_frame),
             geometry_key=geometry_key,
             summary_text="",
-            meta={"roi_role": "none"},
+            meta={"roi_role": "none", **(extra_meta or {})},
         )
         metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
         measurement.summary_text = metrics["summary"]
@@ -4865,7 +5340,7 @@ class DicomViewer:
             metrics = self.compute_measurement(measurement, frame_array)
             measurement.summary_text = metrics["summary"]
             measurement.meta = self._canonicalize_measurement_meta(measurement, metrics)
-            selected = measurement.id in self.selected_persistent_measurement_ids or measurement.id == self.selected_persistent_measurement_id
+            selected = measurement.id == self.selected_persistent_measurement_id
             if measurement.kind == "roi":
                 outline = "#ffdc5e" if selected else "#ff7f50"
                 item_id = self.canvas.create_rectangle(
@@ -4878,13 +5353,38 @@ class DicomViewer:
                 primary_label, secondary_label = self._build_measurement_label_parts("roi", metrics)
                 rect_box = (min(sx, ex), min(sy, ey), max(sx, ex), max(sy, ey))
                 occupied_label_boxes.append(rect_box)
-            else:
+            elif measurement.kind == "line":
                 color = "#e6ff7a" if selected else "#00ffaa"
                 item_id = self.canvas.create_line(
                     sx, sy, ex, ey, fill=color, width=3 if selected else 2, tags=("persistent_measurement",)
                 )
                 self.register_measurement_hit_target(item_id, measurement.id)
                 primary_label, secondary_label = self._build_measurement_label_parts("line", metrics)
+            else:
+                raw_points = measurement.meta.get("points", [])
+                polygon_canvas: list[float] = []
+                for point in raw_points:
+                    if not isinstance(point, (list, tuple)) or len(point) < 2:
+                        continue
+                    canvas_point = self._image_pixel_to_canvas(int(point[0]), int(point[1]))
+                    if canvas_point is None:
+                        continue
+                    polygon_canvas.extend(canvas_point)
+                if len(polygon_canvas) < 6:
+                    continue
+                fill_color = "#ffe97f" if selected else "#8be9fd"
+                item_id = self.canvas.create_polygon(
+                    *polygon_canvas,
+                    outline=fill_color,
+                    fill="",
+                    width=3 if selected else 2,
+                    tags=("persistent_measurement",),
+                )
+                self.register_measurement_hit_target(item_id, measurement.id)
+                primary_label = f"Poly {int(metrics.get('point_count', 0))}pts"
+                secondary_label = f"Area {metrics['area_px']:.1f}px²"
+                ex = sum(polygon_canvas[0::2]) / (len(polygon_canvas) // 2)
+                ey = sum(polygon_canvas[1::2]) / (len(polygon_canvas) // 2)
             if measurement.kind == "roi":
                 label_x, label_y, anchor, label_box = self._resolve_roi_label_position(
                     ex,
@@ -4942,6 +5442,7 @@ class DicomViewer:
             )
             self.canvas.itemconfig(label_id, state="disabled")
             placed_boxes.append((x - estimated_width / 2, y, x + estimated_width / 2, y - estimated_height))
+        self._refresh_analysis_selectors()
 
     def export_measurements_csv(self) -> None:
         if not self.persistent_measurements:
@@ -5151,15 +5652,29 @@ class DicomViewer:
         return distance, intensity
 
     def show_line_profile_for_selected_line(self) -> None:
-        lines = [item for item in self.persistent_measurements if item.kind == "line"]
-        if not lines:
-            messagebox.showinfo("안내", "영구 Line 측정이 없습니다.")
+        measurement = self._get_selected_measurement_from_analysis("line", "line_profile_line_id", "line_profile")
+        if measurement is None:
+            self.analysis_results["line_info"].set("Line: Select Profile Line")
+            messagebox.showinfo("안내", "Profile Line을 선택하세요.")
             return
-        measurement = lines[-1]
         profile = self._sample_line_profile(measurement)
         if profile is None:
             return
         distance, intensity = profile
+        metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
+        self.analysis_results["line_info"].set(
+            f"Line {measurement.id[:8]} | length {metrics['length_px']:.1f} px | samples {len(distance)}"
+        )
+        self.analysis_last_run["line_profile"] = {
+            "inputs": {
+                "line_id": measurement.id,
+            },
+            "factors": self._collect_analysis_factors(measurement),
+            "result": {
+                "length_px": float(metrics["length_px"]),
+                "sample_count": int(len(distance)),
+            },
+        }
         plt.figure(figsize=(7, 4))
         plt.plot(distance, intensity, color="#0a84ff")
         plt.xlabel("Distance (px)")
@@ -5178,6 +5693,99 @@ class DicomViewer:
                 writer.writerow(["distance_px", "intensity"])
                 for d, v in zip(distance, intensity):
                     writer.writerow([f"{float(d):.6f}", f"{float(v):.6f}"])
+
+    def calculate_snr_from_inputs(self) -> None:
+        signal_roi = self._get_selected_measurement_from_analysis("roi", "snr_signal_roi_id", "snr_signal")
+        noise_roi = self._get_selected_measurement_from_analysis("roi", "snr_noise_roi_id", "snr_noise")
+        if signal_roi is None or noise_roi is None:
+            self.analysis_results["snr_preview"].set("Preview: Select Signal ROI and Noise ROI")
+            self.analysis_results["snr_result"].set("Result: -")
+            messagebox.showinfo("SNR", "Select Signal ROI and Noise ROI")
+            return
+        signal_metrics = self.compute_measurement(signal_roi, self._get_frame_pixel_array(signal_roi.frame_index))
+        noise_metrics = self.compute_measurement(noise_roi, self._get_frame_pixel_array(noise_roi.frame_index))
+        signal_mean = float((signal_metrics.get("signal_stats") or {}).get("mean", 0.0))
+        noise_std = float((noise_metrics.get("signal_stats") or {}).get("std", 0.0))
+        self.analysis_results["snr_preview"].set(f"Preview: {signal_mean:.4f} / {noise_std:.4f}")
+        if noise_std <= 0:
+            self.analysis_results["snr_result"].set("Result: Invalid (noise std = 0)")
+            messagebox.showwarning("SNR", "Noise ROI 표준편차가 0입니다.")
+            return
+        snr = signal_mean / noise_std
+        self.analysis_results["snr_result"].set(f"Result: SNR = {snr:.4f}")
+        self.analysis_last_run["snr"] = {
+            "inputs": {
+                "signal_roi_id": signal_roi.id,
+                "noise_roi_id": noise_roi.id,
+            },
+            "factors": {
+                "signal": self._collect_analysis_factors(signal_roi),
+                "noise": self._collect_analysis_factors(noise_roi),
+            },
+            "formula": "mean(Signal ROI) / std(Noise ROI)",
+            "preview": f"{signal_mean:.4f} / {noise_std:.4f}",
+            "result": float(snr),
+        }
+
+    def calculate_cnr_from_inputs(self) -> None:
+        formula = self.analysis_inputs["cnr_formula"].get()
+        target_roi = self._get_selected_measurement_from_analysis("roi", "cnr_target_roi_id", "cnr_target")
+        reference_roi = self._get_selected_measurement_from_analysis("roi", "cnr_reference_roi_id", "cnr_reference")
+        noise_roi = None
+        if formula == "standard_noise":
+            noise_roi = self._get_selected_measurement_from_analysis("roi", "cnr_noise_roi_id", "cnr_noise")
+        if target_roi is None or reference_roi is None or (formula == "standard_noise" and noise_roi is None):
+            self.analysis_results["cnr_preview"].set("Formula: Select required ROI inputs first")
+            self.analysis_results["cnr_result"].set("Result: -")
+            if formula == "standard_noise":
+                messagebox.showinfo("CNR", "Region A ROI, Region B ROI, Noise ROI를 선택하세요.")
+            else:
+                messagebox.showinfo("CNR", "Region A ROI, Region B ROI를 선택하세요.")
+            return
+        target_metrics = self.compute_measurement(target_roi, self._get_frame_pixel_array(target_roi.frame_index))
+        reference_metrics = self.compute_measurement(reference_roi, self._get_frame_pixel_array(reference_roi.frame_index))
+        target_mean = float((target_metrics.get("signal_stats") or {}).get("mean", 0.0))
+        reference_mean = float((reference_metrics.get("signal_stats") or {}).get("mean", 0.0))
+        numerator = abs(target_mean - reference_mean)
+        if formula == "standard_noise":
+            assert noise_roi is not None
+            noise_metrics = self.compute_measurement(noise_roi, self._get_frame_pixel_array(noise_roi.frame_index))
+            noise_std = float((noise_metrics.get("signal_stats") or {}).get("std", 0.0))
+            self.analysis_results["cnr_preview"].set(
+                "Formula: |S_A - S_B| / sigma_o\n"
+                f"Preview: |{target_mean:.4f} - {reference_mean:.4f}| / {noise_std:.4f}"
+            )
+            denominator = noise_std
+            invalid_msg = "Noise ROI 표준편차가 0입니다."
+        else:
+            target_std = float((target_metrics.get("signal_stats") or {}).get("std", 0.0))
+            reference_std = float((reference_metrics.get("signal_stats") or {}).get("std", 0.0))
+            denominator = float(np.sqrt(target_std * target_std + reference_std * reference_std))
+            self.analysis_results["cnr_preview"].set(
+                "Formula: |S_A - S_B| / sqrt(sigma_A^2 + sigma_B^2)\n"
+                f"Preview: |{target_mean:.4f} - {reference_mean:.4f}| / sqrt({target_std:.4f}² + {reference_std:.4f}²)"
+            )
+            invalid_msg = "Region A/Region B 분산 기반 분모가 0입니다."
+        if denominator <= 0:
+            self.analysis_results["cnr_result"].set("Result: Invalid (denominator = 0)")
+            messagebox.showwarning("CNR", invalid_msg)
+            return
+        cnr = numerator / denominator
+        self.analysis_results["cnr_result"].set(f"Result: CNR = {cnr:.4f}")
+        self.analysis_last_run["cnr"] = {
+            "inputs": {
+                "formula": formula,
+                "region_a_roi_id": target_roi.id,
+                "region_b_roi_id": reference_roi.id,
+                "noise_roi_id": None if noise_roi is None else noise_roi.id,
+            },
+            "factors": {
+                "region_a": self._collect_analysis_factors(target_roi),
+                "region_b": self._collect_analysis_factors(reference_roi),
+                "noise": None if noise_roi is None else self._collect_analysis_factors(noise_roi),
+            },
+            "result": float(cnr),
+        }
 
     def assign_roi_role(self) -> None:
         rois = [item for item in self.persistent_measurements if item.kind == "roi"]
@@ -5217,11 +5825,13 @@ class DicomViewer:
         self.guided_snr_state = None
         self.snr_workflow_var.set("SNR: Idle")
 
-    def _find_measurement_by_id(self, measurement_id: str | None) -> Measurement | None:
+    def _find_measurement_by_id(self, measurement_id: str | None, expected_kind: str | None = None) -> Measurement | None:
         if measurement_id is None:
             return None
         for measurement in self.persistent_measurements:
             if measurement.id == measurement_id:
+                if expected_kind is not None and measurement.kind != expected_kind:
+                    return None
                 return measurement
         return None
 
@@ -5365,10 +5975,29 @@ class DicomViewer:
                 draw.rectangle((sx, sy, ex, ey), outline="#ff7f50", width=2)
                 if include_labels:
                     draw.text((ex + 4, ey - 14), label_summary, fill="white")
-            else:
+            elif measurement.kind == "line":
                 draw.line((sx, sy, ex, ey), fill="#00ffaa", width=2)
                 if include_labels:
                     draw.text((ex + 4, ey - 14), label_summary, fill="white")
+            else:
+                points = measurement.meta.get("points", [])
+                scaled_points: list[tuple[float, float]] = []
+                if isinstance(points, list):
+                    for point in points:
+                        if not isinstance(point, (list, tuple)) or len(point) < 2:
+                            continue
+                        scaled_points.append(
+                            (
+                                float(point[0]) / max(source_w, 1) * width,
+                                float(point[1]) / max(source_h, 1) * height,
+                            )
+                        )
+                if len(scaled_points) >= 3:
+                    draw.polygon(scaled_points, outline="#8be9fd")
+                    if include_labels:
+                        centroid_x = sum(point[0] for point in scaled_points) / len(scaled_points)
+                        centroid_y = sum(point[1] for point in scaled_points) / len(scaled_points)
+                        draw.text((centroid_x + 4, centroid_y - 14), label_summary, fill="white")
         if include_grid:
             spacing = self._get_grid_spacing_px()
             source_step_x = spacing / max(source_w, 1)
@@ -5572,12 +6201,19 @@ class DicomViewer:
         return ""
 
     def _handle_enter_shortcut(self, _event: tk.Event) -> str:
+        if self.view_mode == "single" and self.measurement_mode.get() == "polygon" and len(self._polygon_points) >= 3:
+            self._finalize_polygon_measurement()
+            return "break"
         if self.view_mode == "multi" and 0 <= self.current_file_index < len(self.file_paths):
             self.open_multiview_tile(self.current_file_index)
             return "break"
         return ""
 
     def _handle_escape_shortcut(self, _event: tk.Event) -> str:
+        if self.view_mode == "single" and self.measurement_mode.get() == "polygon" and self._polygon_points:
+            self._cancel_polygon_draft()
+            self.cursor_var.set("Cursor: Polygon 초안 취소됨")
+            return "break"
         if self.view_mode == "single" and self._can_use_multiview():
             self.enter_multiview_mode()
             return "break"
