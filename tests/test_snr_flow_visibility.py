@@ -95,7 +95,7 @@ def test_snr_invalid_path_is_saved_in_analysis_last_run(monkeypatch):
     assert snr["status"] == "invalid"
     assert snr["reason"] == "noise std <= 0"
     assert snr["result"] is None
-    assert "Invalid" in viewer.analysis_results["snr_result"].get()
+    assert "계산할 수 없습니다" in viewer.analysis_results["snr_result"].get()
     rows = viewer._build_analysis_last_run_rows()
     snr_rows = [row for row in rows if row["metric_name"] == "SNR"]
     assert len(snr_rows) == 1
@@ -111,7 +111,7 @@ def test_snr_missing_path_is_saved_in_analysis_last_run(monkeypatch):
     snr = viewer.analysis_last_run["snr"]
     assert snr["status"] == "missing"
     assert snr["result"] is None
-    assert "Missing inputs" in viewer.analysis_results["snr_result"].get()
+    assert "ROI를 선택" in viewer.analysis_results["snr_result"].get()
 
 
 def test_cnr_invalid_and_missing_paths_are_saved_in_analysis_last_run(monkeypatch):
@@ -122,7 +122,7 @@ def test_cnr_invalid_and_missing_paths_are_saved_in_analysis_last_run(monkeypatc
     viewer.calculate_cnr_from_inputs()
     missing_cnr = viewer.analysis_last_run["cnr"]
     assert missing_cnr["status"] == "missing"
-    assert "Missing inputs" in viewer.analysis_results["cnr_result"].get()
+    assert "ROI를 선택" in viewer.analysis_results["cnr_result"].get()
 
     target = viewer._append_persistent_measurement("roi", (1, 1), (5, 5), extra_meta={"roi_type": "free"}, roi_bounds_exclusive=True)
     reference = viewer._append_persistent_measurement("roi", (5, 1), (9, 5), extra_meta={"roi_type": "free"}, roi_bounds_exclusive=True)
@@ -148,7 +148,7 @@ def test_uniformity_missing_and_invalid_paths_are_saved_in_analysis_last_run(mon
     viewer.calculate_uniformity_from_inputs()
     missing_uniformity = viewer.analysis_last_run["uniformity"]
     assert missing_uniformity["status"] == "missing"
-    assert "Missing ROI set" in viewer.analysis_results["uniformity_result"].get()
+    assert "ROI가 없습니다" in viewer.analysis_results["uniformity_result"].get()
 
     zero_viewer = _build_viewer()
     zero_viewer.frames = [np.zeros((10, 10), dtype=np.float32)]
