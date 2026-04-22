@@ -252,8 +252,6 @@ class DicomViewer:
         self._uniformity_advanced_frame: ttk.Frame | None = None
         self._analysis_action_buttons: dict[str, ttk.Button] = {}
         self._uniformity_roi_listbox: tk.Listbox | None = None
-        self._collapsible_section_states: dict[str, bool] = {}
-        self._collapsible_section_widgets: dict[str, dict[str, Any]] = {}
         self.analysis_results_table: ttk.Treeview | None = None
         self.analysis_result_detail_text: tk.Text | None = None
         self._analysis_table_rows_by_item: dict[str, dict[str, Any]] = {}
@@ -625,81 +623,6 @@ class DicomViewer:
         _update_nav_buttons()
         return strip
 
-    def _create_collapsible_section(
-        self,
-        parent: ttk.Frame,
-        section_key: str,
-        title: str,
-        *,
-        expanded: bool,
-    ) -> ttk.Frame:
-        shell = ttk.Frame(parent)
-        shell.pack(fill="x", pady=(0, 6), anchor="n")
-
-        header = ttk.Frame(shell)
-        header.pack(fill="x")
-        header.columnconfigure(0, weight=1)
-
-        title_var = tk.StringVar(value="")
-        toggle_button = ttk.Button(
-            header,
-            textvariable=title_var,
-            command=lambda key=section_key: self._toggle_collapsible_section(key),
-        )
-        toggle_button.grid(row=0, column=0, sticky="ew")
-
-        content = ttk.Frame(shell, padding=(8, 6))
-        self._collapsible_section_states[section_key] = bool(expanded)
-        self._collapsible_section_widgets[section_key] = {
-            "title": title,
-            "title_var": title_var,
-            "content": content,
-        }
-        self._apply_collapsible_section_state(section_key)
-        return content
-
-    def _toggle_collapsible_section(self, section_key: str) -> None:
-        section_states = getattr(self, "_collapsible_section_states", {})
-        current_state = section_states.get(section_key, False)
-        self._set_collapsible_section_state(section_key, not current_state)
-
-    def _set_collapsible_section_state(self, section_key: str, expanded: bool) -> None:
-        section_widgets = getattr(self, "_collapsible_section_widgets", {})
-        if section_key not in section_widgets:
-            return
-        self._collapsible_section_states[section_key] = bool(expanded)
-        self._apply_collapsible_section_state(section_key)
-
-    def _apply_collapsible_section_state(self, section_key: str) -> None:
-        section_widgets = getattr(self, "_collapsible_section_widgets", {})
-        widgets = section_widgets.get(section_key)
-        if widgets is None:
-            return
-        section_states = getattr(self, "_collapsible_section_states", {})
-        expanded = section_states.get(section_key, False)
-        arrow = "▼" if expanded else "▶"
-        widgets["title_var"].set(f"{arrow} {widgets['title']}")
-        content: ttk.Frame = widgets["content"]
-        if expanded:
-            content.pack(fill="x", anchor="w", pady=(4, 0))
-        else:
-            content.pack_forget()
-
-    def _expand_signal_analysis_section(self, target_section: str) -> None:
-        if not hasattr(self, "_collapsible_section_widgets"):
-            return
-        section_keys = {
-            "snr": "analysis_signal_snr",
-            "cnr": "analysis_signal_cnr",
-            "uniformity": "analysis_signal_uniformity",
-            "line_profile": "analysis_signal_line_profile",
-        }
-        target_key = section_keys.get(target_section)
-        if target_key is None:
-            return
-        for key in section_keys.values():
-            self._set_collapsible_section_state(key, key == target_key)
-
     def _build_home_toolbar(self, tab: ttk.Frame) -> None:
         sections = self._build_subtoolbar_sections(tab, ["View", "Compare", "Overlay", "Output"])
 
@@ -815,17 +738,18 @@ class DicomViewer:
             self.cursor_var.set("Cursor: Polygon 모드 (점 추가 후 첫 점 클릭 또는 Enter로 닫기)")
 
     def _build_measure_toolbar(self, tab: ttk.Frame) -> None:
-        container = ttk.Frame(tab)
-        container.pack(fill="both", expand=True)
+        strip = self._build_grouped_toolbar_strip(tab)
 
-        roi_section = self._create_collapsible_section(container, "measure_roi", "ROI 설정", expanded=True)
+        roi_section = ttk.LabelFrame(strip, text="ROI 설정", padding=(8, 6))
+        roi_section.pack(side="left", fill="y", padx=(0, 8))
         self._build_draw_tool_panel(roi_section)
         ttk.Separator(roi_section, orient="horizontal").grid(row=9, column=0, sticky="ew", pady=(6, 6))
         ttk.Button(roi_section, text="Undo", command=self.undo_last_measurement).grid(row=10, column=0, sticky="ew")
         ttk.Button(roi_section, text="Delete Selected", command=self.clear_selected_measurement).grid(row=11, column=0, sticky="ew", pady=(4, 0))
         ttk.Button(roi_section, text="Clear All", command=self.clear_persistent_measurements).grid(row=12, column=0, sticky="ew", pady=(4, 0))
 
-        grid_section = self._create_collapsible_section(container, "measure_grid", "Grid 설정", expanded=False)
+        grid_section = ttk.LabelFrame(strip, text="Grid 설정", padding=(8, 6))
+        grid_section.pack(side="left", fill="y", padx=(0, 8))
         ttk.Checkbutton(
             grid_section,
             text="Show Grid",
@@ -863,7 +787,8 @@ class DicomViewer:
         self._sync_grid_spacing_from_mode()
         self._sync_grid_roi_size_from_mode()
 
-        propagation_section = self._create_collapsible_section(container, "measure_propagation", "Propagation", expanded=False)
+        propagation_section = ttk.LabelFrame(strip, text="Propagation", padding=(8, 6))
+        propagation_section.pack(side="left", fill="y", padx=(0, 8))
         ttk.Checkbutton(
             propagation_section,
             text="ROI Propagation",
@@ -882,7 +807,8 @@ class DicomViewer:
             variable=self.roi_propagation_scope,
         ).grid(row=2, column=0, sticky="w")
 
-        export_section = self._create_collapsible_section(container, "measure_export", "Export", expanded=False)
+        export_section = ttk.LabelFrame(strip, text="Export", padding=(8, 6))
+        export_section.pack(side="left", fill="y", padx=(0, 8))
         ttk.Label(export_section, text="ROI Geometry: X/Y, Width, Height, Area").grid(row=0, column=0, sticky="w")
         ttk.Label(export_section, text="Display: mm first, px second").grid(row=1, column=0, sticky="w", pady=(2, 0))
         ttk.Button(export_section, text="Grid ROI Summary", command=self._show_grid_roi_combined_summary).grid(
@@ -890,7 +816,8 @@ class DicomViewer:
         )
         ttk.Button(export_section, text="Export CSV", command=self.export_measurements_csv).grid(row=3, column=0, sticky="ew", pady=(4, 0))
 
-        role_section = self._create_collapsible_section(container, "measure_role", "Role", expanded=False)
+        role_section = ttk.LabelFrame(strip, text="Role", padding=(8, 6))
+        role_section.pack(side="left", fill="y")
         ttk.Button(role_section, text="Set ROI Role", command=self.assign_roi_role).grid(row=0, column=0, sticky="ew")
 
     def _build_analysis_toolbar(self, tab: ttk.Frame) -> None:
@@ -918,7 +845,10 @@ class DicomViewer:
         for key in ("snr_signal", "snr_noise", "cnr_target", "cnr_reference", "cnr_noise"):
             self._analysis_selector_vars[key] = tk.StringVar(value="")
 
-        snr_group = self._create_collapsible_section(container, "analysis_signal_snr", "SNR", expanded=True)
+        strip = self._build_grouped_toolbar_strip(container)
+
+        snr_group = ttk.LabelFrame(strip, text="SNR", padding=(8, 6))
+        snr_group.pack(side="left", fill="y", padx=(0, 8))
         ttk.Label(snr_group, text="Input: Signal ROI").grid(row=0, column=0, sticky="w")
         self._analysis_comboboxes["snr_signal"] = ttk.Combobox(
             snr_group,
@@ -945,7 +875,8 @@ class DicomViewer:
         # for debugging and test instrumentation, but is intentionally hidden from the
         # default UI to avoid exposing internal state to end users.
 
-        cnr_group = self._create_collapsible_section(container, "analysis_signal_cnr", "CNR", expanded=False)
+        cnr_group = ttk.LabelFrame(strip, text="CNR", padding=(8, 6))
+        cnr_group.pack(side="left", fill="y", padx=(0, 8))
         formula_cards = ttk.LabelFrame(cnr_group, text="Formula Selection", padding=(6, 4))
         formula_cards.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         ttk.Radiobutton(formula_cards, text="Option A | |S_A - S_B| / sigma_o", value="standard_noise", variable=self.analysis_inputs["cnr_formula"]).grid(row=0, column=0, sticky="w")
@@ -981,7 +912,8 @@ class DicomViewer:
         self._analysis_action_buttons["cnr"] = ttk.Button(cnr_group, text="Calculate CNR", command=self.calculate_cnr_from_inputs)
         self._analysis_action_buttons["cnr"].grid(row=9, column=0, sticky="ew", pady=(6, 0))
 
-        uniformity_group = self._create_collapsible_section(container, "analysis_signal_uniformity", "Uniformity", expanded=False)
+        uniformity_group = ttk.LabelFrame(strip, text="Uniformity", padding=(8, 6))
+        uniformity_group.pack(side="left", fill="y", padx=(0, 8))
         ttk.Label(uniformity_group, text="Formula").grid(row=0, column=0, sticky="w")
         uniformity_formula_combo = ttk.Combobox(
             uniformity_group,
@@ -1033,7 +965,8 @@ class DicomViewer:
         ttk.Button(uniformity_group, text="Calculate Uniformity", command=self.calculate_uniformity_from_inputs).grid(row=9, column=0, sticky="ew", pady=(6, 0))
         self._refresh_uniformity_advanced_fields()
 
-        line_group = self._create_collapsible_section(container, "analysis_signal_line_profile", "Line Profile", expanded=False)
+        line_group = ttk.LabelFrame(strip, text="Line Profile", padding=(8, 6))
+        line_group.pack(side="left", fill="y")
         ttk.Label(line_group, text="Input: Profile Line").grid(row=0, column=0, sticky="w")
         self._analysis_comboboxes["line_profile"] = ttk.Combobox(line_group, state="readonly", width=42)
         self._analysis_comboboxes["line_profile"].grid(row=1, column=0, sticky="ew", pady=(2, 4))
@@ -6983,7 +6916,6 @@ class DicomViewer:
         return distance, intensity
 
     def show_line_profile_for_selected_line(self) -> None:
-        self._expand_signal_analysis_section("line_profile")
         measurement = self._get_selected_measurement_from_analysis("line", "line_profile_line_id", "line_profile")
         if measurement is None:
             self.analysis_results["line_info"].set("Line: Select Profile Line")
@@ -7093,7 +7025,6 @@ class DicomViewer:
         }
 
     def calculate_uniformity_from_inputs(self) -> None:
-        self._expand_signal_analysis_section("uniformity")
         roi_set, source = self._collect_uniformity_roi_set()
         roi_ids = [measurement.id for measurement in roi_set]
         formula_key = self.analysis_inputs["uniformity_formula"].get()
@@ -7224,7 +7155,6 @@ class DicomViewer:
         self._refresh_analysis_results_panel()
 
     def calculate_snr_from_inputs(self) -> None:
-        self._expand_signal_analysis_section("snr")
         self._auto_bind_analysis_inputs_from_roles(overwrite_existing=False)
         signal_roi = self._get_selected_measurement_from_analysis("roi", "snr_signal_roi_id", "snr_signal")
         noise_roi = self._get_selected_measurement_from_analysis("roi", "snr_background_roi_id", "snr_noise")
@@ -7335,7 +7265,6 @@ class DicomViewer:
         self._refresh_analysis_results_panel()
 
     def calculate_cnr_from_inputs(self) -> None:
-        self._expand_signal_analysis_section("cnr")
         self._auto_bind_analysis_inputs_from_roles(overwrite_existing=False)
         formula = self.analysis_inputs["cnr_formula"].get()
         target_roi = self._get_selected_measurement_from_analysis("roi", "cnr_target_roi_id", "cnr_target")
