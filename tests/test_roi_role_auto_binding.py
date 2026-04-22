@@ -50,6 +50,17 @@ class DummyButton:
             self.state = kwargs["state"]
 
 
+class DummyCombobox:
+    def __init__(self, value=""):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
+
+
 def _build_viewer() -> DicomViewer:
     viewer = object.__new__(DicomViewer)
     viewer.frames = [np.arange(100, dtype=np.float32).reshape(10, 10)]
@@ -140,3 +151,50 @@ def test_roi_role_persists_through_measurement_set_serialization():
     restored_set = viewer._deserialize_measurement_set(payload)
 
     assert restored_set.measurements[0].meta.get("role") == "signal"
+
+
+def test_snr_button_enabled_with_manual_selection_even_without_roles():
+    viewer = _build_viewer()
+    signal = _add_roi(viewer, "roi_signal_manual", (1, 1), (5, 5), role=None)
+    noise = _add_roi(viewer, "roi_noise_manual", (5, 1), (9, 5), role=None)
+
+    signal_label = "Signal Manual ROI"
+    noise_label = "Noise Manual ROI"
+    viewer._analysis_option_maps["roi"] = {
+        signal_label: signal.id,
+        noise_label: noise.id,
+    }
+    viewer._analysis_comboboxes = {
+        "snr_signal": DummyCombobox(signal_label),
+        "snr_noise": DummyCombobox(noise_label),
+    }
+
+    viewer._update_analysis_action_button_state()
+
+    assert viewer._analysis_action_buttons["snr"].state == "normal"
+
+
+def test_cnr_button_enabled_with_manual_selection_even_without_roles():
+    viewer = _build_viewer()
+    target = _add_roi(viewer, "roi_target_manual", (1, 1), (5, 5), role=None)
+    reference = _add_roi(viewer, "roi_reference_manual", (5, 1), (9, 5), role=None)
+    noise = _add_roi(viewer, "roi_noise_manual", (1, 5), (5, 9), role=None)
+
+    target_label = "Target Manual ROI"
+    reference_label = "Reference Manual ROI"
+    noise_label = "Noise Manual ROI"
+    viewer.analysis_inputs["cnr_formula"].set("standard_noise")
+    viewer._analysis_option_maps["roi"] = {
+        target_label: target.id,
+        reference_label: reference.id,
+        noise_label: noise.id,
+    }
+    viewer._analysis_comboboxes = {
+        "cnr_target": DummyCombobox(target_label),
+        "cnr_reference": DummyCombobox(reference_label),
+        "cnr_noise": DummyCombobox(noise_label),
+    }
+
+    viewer._update_analysis_action_button_state()
+
+    assert viewer._analysis_action_buttons["cnr"].state == "normal"
