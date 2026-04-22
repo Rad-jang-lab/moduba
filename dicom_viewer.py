@@ -215,6 +215,7 @@ class DicomViewer:
         self.signal_analysis_results: dict[str, tk.StringVar] = {
             "snr_preview": tk.StringVar(value="Preview: -"),
             "snr_result": tk.StringVar(value="Result: -"),
+            "snr_ready_reason": tk.StringVar(value="Ready: 입력 대기"),
             "cnr_preview": tk.StringVar(value="Preview: -"),
             "cnr_result": tk.StringVar(value="Result: -"),
             "uniformity_preview": tk.StringVar(value="Preview: -"),
@@ -516,14 +517,16 @@ class DicomViewer:
         wrapper = ttk.Frame(parent)
         wrapper.pack(fill="both", expand=True)
         wrapper.rowconfigure(0, weight=1)
+        wrapper.rowconfigure(1, weight=0)
         wrapper.columnconfigure(1, weight=1)
         canvas_background = self.ui_colors["bg_surface"]
         canvas = tk.Canvas(wrapper, highlightthickness=0, bg=canvas_background, bd=0)
         canvas.grid(row=0, column=1, sticky="nsew")
         canvas.configure(yscrollincrement=16)
+        x_scrollbar = ttk.Scrollbar(wrapper, orient="horizontal", command=canvas.xview)
+        x_scrollbar.grid(row=1, column=1, sticky="ew", pady=(4, 0))
         y_scrollbar = ttk.Scrollbar(wrapper, orient="vertical", command=canvas.yview)
         y_scrollbar.grid(row=0, column=3, sticky="ns", padx=(4, 0))
-        canvas.configure(yscrollcommand=y_scrollbar.set)
         left_button = ttk.Button(
             wrapper,
             text="◀",
@@ -549,9 +552,25 @@ class DicomViewer:
             left_button.configure(state="disabled" if left_start <= 0.001 else "normal")
             right_button.configure(state="disabled" if right_end >= 0.999 else "normal")
 
+        def _on_xscroll(first: str, last: str) -> None:
+            x_scrollbar.set(first, last)
+            _update_nav_buttons()
+
         def _refresh_scroll_region(_event: tk.Event | None = None) -> None:
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            requires_vertical_scroll = strip.winfo_reqheight() > canvas.winfo_height() + 1
+            canvas.update_idletasks()
+            canvas_width = canvas.winfo_width()
+            canvas_height = canvas.winfo_height()
+            strip_width = strip.winfo_reqwidth()
+            strip_height = strip.winfo_reqheight()
+            canvas.itemconfigure(window_id, width=strip_width, height=strip_height)
+            canvas.configure(scrollregion=(0, 0, strip_width, strip_height))
+            requires_horizontal_scroll = strip_width > canvas_width + 1
+            requires_vertical_scroll = strip_height > canvas_height + 1
+            if requires_horizontal_scroll:
+                x_scrollbar.grid()
+            else:
+                x_scrollbar.grid_remove()
+                canvas.xview_moveto(0.0)
             if requires_vertical_scroll:
                 y_scrollbar.grid()
             else:
@@ -560,7 +579,6 @@ class DicomViewer:
             _update_nav_buttons()
 
         def _resize_inner(_event: tk.Event) -> None:
-            canvas.itemconfigure(window_id, height=canvas.winfo_height())
             _refresh_scroll_region()
 
         def _on_mousewheel(event: tk.Event) -> None:
@@ -595,7 +613,7 @@ class DicomViewer:
                 _bind_wheel(child)
 
         strip.bind("<Map>", lambda _event: _bind_wheel(strip), add="+")
-        canvas.configure(xscrollcommand=lambda _first, _last: _update_nav_buttons())
+        canvas.configure(xscrollcommand=_on_xscroll, yscrollcommand=y_scrollbar.set)
         _update_nav_buttons()
         return strip
 
@@ -832,6 +850,7 @@ class DicomViewer:
         ttk.Label(snr_group, textvariable=self.signal_analysis_results["snr_result"]).grid(row=6, column=0, sticky="w", pady=(2, 0))
         self._analysis_action_buttons["snr"] = ttk.Button(snr_group, text="Calculate SNR", command=self.calculate_snr_from_inputs)
         self._analysis_action_buttons["snr"].grid(row=7, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(snr_group, textvariable=self.signal_analysis_results["snr_ready_reason"]).grid(row=8, column=0, sticky="w", pady=(2, 0))
 
         cnr_group = ttk.LabelFrame(strip, text="CNR", padding=(8, 6))
         cnr_group.pack(side="left", padx=(0, 8), fill="y")
@@ -904,6 +923,22 @@ class DicomViewer:
         ttk.Label(line_group, textvariable=self.snr_workflow_var).grid(row=5, column=0, sticky="w", pady=(2, 0))
 
         self._build_analysis_results_panel(strip)
+        self._bind_analysis_selector_events()
+
+    def _bind_analysis_selector_events(self) -> None:
+        for key in ("snr_signal", "snr_noise", "cnr_target", "cnr_reference", "cnr_noise"):
+            combo = self._analysis_comboboxes.get(key)
+            if combo is None:
+                continue
+            combo.bind("<<ComboboxSelected>>", self._on_analysis_selector_changed, add="+")
+
+    def _on_analysis_selector_changed(self, _event: tk.Event | None = None) -> None:
+        self._sync_analysis_display_value("roi", "snr_signal", "snr_signal_roi_id")
+        self._sync_analysis_display_value("roi", "snr_noise", "snr_background_roi_id")
+        self._sync_analysis_display_value("roi", "cnr_target", "cnr_target_roi_id")
+        self._sync_analysis_display_value("roi", "cnr_reference", "cnr_reference_roi_id")
+        self._sync_analysis_display_value("roi", "cnr_noise", "cnr_noise_roi_id")
+        self._update_analysis_action_button_state()
 
     def _build_image_analysis_toolbar(self, tab: ttk.Frame) -> None:
         frame = ttk.Frame(tab)
@@ -1190,6 +1225,24 @@ class DicomViewer:
             manual_ready = manual_signal_roi is not None and manual_snr_noise_roi is not None
             snr_ready = role_ready or manual_ready
             snr_button.configure(state="normal" if snr_ready else "disabled")
+            snr_reason_var = self.analysis_results.get("snr_ready_reason")
+            if snr_reason_var is not None:
+                missing_reasons: list[str] = []
+                if signal_roi is None and manual_signal_roi is None:
+                    missing_reasons.append("signal ROI 미선택")
+                if snr_noise_roi is None and manual_snr_noise_roi is None:
+                    missing_reasons.append("background/noise ROI 미선택")
+                current_signal_id = self._read_analysis_selected_id("roi", "snr_signal_roi_id", "snr_signal")
+                current_noise_id = self._read_analysis_selected_id("roi", "snr_background_roi_id", "snr_noise")
+                if snr_ready:
+                    source_text = "role" if role_ready else "manual"
+                    snr_reason_var.set(
+                        f"Ready: {source_text} | signal={current_signal_id or '-'} | noise={current_noise_id or '-'}"
+                    )
+                else:
+                    snr_reason_var.set(
+                        "Disabled: " + ", ".join(missing_reasons) if missing_reasons else "Disabled: ROI 입력 확인 필요"
+                    )
         if cnr_button is not None:
             needs_noise = formula == "standard_noise"
             role_ready = cnr_target_roi is not None and cnr_reference_roi is not None and (cnr_noise_roi is not None or not needs_noise)
@@ -5961,6 +6014,8 @@ class DicomViewer:
         self._cancel_guided_snr_workflow()
         self.canvas.delete("persistent_measurement")
         self.canvas.delete("temp_measurement")
+        self._refresh_analysis_selectors()
+        self._update_analysis_action_button_state()
         if self.view_mode == "single":
             self._draw_single_view_overlays()
 
