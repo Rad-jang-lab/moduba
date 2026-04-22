@@ -247,14 +247,9 @@ class DicomViewer:
         self._analysis_selector_vars: dict[str, tk.StringVar] = {}
         self._image_analysis_comboboxes: dict[str, ttk.Combobox] = {}
         self._cnr_noise_widgets: list[tk.Widget] = []
-        self.show_uniformity_advanced = tk.BooleanVar(value=False)
-        self.uniformity_advanced_button_var = tk.StringVar(value="Advanced 옵션 펼치기")
-        self._uniformity_advanced_frame: ttk.Frame | None = None
         self._analysis_action_buttons: dict[str, ttk.Button] = {}
         self._uniformity_roi_listbox: tk.Listbox | None = None
         self.analysis_results_table: ttk.Treeview | None = None
-        self.analysis_result_detail_text: tk.Text | None = None
-        self._analysis_table_rows_by_item: dict[str, dict[str, Any]] = {}
         self.shortcut_var = tk.StringVar(
             value=(
                 "단축키: F 창맞춤 | 0/Ctrl+0 100% | R W/L 리셋 | "
@@ -740,45 +735,41 @@ class DicomViewer:
     def _build_measure_toolbar(self, tab: ttk.Frame) -> None:
         strip = self._build_grouped_toolbar_strip(tab)
 
-        roi_section = ttk.LabelFrame(strip, text="ROI 설정", padding=(8, 6))
-        roi_section.pack(side="left", fill="y", padx=(0, 8))
-        self._build_draw_tool_panel(roi_section)
-        ttk.Separator(roi_section, orient="horizontal").grid(row=9, column=0, sticky="ew", pady=(6, 6))
-        ttk.Button(roi_section, text="Undo", command=self.undo_last_measurement).grid(row=10, column=0, sticky="ew")
-        ttk.Button(roi_section, text="Delete Selected", command=self.clear_selected_measurement).grid(row=11, column=0, sticky="ew", pady=(4, 0))
-        ttk.Button(roi_section, text="Clear All", command=self.clear_persistent_measurements).grid(row=12, column=0, sticky="ew", pady=(4, 0))
+        tools_group = ttk.LabelFrame(strip, text="Tools", padding=(8, 6))
+        tools_group.pack(side="left", padx=(0, 8), fill="y")
+        self._build_draw_tool_panel(tools_group)
 
-        grid_section = ttk.LabelFrame(strip, text="Grid 설정", padding=(8, 6))
-        grid_section.pack(side="left", fill="y", padx=(0, 8))
+        grid_group = ttk.LabelFrame(strip, text="Grid", padding=(8, 6))
+        grid_group.pack(side="left", padx=(0, 8), fill="y")
         ttk.Checkbutton(
-            grid_section,
+            grid_group,
             text="Show Grid",
             variable=self.show_grid_overlay,
             command=self._refresh_grid_overlay,
         ).grid(row=0, column=0, columnspan=4, sticky="w")
-        ttk.Label(grid_section, text="Grid spacing (cell size)").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(grid_group, text="Grid spacing (cell size)").grid(row=1, column=0, sticky="w", pady=(4, 0))
         self.grid_spacing_combobox = ttk.Combobox(
-            grid_section,
+            grid_group,
             width=6,
             state="readonly",
             values=tuple(str(value) for value in self.grid_spacing_presets_px) + ("Custom",),
             textvariable=self.grid_spacing_mode,
         )
         self.grid_spacing_combobox.grid(row=1, column=1, padx=(4, 0), pady=(4, 0), sticky="w")
-        ttk.Entry(grid_section, width=5, textvariable=self.grid_spacing_custom_px).grid(row=1, column=2, padx=(4, 0), pady=(4, 0), sticky="w")
-        ttk.Label(grid_section, textvariable=self.grid_cell_size_var).grid(row=2, column=0, columnspan=5, sticky="w", pady=(4, 0))
-        ttk.Label(grid_section, text="ROI size (cells)").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(grid_group, width=5, textvariable=self.grid_spacing_custom_px).grid(row=1, column=2, padx=(4, 0), pady=(4, 0), sticky="w")
+        ttk.Label(grid_group, textvariable=self.grid_cell_size_var).grid(row=2, column=0, columnspan=5, sticky="w", pady=(4, 0))
+        ttk.Label(grid_group, text="ROI size (cells)").grid(row=3, column=0, sticky="w", pady=(6, 0))
         self.grid_roi_size_combobox = ttk.Combobox(
-            grid_section,
+            grid_group,
             width=8,
             state="readonly",
             values=self.grid_roi_size_presets + ("Custom",),
             textvariable=self.grid_roi_size_mode,
         )
         self.grid_roi_size_combobox.grid(row=3, column=1, padx=(4, 0), pady=(6, 0), sticky="w")
-        ttk.Entry(grid_section, width=4, textvariable=self.grid_roi_width_cells).grid(row=3, column=2, padx=(4, 0), pady=(6, 0), sticky="w")
-        ttk.Label(grid_section, text="x").grid(row=3, column=3, padx=(2, 2), pady=(6, 0), sticky="w")
-        ttk.Entry(grid_section, width=4, textvariable=self.grid_roi_height_cells).grid(row=3, column=4, pady=(6, 0), sticky="w")
+        ttk.Entry(grid_group, width=4, textvariable=self.grid_roi_width_cells).grid(row=3, column=2, padx=(4, 0), pady=(6, 0), sticky="w")
+        ttk.Label(grid_group, text="x").grid(row=3, column=3, padx=(2, 2), pady=(6, 0), sticky="w")
+        ttk.Entry(grid_group, width=4, textvariable=self.grid_roi_height_cells).grid(row=3, column=4, pady=(6, 0), sticky="w")
         self.grid_spacing_mode.trace_add("write", self._on_grid_spacing_mode_changed)
         self.grid_spacing_custom_px.trace_add("write", self._on_grid_spacing_custom_changed)
         self.grid_roi_size_mode.trace_add("write", self._on_grid_roi_size_mode_changed)
@@ -787,38 +778,44 @@ class DicomViewer:
         self._sync_grid_spacing_from_mode()
         self._sync_grid_roi_size_from_mode()
 
-        propagation_section = ttk.LabelFrame(strip, text="Propagation", padding=(8, 6))
-        propagation_section.pack(side="left", fill="y", padx=(0, 8))
+        measurement_group = ttk.LabelFrame(strip, text="Measurement", padding=(8, 6))
+        measurement_group.pack(side="left", padx=(0, 8), fill="y")
+        ttk.Label(measurement_group, text="ROI Geometry: X/Y, Width, Height, Area").grid(row=0, column=0, sticky="w")
+        ttk.Label(measurement_group, text="Display: mm first, px second").grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(measurement_group, text="Grid ROI Summary", command=self._show_grid_roi_combined_summary).grid(
+            row=2, column=0, sticky="ew", pady=(6, 0)
+        )
         ttk.Checkbutton(
-            propagation_section,
+            measurement_group,
             text="ROI Propagation",
             variable=self.roi_propagation_enabled,
-        ).grid(row=0, column=0, sticky="w")
+        ).grid(row=3, column=0, sticky="w", pady=(6, 0))
         ttk.Radiobutton(
-            propagation_section,
+            measurement_group,
             text="Next frame/image",
             value="next",
             variable=self.roi_propagation_scope,
-        ).grid(row=1, column=0, sticky="w")
+        ).grid(row=4, column=0, sticky="w")
         ttk.Radiobutton(
-            propagation_section,
+            measurement_group,
             text="All navigated targets",
             value="all",
             variable=self.roi_propagation_scope,
-        ).grid(row=2, column=0, sticky="w")
+        ).grid(row=5, column=0, sticky="w")
 
-        export_section = ttk.LabelFrame(strip, text="Export", padding=(8, 6))
-        export_section.pack(side="left", fill="y", padx=(0, 8))
-        ttk.Label(export_section, text="ROI Geometry: X/Y, Width, Height, Area").grid(row=0, column=0, sticky="w")
-        ttk.Label(export_section, text="Display: mm first, px second").grid(row=1, column=0, sticky="w", pady=(2, 0))
-        ttk.Button(export_section, text="Grid ROI Summary", command=self._show_grid_roi_combined_summary).grid(
-            row=2, column=0, sticky="ew", pady=(6, 0)
+        manage_group = ttk.LabelFrame(strip, text="Manage", padding=(8, 6))
+        manage_group.pack(side="left", padx=(0, 8), fill="y")
+        ttk.Button(manage_group, text="Undo", command=self.undo_last_measurement).grid(row=0, column=0, sticky="ew")
+        ttk.Button(manage_group, text="Clear All", command=self.clear_persistent_measurements).grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(manage_group, text="Delete Selected", command=self.clear_selected_measurement).grid(
+            row=2, column=0, sticky="ew", pady=(4, 0)
         )
-        ttk.Button(export_section, text="Export CSV", command=self.export_measurements_csv).grid(row=3, column=0, sticky="ew", pady=(4, 0))
-
-        role_section = ttk.LabelFrame(strip, text="Role", padding=(8, 6))
-        role_section.pack(side="left", fill="y")
-        ttk.Button(role_section, text="Set ROI Role", command=self.assign_roi_role).grid(row=0, column=0, sticky="ew")
+        ttk.Button(manage_group, text="Export CSV", command=self.export_measurements_csv).grid(
+            row=3, column=0, sticky="ew", pady=(4, 0)
+        )
+        ttk.Button(manage_group, text="Set ROI Role", command=self.assign_roi_role).grid(
+            row=4, column=0, sticky="ew", pady=(4, 0)
+        )
 
     def _build_analysis_toolbar(self, tab: ttk.Frame) -> None:
         analysis_notebook = ttk.Notebook(tab)
@@ -829,9 +826,8 @@ class DicomViewer:
         analysis_notebook.add(signal_tab, text="Signal Analysis")
         analysis_notebook.add(image_tab, text="Image Analysis")
 
-        signal_container = ttk.Frame(signal_tab)
-        signal_container.pack(fill="both", expand=True)
-        self._build_signal_analysis_toolbar(signal_container)
+        signal_strip = self._build_grouped_toolbar_strip(signal_tab)
+        self._build_signal_analysis_toolbar(signal_strip)
         self._build_image_analysis_toolbar(image_tab)
         self.analysis_inputs["cnr_formula"].trace_add("write", self._update_cnr_formula_ui)
         self.analysis_inputs["uniformity_input_mode"].trace_add("write", self._update_uniformity_input_ui)
@@ -841,14 +837,12 @@ class DicomViewer:
         self._update_image_scope_ui()
         self._refresh_analysis_selectors()
 
-    def _build_signal_analysis_toolbar(self, container: ttk.Frame) -> None:
+    def _build_signal_analysis_toolbar(self, strip: ttk.Frame) -> None:
         for key in ("snr_signal", "snr_noise", "cnr_target", "cnr_reference", "cnr_noise"):
             self._analysis_selector_vars[key] = tk.StringVar(value="")
 
-        strip = self._build_grouped_toolbar_strip(container)
-
         snr_group = ttk.LabelFrame(strip, text="SNR", padding=(8, 6))
-        snr_group.pack(side="left", fill="y", padx=(0, 8))
+        snr_group.pack(side="left", padx=(0, 8), fill="y")
         ttk.Label(snr_group, text="Input: Signal ROI").grid(row=0, column=0, sticky="w")
         self._analysis_comboboxes["snr_signal"] = ttk.Combobox(
             snr_group,
@@ -870,13 +864,10 @@ class DicomViewer:
         ttk.Label(snr_group, textvariable=self.signal_analysis_results["snr_result"]).grid(row=6, column=0, sticky="w", pady=(2, 0))
         self._analysis_action_buttons["snr"] = ttk.Button(snr_group, text="Calculate SNR", command=self.calculate_snr_from_inputs)
         self._analysis_action_buttons["snr"].grid(row=7, column=0, sticky="ew", pady=(6, 0))
-        # NOTE:
-        # snr_ready_reason keeps internal readiness diagnostics (role/manual source, ROI ids)
-        # for debugging and test instrumentation, but is intentionally hidden from the
-        # default UI to avoid exposing internal state to end users.
+        ttk.Label(snr_group, textvariable=self.signal_analysis_results["snr_ready_reason"]).grid(row=8, column=0, sticky="w", pady=(2, 0))
 
         cnr_group = ttk.LabelFrame(strip, text="CNR", padding=(8, 6))
-        cnr_group.pack(side="left", fill="y", padx=(0, 8))
+        cnr_group.pack(side="left", padx=(0, 8), fill="y")
         formula_cards = ttk.LabelFrame(cnr_group, text="Formula Selection", padding=(6, 4))
         formula_cards.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         ttk.Radiobutton(formula_cards, text="Option A | |S_A - S_B| / sigma_o", value="standard_noise", variable=self.analysis_inputs["cnr_formula"]).grid(row=0, column=0, sticky="w")
@@ -913,7 +904,7 @@ class DicomViewer:
         self._analysis_action_buttons["cnr"].grid(row=9, column=0, sticky="ew", pady=(6, 0))
 
         uniformity_group = ttk.LabelFrame(strip, text="Uniformity", padding=(8, 6))
-        uniformity_group.pack(side="left", fill="y", padx=(0, 8))
+        uniformity_group.pack(side="left", padx=(0, 8), fill="y")
         ttk.Label(uniformity_group, text="Formula").grid(row=0, column=0, sticky="w")
         uniformity_formula_combo = ttk.Combobox(
             uniformity_group,
@@ -935,38 +926,23 @@ class DicomViewer:
             value="selected_rois",
             variable=self.analysis_inputs["uniformity_input_mode"],
         ).grid(row=3, column=0, sticky="w")
-        ttk.Button(
-            uniformity_group,
-            textvariable=self.uniformity_advanced_button_var,
-            command=self._toggle_uniformity_advanced_fields,
-        ).grid(row=4, column=0, sticky="w", pady=(2, 2))
-
-        advanced_frame = ttk.Frame(uniformity_group)
-        advanced_frame.grid(row=5, column=0, sticky="ew")
         ttk.Radiobutton(
-            advanced_frame,
+            uniformity_group,
             text="Role-based ROI set",
             value="role_group",
             variable=self.analysis_inputs["uniformity_input_mode"],
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Label(advanced_frame, text="Role filter (csv)").grid(row=1, column=0, sticky="w")
-        ttk.Entry(advanced_frame, textvariable=self.analysis_inputs["uniformity_role_filter"], width=42).grid(row=2, column=0, sticky="ew", pady=(2, 2))
-        ttk.Label(
-            advanced_frame,
-            text="Help: role_group는 ROI role(예: signal, target)로 ROI 집합을 자동 선택하는 고급 옵션입니다.",
-            foreground="#64748B",
-        ).grid(row=3, column=0, sticky="w")
-        self._uniformity_advanced_frame = advanced_frame
+        ).grid(row=4, column=0, sticky="w")
 
         self._uniformity_roi_listbox = tk.Listbox(uniformity_group, selectmode=tk.EXTENDED, height=5, exportselection=False, width=44)
-        self._uniformity_roi_listbox.grid(row=6, column=0, sticky="ew", pady=(4, 4))
-        ttk.Label(uniformity_group, textvariable=self.signal_analysis_results["uniformity_preview"]).grid(row=7, column=0, sticky="w", pady=(2, 0))
-        ttk.Label(uniformity_group, textvariable=self.signal_analysis_results["uniformity_result"]).grid(row=8, column=0, sticky="w", pady=(2, 0))
-        ttk.Button(uniformity_group, text="Calculate Uniformity", command=self.calculate_uniformity_from_inputs).grid(row=9, column=0, sticky="ew", pady=(6, 0))
-        self._refresh_uniformity_advanced_fields()
+        self._uniformity_roi_listbox.grid(row=5, column=0, sticky="ew", pady=(4, 4))
+        ttk.Label(uniformity_group, text="Role filter (csv)").grid(row=6, column=0, sticky="w")
+        ttk.Entry(uniformity_group, textvariable=self.analysis_inputs["uniformity_role_filter"], width=42).grid(row=7, column=0, sticky="ew", pady=(2, 4))
+        ttk.Label(uniformity_group, textvariable=self.signal_analysis_results["uniformity_preview"]).grid(row=8, column=0, sticky="w", pady=(2, 0))
+        ttk.Label(uniformity_group, textvariable=self.signal_analysis_results["uniformity_result"]).grid(row=9, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(uniformity_group, text="Calculate Uniformity", command=self.calculate_uniformity_from_inputs).grid(row=10, column=0, sticky="ew", pady=(6, 0))
 
         line_group = ttk.LabelFrame(strip, text="Line Profile", padding=(8, 6))
-        line_group.pack(side="left", fill="y")
+        line_group.pack(side="left", padx=(0, 8), fill="y")
         ttk.Label(line_group, text="Input: Profile Line").grid(row=0, column=0, sticky="w")
         self._analysis_comboboxes["line_profile"] = ttk.Combobox(line_group, state="readonly", width=42)
         self._analysis_comboboxes["line_profile"].grid(row=1, column=0, sticky="ew", pady=(2, 4))
@@ -975,7 +951,7 @@ class DicomViewer:
         ttk.Button(line_group, text="Show Line Profile", command=self.show_line_profile_for_selected_line).grid(row=4, column=0, sticky="ew", pady=(6, 0))
         ttk.Label(line_group, textvariable=self.snr_workflow_var).grid(row=5, column=0, sticky="w", pady=(2, 0))
 
-        self._build_analysis_results_panel(container)
+        self._build_analysis_results_panel(strip)
         self._bind_analysis_selector_events()
 
     def _bind_analysis_selector_events(self) -> None:
@@ -984,23 +960,6 @@ class DicomViewer:
             if combo is None:
                 continue
             combo.bind("<<ComboboxSelected>>", self._on_analysis_selector_changed, add="+")
-
-    def _toggle_uniformity_advanced_fields(self) -> None:
-        self.show_uniformity_advanced.set(not self.show_uniformity_advanced.get())
-        self._refresh_uniformity_advanced_fields()
-
-    def _refresh_uniformity_advanced_fields(self) -> None:
-        advanced_frame = self._uniformity_advanced_frame
-        if advanced_frame is None:
-            return
-        show_advanced = self.show_uniformity_advanced.get()
-        self.uniformity_advanced_button_var.set("Advanced 옵션 접기" if show_advanced else "Advanced 옵션 펼치기")
-        if show_advanced:
-            advanced_frame.grid()
-            return
-        advanced_frame.grid_remove()
-        if self.analysis_inputs["uniformity_input_mode"].get() == "role_group":
-            self.analysis_inputs["uniformity_input_mode"].set("selected_rois")
 
     def _on_analysis_selector_changed(self, _event: tk.Event | None = None) -> None:
         self._sync_analysis_input_from_combobox("roi", "snr_signal", "snr_signal_roi_id")
@@ -1051,43 +1010,35 @@ class DicomViewer:
 
     def _build_analysis_results_panel(self, strip: ttk.Frame) -> None:
         panel = ttk.LabelFrame(strip, text="Analysis Results", padding=(8, 6))
-        panel.pack(fill="both", expand=True, pady=(2, 0))
-        columns = ("category", "metric", "status", "roi", "stats", "value")
+        panel.pack(side="left", padx=(0, 8), fill="both", expand=True)
+        columns = ("category", "metric", "status", "formula", "roi_ids", "roles", "stats", "value")
         tree = ttk.Treeview(panel, columns=columns, show="headings", height=10)
         tree.heading("category", text="Category")
         tree.heading("metric", text="Metric")
         tree.heading("status", text="Status")
-        tree.heading("roi", text="ROI")
-        tree.heading("stats", text="Key Stats")
+        tree.heading("formula", text="Formula/Mode")
+        tree.heading("roi_ids", text="ROI IDs")
+        tree.heading("roles", text="Roles")
+        tree.heading("stats", text="Stats")
         tree.heading("value", text="Result")
         tree.column("category", width=110, anchor="w")
         tree.column("metric", width=180, anchor="w")
-        tree.column("status", width=90, anchor="w")
-        tree.column("roi", width=220, anchor="w")
-        tree.column("stats", width=360, anchor="w")
+        tree.column("status", width=100, anchor="w")
+        tree.column("formula", width=220, anchor="w")
+        tree.column("roi_ids", width=220, anchor="w")
+        tree.column("roles", width=130, anchor="w")
+        tree.column("stats", width=320, anchor="w")
         tree.column("value", width=220, anchor="w")
         tree.grid(row=0, column=0, columnspan=2, sticky="nsew")
         scrollbar = ttk.Scrollbar(panel, orient="vertical", command=tree.yview)
         scrollbar.grid(row=0, column=2, sticky="ns")
         tree.configure(yscrollcommand=scrollbar.set)
-        tree.bind("<<TreeviewSelect>>", self._on_analysis_result_row_selected, add="+")
         ttk.Button(panel, text="Export Results CSV", command=self.export_analysis_results_csv).grid(row=1, column=0, sticky="ew", pady=(6, 0), padx=(0, 4))
         ttk.Button(panel, text="Export Results JSON", command=self.export_analysis_results_json).grid(row=1, column=1, sticky="ew", pady=(6, 0), padx=(4, 0))
-        detail_group = ttk.LabelFrame(panel, text="선택 항목 상세 (검증용)", padding=(6, 4))
-        detail_group.grid(row=2, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
-        detail_text = tk.Text(detail_group, height=7, wrap="word", state="disabled")
-        detail_text.grid(row=0, column=0, sticky="nsew")
-        detail_scrollbar = ttk.Scrollbar(detail_group, orient="vertical", command=detail_text.yview)
-        detail_scrollbar.grid(row=0, column=1, sticky="ns")
-        detail_text.configure(yscrollcommand=detail_scrollbar.set)
-        detail_group.grid_columnconfigure(0, weight=1)
-        detail_group.grid_rowconfigure(0, weight=1)
         panel.grid_columnconfigure(0, weight=1)
         panel.grid_columnconfigure(1, weight=1)
         panel.grid_rowconfigure(0, weight=1)
-        panel.grid_rowconfigure(2, weight=1)
         self.analysis_results_table = tree
-        self.analysis_result_detail_text = detail_text
 
     def _refresh_analysis_selectors(self) -> None:
         roi_options = self._build_roi_analysis_options()
@@ -1724,261 +1675,33 @@ class DicomViewer:
                 ordered.append(merged)
         return ordered
 
-    def _analysis_measurement_name(self, measurement_id: str) -> str:
-        if not measurement_id:
-            return "-"
-        roi_index = self._get_roi_display_index(measurement_id)
-        if roi_index is not None:
-            return f"{roi_index}번 ROI"
-        for index, measurement in enumerate(self.persistent_measurements, start=1):
-            if measurement.id == measurement_id and measurement.kind == "line":
-                return f"{index}번 Line"
-        return "알 수 없는 ROI"
-
-    @staticmethod
-    def _format_analysis_status_label(status: str) -> str:
-        mapping = {
-            "success": "성공",
-            "missing": "입력 부족",
-            "invalid": "계산 불가",
-        }
-        return mapping.get(status, status)
-
-    def _format_panel_roi_text(self, row: dict[str, Any]) -> str:
-        roi_names = [self._analysis_measurement_name(item) for item in row.get("roi_ids", []) if item]
-        return " / ".join(roi_names) if roi_names else "-"
-
-    def _format_panel_key_stats(self, row: dict[str, Any]) -> str:
-        metric = str(row.get("metric_name", "")).upper()
-        stats = dict(row.get("stats") or {})
-        developer_meta = dict(row.get("developer_meta") or {})
-        if metric == "SNR":
-            parts: list[str] = []
-            signal_mean = developer_meta.get("mean_signal")
-            noise_std = developer_meta.get("std_noise")
-            if isinstance(signal_mean, (int, float)):
-                parts.append(f"mean(signal)={float(signal_mean):.4f}")
-            if isinstance(noise_std, (int, float)):
-                parts.append(f"std(noise)={float(noise_std):.4f}")
-            return ", ".join(parts)
-        if metric == "CNR":
-            parts = []
-            for key, label in (
-                ("target_mean", "mean(target)"),
-                ("reference_mean", "mean(reference)"),
-                ("noise_std", "std(noise)"),
-                ("target_std", "std(target)"),
-                ("reference_std", "std(reference)"),
-            ):
-                value = developer_meta.get(key)
-                if isinstance(value, (int, float)):
-                    parts.append(f"{label}={float(value):.4f}")
-            return ", ".join(parts)
-        if metric == "UNIFORMITY":
-            inputs = dict(developer_meta.get("inputs") or {})
-            formula = str(inputs.get("formula", "-"))
-            roi_count = inputs.get("roi_count")
-            parts = [f"formula={formula}"]
-            if isinstance(roi_count, int):
-                parts.append(f"roi_count={roi_count}")
-            if isinstance(stats.get("max"), (int, float)) and isinstance(stats.get("min"), (int, float)):
-                parts.append(f"max={float(stats['max']):.4f}")
-                parts.append(f"min={float(stats['min']):.4f}")
-            if isinstance(stats.get("mean"), (int, float)) and isinstance(stats.get("std"), (int, float)):
-                parts.append(f"mean={float(stats['mean']):.4f}")
-                parts.append(f"std={float(stats['std']):.4f}")
-            return ", ".join(parts)
-        if metric == "ROI_STATS":
-            parts = []
-            for key in ("mean", "std", "min", "max"):
-                value = stats.get(key)
-                if isinstance(value, (int, float)):
-                    parts.append(f"{key}={float(value):.4f}")
-            return ", ".join(parts)
-        return self._format_analysis_stats(stats)
-
-    @staticmethod
-    def _format_panel_result_text(row: dict[str, Any]) -> str:
-        status = str((row.get("stats") or {}).get("status", ""))
-        metric = str(row.get("metric_name", "")).upper()
-        result_value = row.get("result_value")
-        if status == "success" and isinstance(result_value, (int, float)):
-            if metric == "UNIFORMITY":
-                return f"Uniformity={float(result_value):.4f}"
-            return f"{metric}={float(result_value):.4f}"
-        reason = str((row.get("developer_meta") or {}).get("reason", "")).strip()
-        reason_map = {
-            "noise std <= 0": "Background ROI의 표준편차가 0이라 계산할 수 없습니다",
-            "denominator <= 0": "분모가 0이라 계산할 수 없습니다",
-            "invalid denominator": "선택한 공식의 분모가 0 이하입니다",
-            "ROI pixels unavailable": "선택된 ROI에서 유효한 픽셀을 찾지 못했습니다",
-            "no ROI set": "Uniformity 계산 ROI가 비어 있습니다",
-        }
-        if reason in reason_map:
-            return reason_map[reason]
-        return str(row.get("result_text", status))
-
-    def _set_analysis_detail_text(self, text: str) -> None:
-        detail = self.analysis_result_detail_text
-        if detail is None:
-            return
-        detail.configure(state="normal")
-        detail.delete("1.0", "end")
-        detail.insert("1.0", text.strip() if text.strip() else "상세 정보를 보려면 metric 결과 행을 선택하세요.")
-        detail.configure(state="disabled")
-
-    def _build_analysis_detail_text(self, row: dict[str, Any]) -> str:
-        metric = str(row.get("metric_name", "")).upper()
-        if metric in {"SECTION", "ROI_STATS", "LINE_PROFILE_SUMMARY"}:
-            return "상세 검증은 SNR/CNR/UNIFORMITY 결과 행에서만 제공합니다."
-        meta = dict(row.get("developer_meta") or {})
-        status = str((row.get("stats") or {}).get("status", ""))
-        if metric == "SNR":
-            signal_name = self._analysis_measurement_name((row.get("roi_ids") or ["", ""])[0] if row.get("roi_ids") else "")
-            noise_name = self._analysis_measurement_name((row.get("roi_ids") or ["", ""])[1] if len(row.get("roi_ids") or []) > 1 else "")
-            signal_mean = meta.get("mean_signal")
-            noise_std = meta.get("std_noise")
-            result_value = row.get("result_value")
-            lines = [
-                "SNR 검증 상세",
-                f"- Status: {self._format_analysis_status_label(status)}",
-                f"- Signal ROI: {signal_name}",
-                f"- Background/Noise ROI: {noise_name}",
-                f"- mean(signal): {'-' if not isinstance(signal_mean, (int, float)) else f'{float(signal_mean):.4f}'}",
-                f"- std(noise): {'-' if not isinstance(noise_std, (int, float)) else f'{float(noise_std):.4f}'}",
-                "",
-                "SNR = mean(signal) / std(noise)",
-            ]
-            if isinstance(signal_mean, (int, float)) and isinstance(noise_std, (int, float)):
-                lines.append(f"    = {float(signal_mean):.4f} / {float(noise_std):.4f}")
-            if isinstance(result_value, (int, float)):
-                lines.append(f"    = {float(result_value):.4f}")
-            return "\n".join(lines)
-        if metric == "CNR":
-            inputs = dict(meta.get("inputs") or {})
-            formula = str(inputs.get("formula", "standard_noise"))
-            target_mean = meta.get("target_mean")
-            reference_mean = meta.get("reference_mean")
-            noise_std = meta.get("noise_std")
-            target_std = meta.get("target_std")
-            reference_std = meta.get("reference_std")
-            result_value = row.get("result_value")
-            lines = [
-                "CNR 검증 상세",
-                f"- Status: {self._format_analysis_status_label(status)}",
-                f"- Target mean: {'-' if not isinstance(target_mean, (int, float)) else f'{float(target_mean):.4f}'}",
-                f"- Reference mean: {'-' if not isinstance(reference_mean, (int, float)) else f'{float(reference_mean):.4f}'}",
-            ]
-            if formula == "standard_noise":
-                lines.extend(
-                    [
-                        f"- Noise std: {'-' if not isinstance(noise_std, (int, float)) else f'{float(noise_std):.4f}'}",
-                        "- Formula: CNR = |mean(target) - mean(reference)| / std(noise)",
-                    ]
-                )
-                if all(isinstance(v, (int, float)) for v in (target_mean, reference_mean, noise_std)):
-                    numerator = abs(float(target_mean) - float(reference_mean))
-                    lines.append(f"  = |{float(target_mean):.4f} - {float(reference_mean):.4f}| / {float(noise_std):.4f}")
-                    lines.append(f"  = {numerator:.4f} / {float(noise_std):.4f}")
-            else:
-                lines.extend(
-                    [
-                        f"- Target std: {'-' if not isinstance(target_std, (int, float)) else f'{float(target_std):.4f}'}",
-                        f"- Reference std: {'-' if not isinstance(reference_std, (int, float)) else f'{float(reference_std):.4f}'}",
-                        "- Formula: CNR = |mean(target) - mean(reference)| / sqrt(std(target)^2 + std(reference)^2)",
-                    ]
-                )
-                if all(isinstance(v, (int, float)) for v in (target_mean, reference_mean, target_std, reference_std)):
-                    denominator = float(np.sqrt(float(target_std) ** 2 + float(reference_std) ** 2))
-                    numerator = abs(float(target_mean) - float(reference_mean))
-                    lines.append(f"  = |{float(target_mean):.4f} - {float(reference_mean):.4f}| / sqrt({float(target_std):.4f}² + {float(reference_std):.4f}²)")
-                    lines.append(f"  = {numerator:.4f} / {denominator:.4f}")
-            if isinstance(result_value, (int, float)):
-                lines.append(f"  = {float(result_value):.4f}")
-            return "\n".join(lines)
-        if metric == "UNIFORMITY":
-            inputs = dict(meta.get("inputs") or {})
-            stats = dict(meta.get("stats") or row.get("stats") or {})
-            formula = str(inputs.get("formula", "-"))
-            roi_count = inputs.get("roi_count")
-            result_value = row.get("result_value")
-            lines = [
-                "Uniformity 검증 상세",
-                f"- Status: {self._format_analysis_status_label(status)}",
-                f"- Formula: {formula}",
-                f"- ROI count: {roi_count if isinstance(roi_count, int) else '-'}",
-            ]
-            if formula == "std_mean":
-                mean_val = stats.get("mean")
-                std_val = stats.get("std")
-                lines.extend(
-                    [
-                        f"- mean: {'-' if not isinstance(mean_val, (int, float)) else f'{float(mean_val):.4f}'}",
-                        f"- std: {'-' if not isinstance(std_val, (int, float)) else f'{float(std_val):.4f}'}",
-                        "- Formula: U = (1 - std / mean) * 100",
-                    ]
-                )
-                if isinstance(mean_val, (int, float)) and isinstance(std_val, (int, float)):
-                    lines.append(f"  = (1 - {float(std_val):.4f} / {float(mean_val):.4f}) * 100")
-            else:
-                max_val = stats.get("max")
-                min_val = stats.get("min")
-                lines.extend(
-                    [
-                        f"- max: {'-' if not isinstance(max_val, (int, float)) else f'{float(max_val):.4f}'}",
-                        f"- min: {'-' if not isinstance(min_val, (int, float)) else f'{float(min_val):.4f}'}",
-                        "- Formula: U = (1 - (max - min) / (max + min)) * 100",
-                    ]
-                )
-                if isinstance(max_val, (int, float)) and isinstance(min_val, (int, float)):
-                    lines.append(f"  = (1 - ({float(max_val):.4f} - {float(min_val):.4f}) / ({float(max_val):.4f} + {float(min_val):.4f})) * 100")
-            if isinstance(result_value, (int, float)):
-                lines.append(f"  = {float(result_value):.4f}")
-            return "\n".join(lines)
-        return "해당 metric의 상세 검증 정보가 없습니다."
-
-    def _on_analysis_result_row_selected(self, _event: tk.Event | None = None) -> None:
-        table = self.analysis_results_table
-        if table is None:
-            return
-        selected = table.selection()
-        if not selected:
-            self._set_analysis_detail_text("")
-            return
-        row = self._analysis_table_rows_by_item.get(selected[0])
-        if row is None:
-            self._set_analysis_detail_text("")
-            return
-        self._set_analysis_detail_text(self._build_analysis_detail_text(row))
-
     def _refresh_analysis_results_panel(self) -> None:
         table = getattr(self, "analysis_results_table", None)
         if table is None:
             return
-        self._analysis_table_rows_by_item = {}
         for item_id in table.get_children():
             table.delete(item_id)
         grouped_rows = self._group_analysis_rows_for_panel(self._build_analysis_result_rows())
         for row in grouped_rows:
             stats = dict(row.get("stats") or {})
-            status = self._format_analysis_status_label(str(stats.get("status", "")))
+            status = str(stats.get("status", ""))
             category = str(row.get("category", "METRIC"))
             if category == "SECTION":
                 status = ""
-            item_id = table.insert(
+            table.insert(
                 "",
                 "end",
                 values=(
                     category,
                     row["metric_name"],
                     status,
-                    self._format_panel_roi_text(row),
-                    self._format_panel_key_stats(row),
-                    self._format_panel_result_text(row),
+                    row["formula_mode"],
+                    ",".join(row["roi_ids"]),
+                    ",".join(row["roles"]),
+                    self._format_analysis_stats(stats),
+                    row["result_text"] if row["result_text"] else row["result_value"],
                 ),
             )
-            self._analysis_table_rows_by_item[item_id] = dict(row)
-        self._set_analysis_detail_text("")
 
     def _build_analysis_export_payload(self) -> dict[str, Any]:
         rows = self._build_analysis_result_rows()
@@ -7053,10 +6776,8 @@ class DicomViewer:
         }
         if not roi_set:
             preview_text = f"source={source}, roi_count=0"
-            result_text = "Uniformity 계산에 사용할 ROI가 없습니다"
-            self.analysis_results["uniformity_preview"].set(
-                f"Formula: {formula_key}\nROI count: 0\nUniformity: -"
-            )
+            result_text = f"Result: Missing ROI set ({source})"
+            self.analysis_results["uniformity_preview"].set(f"Preview: {preview_text}")
             self.analysis_results["uniformity_result"].set(result_text)
             uniformity_payload["status"] = "missing"
             uniformity_payload["reason"] = "no ROI set"
@@ -7074,10 +6795,8 @@ class DicomViewer:
                 samples.append(roi_pixels.reshape(-1))
         if not samples:
             preview_text = f"source={source}, roi_ids={','.join(roi_ids) if roi_ids else '-'}"
-            result_text = "선택된 ROI에서 유효한 픽셀을 찾지 못했습니다"
-            self.analysis_results["uniformity_preview"].set(
-                f"Formula: {formula_key}\nROI count: {len(roi_set)}\nUniformity: -"
-            )
+            result_text = "Result: Missing ROI pixels (selected ROIs are empty)"
+            self.analysis_results["uniformity_preview"].set(f"Preview: {preview_text}")
             self.analysis_results["uniformity_result"].set(result_text)
             uniformity_payload["status"] = "missing"
             uniformity_payload["reason"] = "ROI pixels unavailable"
@@ -7111,14 +6830,8 @@ class DicomViewer:
             f"mean={aggregate_stats['mean']:.4f}, std={aggregate_stats['std']:.4f}"
         )
         if uniformity_value is None:
-            result_text = "선택한 공식의 분모가 0 이하입니다"
-            self.analysis_results["uniformity_preview"].set(
-                f"Formula: {formula_key}\n"
-                f"ROI count: {len(roi_set)}\n"
-                f"max: {aggregate_stats['max']:.4f}, min: {aggregate_stats['min']:.4f}\n"
-                f"mean: {aggregate_stats['mean']:.4f}, std: {aggregate_stats['std']:.4f}\n"
-                "Uniformity: -"
-            )
+            result_text = f"Result: Invalid denominator ({formula_key})"
+            self.analysis_results["uniformity_preview"].set(f"Preview: {preview_text}")
             self.analysis_results["uniformity_result"].set(result_text)
             uniformity_payload["status"] = "invalid"
             uniformity_payload["reason"] = "invalid denominator"
@@ -7133,14 +6846,8 @@ class DicomViewer:
             self._refresh_analysis_results_panel()
             messagebox.showwarning("Uniformity", "선택한 공식에서 분모가 0 또는 음수입니다.")
             return
-        result_text = f"Uniformity: {uniformity_value:.4f}"
-        self.analysis_results["uniformity_preview"].set(
-            f"Formula: {formula_key}\n"
-            f"ROI count: {len(roi_set)}\n"
-            f"max: {aggregate_stats['max']:.4f}, min: {aggregate_stats['min']:.4f}\n"
-            f"mean: {aggregate_stats['mean']:.4f}, std: {aggregate_stats['std']:.4f}\n"
-            f"Uniformity: {uniformity_value:.4f}"
-        )
+        result_text = f"Result: Uniformity={uniformity_value:.4f} ({formula_key})"
+        self.analysis_results["uniformity_preview"].set(f"Preview: {preview_text}")
         self.analysis_results["uniformity_result"].set(result_text)
         uniformity_payload["status"] = "success"
         uniformity_payload["reason"] = ""
@@ -7189,14 +6896,8 @@ class DicomViewer:
                 missing.append("background/noise role(또는 Noise ROI 수동 선택)")
             reason = " + ".join(missing)
             preview_text = f"signal_roi={signal_roi_id or '-'} | noise_roi={noise_roi_id or '-'}"
-            result_text = "SNR 계산에 필요한 ROI를 선택해 주세요"
-            self.analysis_results["snr_preview"].set(
-                f"Signal ROI: {self._analysis_measurement_name(signal_roi_id)}\n"
-                f"Background ROI: {self._analysis_measurement_name(noise_roi_id)}\n"
-                "Signal mean: -\n"
-                "Background std: -\n"
-                "SNR: -"
-            )
+            result_text = f"Result: Missing inputs ({reason})"
+            self.analysis_results["snr_preview"].set(f"Preview: {preview_text}")
             self.analysis_results["snr_result"].set(result_text)
             snr_payload["status"] = "missing"
             snr_payload["reason"] = reason
@@ -7215,13 +6916,7 @@ class DicomViewer:
             f"signal_roi={signal_roi.id} mean={signal_mean:.4f} | "
             f"noise_roi={noise_roi.id} std={noise_std:.4f}"
         )
-        self.analysis_results["snr_preview"].set(
-            f"Signal ROI: {self._analysis_measurement_name(signal_roi.id)}\n"
-            f"Background ROI: {self._analysis_measurement_name(noise_roi.id)}\n"
-            f"Signal mean: {signal_mean:.4f}\n"
-            f"Background std: {noise_std:.4f}\n"
-            "SNR: -"
-        )
+        self.analysis_results["snr_preview"].set(f"Preview: {preview_text}")
         snr_payload["signal_roi_id"] = signal_roi.id
         snr_payload["noise_roi_id"] = noise_roi.id
         snr_payload["inputs"] = {
@@ -7237,7 +6932,10 @@ class DicomViewer:
         snr_payload["preview"] = f"{signal_mean:.4f} / {noise_std:.4f}"
         snr_payload["preview_text"] = f"Preview: {preview_text}"
         if noise_std <= 0:
-            result_text = "Background ROI의 표준편차가 0이라 계산할 수 없습니다"
+            result_text = (
+                "Result: Invalid (noise std <= 0) "
+                f"| signal_roi={signal_roi.id} | noise_roi={noise_roi.id}"
+            )
             self.analysis_results["snr_result"].set(result_text)
             snr_payload["status"] = "invalid"
             snr_payload["reason"] = "noise std <= 0"
@@ -7248,15 +6946,12 @@ class DicomViewer:
             messagebox.showwarning("SNR", "Noise ROI 표준편차가 0입니다.")
             return
         snr = signal_mean / noise_std
-        result_text = f"SNR: {snr:.4f}"
-        self.analysis_results["snr_result"].set(result_text)
-        self.analysis_results["snr_preview"].set(
-            f"Signal ROI: {self._analysis_measurement_name(signal_roi.id)}\n"
-            f"Background ROI: {self._analysis_measurement_name(noise_roi.id)}\n"
-            f"Signal mean: {signal_mean:.4f}\n"
-            f"Background std: {noise_std:.4f}\n"
-            f"SNR: {snr:.4f}"
+        result_text = (
+            f"Result: SNR={snr:.4f} "
+            f"(signal={signal_roi.id}, noise={noise_roi.id}, "
+            f"mean={signal_mean:.4f}, std={noise_std:.4f})"
         )
+        self.analysis_results["snr_result"].set(result_text)
         snr_payload["status"] = "success"
         snr_payload["reason"] = ""
         snr_payload["result"] = float(snr)
@@ -7316,15 +7011,8 @@ class DicomViewer:
                 f"formula={formula}, target_roi={target_roi_id or '-'}, "
                 f"reference_roi={reference_roi_id or '-'}, noise_roi={noise_roi_id or '-'}"
             )
-            result_text = "CNR 계산에 필요한 ROI를 선택해 주세요"
-            self.analysis_results["cnr_preview"].set(
-                f"Target ROI: {self._analysis_measurement_name(target_roi_id)}\n"
-                f"Reference ROI: {self._analysis_measurement_name(reference_roi_id)}\n"
-                f"Noise ROI: {self._analysis_measurement_name(noise_roi_id)}\n"
-                "mean(target): -\n"
-                "mean(reference): -\n"
-                "CNR: -"
-            )
+            result_text = f"Result: Missing inputs ({reason})"
+            self.analysis_results["cnr_preview"].set(f"Preview: {preview_text}")
             self.analysis_results["cnr_result"].set(result_text)
             cnr_payload["status"] = "missing"
             cnr_payload["reason"] = reason
@@ -7361,15 +7049,7 @@ class DicomViewer:
                 f"formula=|S_A-S_B|/sigma_o, target={target_roi.id}, reference={reference_roi.id}, "
                 f"noise={noise_roi.id}, numerator={numerator:.4f}, noise_std={noise_std:.4f}"
             )
-            self.analysis_results["cnr_preview"].set(
-                f"Target ROI: {self._analysis_measurement_name(target_roi.id)}\n"
-                f"Reference ROI: {self._analysis_measurement_name(reference_roi.id)}\n"
-                f"Noise ROI: {self._analysis_measurement_name(noise_roi.id)}\n"
-                f"mean(target): {target_mean:.4f}\n"
-                f"mean(reference): {reference_mean:.4f}\n"
-                f"std(noise): {noise_std:.4f}\n"
-                "CNR: -"
-            )
+            self.analysis_results["cnr_preview"].set(f"Preview: {preview_text}")
             denominator = noise_std
             invalid_msg = "Noise ROI 표준편차가 0입니다."
             cnr_payload["noise_std"] = float(noise_std)
@@ -7382,22 +7062,17 @@ class DicomViewer:
                 f"target={target_roi.id}, reference={reference_roi.id}, numerator={numerator:.4f}, "
                 f"target_std={target_std:.4f}, reference_std={reference_std:.4f}"
             )
-            self.analysis_results["cnr_preview"].set(
-                f"Target ROI: {self._analysis_measurement_name(target_roi.id)}\n"
-                f"Reference ROI: {self._analysis_measurement_name(reference_roi.id)}\n"
-                f"mean(target): {target_mean:.4f}\n"
-                f"mean(reference): {reference_mean:.4f}\n"
-                f"std(target): {target_std:.4f}\n"
-                f"std(reference): {reference_std:.4f}\n"
-                "CNR: -"
-            )
+            self.analysis_results["cnr_preview"].set(f"Preview: {preview_text}")
             invalid_msg = "Region A/Region B 분산 기반 분모가 0입니다."
             cnr_payload["target_std"] = float(target_std)
             cnr_payload["reference_std"] = float(reference_std)
         cnr_payload["preview_text"] = f"Preview: {preview_text}"
         cnr_payload["denominator"] = float(denominator)
         if denominator <= 0:
-            result_text = "분모가 0이라 CNR을 계산할 수 없습니다"
+            result_text = (
+                "Result: Invalid (denominator <= 0) "
+                f"| target={target_roi.id} | reference={reference_roi.id}"
+            )
             self.analysis_results["cnr_result"].set(result_text)
             cnr_payload["status"] = "invalid"
             cnr_payload["reason"] = "denominator <= 0"
@@ -7408,22 +7083,8 @@ class DicomViewer:
             messagebox.showwarning("CNR", invalid_msg)
             return
         cnr = numerator / denominator
-        result_text = f"CNR: {cnr:.4f}"
+        result_text = f"Result: CNR={cnr:.4f} (formula={formula}, numerator={numerator:.4f}, denominator={denominator:.4f})"
         self.analysis_results["cnr_result"].set(result_text)
-        preview_lines = [
-            f"Target ROI: {self._analysis_measurement_name(target_roi.id)}",
-            f"Reference ROI: {self._analysis_measurement_name(reference_roi.id)}",
-            f"mean(target): {target_mean:.4f}",
-            f"mean(reference): {reference_mean:.4f}",
-        ]
-        if noise_roi is not None and isinstance(cnr_payload.get("noise_std"), (int, float)):
-            preview_lines.insert(2, f"Noise ROI: {self._analysis_measurement_name(noise_roi.id)}")
-            preview_lines.append(f"std(noise): {float(cnr_payload['noise_std']):.4f}")
-        elif isinstance(cnr_payload.get("target_std"), (int, float)) and isinstance(cnr_payload.get("reference_std"), (int, float)):
-            preview_lines.append(f"std(target): {float(cnr_payload['target_std']):.4f}")
-            preview_lines.append(f"std(reference): {float(cnr_payload['reference_std']):.4f}")
-        preview_lines.append(f"CNR: {cnr:.4f}")
-        self.analysis_results["cnr_preview"].set("\n".join(preview_lines))
         cnr_payload["status"] = "success"
         cnr_payload["reason"] = ""
         cnr_payload["result"] = float(cnr)
