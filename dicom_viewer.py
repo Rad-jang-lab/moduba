@@ -322,7 +322,11 @@ class DicomViewer:
         self._cnr_noise_widgets: list[tk.Widget] = []
         self._analysis_action_buttons: dict[str, ttk.Button] = {}
         self._uniformity_roi_listbox: tk.Listbox | None = None
-        self.analysis_results_table: ttk.Treeview | None = None
+        self.analysis_results_table: ttk.Frame | None = None
+        self.analysis_results_canvas: tk.Canvas | None = None
+        self.analysis_results_rows_container: ttk.Frame | None = None
+        self._analysis_results_row_widgets: list[dict[str, Any]] = []
+        self._analysis_results_selected_index: int | None = None
         self.result_history_store = ResultHistoryStore()
         self.result_history_table: ttk.Treeview | None = None
         self.history_metric_filter_var = tk.StringVar(value="All")
@@ -406,6 +410,18 @@ class DicomViewer:
                 ("disabled", "#F3F4F6"),
             ],
             relief=[("pressed", "sunken"), ("!pressed", "raised")],
+        )
+        style.configure(
+            "AnalysisResults.Treeview",
+            rowheight=22,
+            fieldbackground="#FFFFFF",
+            background="#FFFFFF",
+            bordercolor=self.ui_colors["border"],
+        )
+        style.map(
+            "AnalysisResults.Treeview",
+            background=[("selected", "#DCEAFE")],
+            foreground=[("selected", self.ui_colors["text_primary"])],
         )
 
     def _build_ui(self) -> None:
@@ -1037,7 +1053,9 @@ class DicomViewer:
         ttk.Label(line_group, text="Formula: intensity(x) sampled along selected line").grid(row=2, column=0, sticky="w")
         ttk.Label(line_group, textvariable=self.signal_analysis_results["line_info"]).grid(row=3, column=0, sticky="w", pady=(2, 0))
         ttk.Button(line_group, text="Show Line Profile", command=self.show_line_profile_for_selected_line).grid(row=4, column=0, sticky="ew", pady=(6, 0))
-        ttk.Label(line_group, textvariable=self.snr_workflow_var).grid(row=5, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(line_group, text="Show Feature Details", command=self.show_line_profile_feature_details).grid(row=5, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(line_group, text="Export Profile CSV", command=self.export_selected_line_profile_csv).grid(row=6, column=0, sticky="ew", pady=(4, 0))
+        ttk.Label(line_group, textvariable=self.snr_workflow_var).grid(row=7, column=0, sticky="w", pady=(2, 0))
 
         self._build_analysis_results_panel(strip)
         self._bind_analysis_selector_events()
@@ -1120,24 +1138,48 @@ class DicomViewer:
     def _build_analysis_results_panel(self, strip: ttk.Frame) -> None:
         panel = ttk.LabelFrame(strip, text="Analysis Results", padding=(8, 6))
         panel.pack(side="left", padx=(0, 8), fill="both", expand=True)
-        columns = ("item", "value", "note")
-        tree = ttk.Treeview(panel, columns=columns, show="headings", height=10, style="AnalysisResults.Treeview")
-        tree.heading("item", text="Item")
-        tree.heading("value", text="Value")
-        tree.heading("note", text="Note")
-        tree.column("item", width=220, anchor="w")
-        tree.column("value", width=180, anchor="w")
-        tree.column("note", width=420, anchor="w")
-        tree.grid(row=0, column=0, columnspan=2, sticky="nsew")
-        scrollbar = ttk.Scrollbar(panel, orient="vertical", command=tree.yview)
-        scrollbar.grid(row=0, column=2, sticky="ns")
-        tree.configure(yscrollcommand=scrollbar.set)
-        ttk.Button(panel, text="Export Results CSV", command=self.export_analysis_results_csv).grid(row=1, column=0, sticky="ew", pady=(6, 0), padx=(0, 4))
-        ttk.Button(panel, text="Export Results JSON", command=self.export_analysis_results_json).grid(row=1, column=1, sticky="ew", pady=(6, 0), padx=(4, 0))
+        header = ttk.Frame(panel)
+        header.grid(row=0, column=0, sticky="ew", columnspan=2)
+        header.columnconfigure(0, weight=0, minsize=220)
+        header.columnconfigure(1, weight=0, minsize=180)
+        header.columnconfigure(2, weight=1, minsize=300)
+        ttk.Label(header, text="Item", anchor="w").grid(row=0, column=0, sticky="ew", padx=(2, 8))
+        ttk.Label(header, text="Value", anchor="w").grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        ttk.Label(header, text="Note", anchor="w").grid(row=0, column=2, sticky="ew")
+
+        canvas = tk.Canvas(
+            panel,
+            background="#FFFFFF",
+            highlightthickness=1,
+            highlightbackground=self.ui_colors["border"],
+            bd=0,
+        )
+        canvas.grid(row=1, column=0, sticky="nsew", columnspan=2)
+        scrollbar = ttk.Scrollbar(panel, orient="vertical", command=canvas.yview)
+        scrollbar.grid(row=1, column=2, sticky="ns")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        rows_container = ttk.Frame(canvas)
+        rows_window = canvas.create_window((0, 0), window=rows_container, anchor="nw")
+
+        def _sync_scroll_region(_event: tk.Event) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _sync_row_container_width(_event: tk.Event) -> None:
+            canvas.itemconfigure(rows_window, width=_event.width)
+            self._relayout_analysis_result_rows()
+
+        rows_container.bind("<Configure>", _sync_scroll_region)
+        canvas.bind("<Configure>", _sync_row_container_width)
+
+        ttk.Button(panel, text="Export Results CSV", command=self.export_analysis_results_csv).grid(row=2, column=0, sticky="ew", pady=(6, 0), padx=(0, 4))
+        ttk.Button(panel, text="Export Results JSON", command=self.export_analysis_results_json).grid(row=2, column=1, sticky="ew", pady=(6, 0), padx=(4, 0))
         panel.grid_columnconfigure(0, weight=1)
         panel.grid_columnconfigure(1, weight=1)
-        panel.grid_rowconfigure(0, weight=1)
-        self.analysis_results_table = tree
+        panel.grid_rowconfigure(1, weight=1)
+        self.analysis_results_table = panel
+        self.analysis_results_canvas = canvas
+        self.analysis_results_rows_container = rows_container
 
     def _build_results_history_panel(self, tab: ttk.Frame) -> None:
         panel = ttk.LabelFrame(tab, text="Measurement History", padding=(8, 6))
@@ -3236,28 +3278,87 @@ class DicomViewer:
         return ordered
 
     def _refresh_analysis_results_panel(self) -> None:
-        table = getattr(self, "analysis_results_table", None)
-        if table is None:
+        rows_container = getattr(self, "analysis_results_rows_container", None)
+        if rows_container is None:
             return
-        for item_id in table.get_children():
-            table.delete(item_id)
+        for child in rows_container.winfo_children():
+            child.destroy()
+        self._analysis_results_row_widgets = []
+        self._analysis_results_selected_index = None
         grouped_rows = self._group_analysis_rows_for_panel(self._build_analysis_result_rows())
-        inserted_rows: list[tuple[str, str, str]] = []
-        for row in grouped_rows:
+        data_row_index = 0
+        for row_index, row in enumerate(grouped_rows):
             category = str(row.get("category", "METRIC"))
             item_text = row["metric_name"] if category == "SECTION" else row.get("item_name", row["metric_name"])
             note_text = self._build_analysis_note_text(row) if category != "SECTION" else ""
             value_text = self._format_analysis_value_text(row) if category != "SECTION" else ""
             if category == "SECTION":
                 item_text = f"[{item_text}]"
-            values = (
-                self._sanitize_ui_text(str(item_text)),
-                self._sanitize_ui_text("" if value_text is None else str(value_text)),
-                note_text,
-            )
-            table.insert("", "end", values=values)
-            inserted_rows.append(values)
-        self._update_treeview_row_height_for_notes(table, "AnalysisResults.Treeview", inserted_rows, note_index=2)
+            item_value = self._sanitize_ui_text(str(item_text))
+            value_value = self._sanitize_ui_text("" if value_text is None else str(value_text))
+            note_value = note_text
+            if category == "SECTION":
+                background = "#F8FAFC"
+                font = ("TkDefaultFont", 10, "bold")
+            else:
+                background = "#FFFFFF" if data_row_index % 2 == 0 else "#F6F7F9"
+                font = ("TkDefaultFont", 10)
+                data_row_index += 1
+            row_frame = tk.Frame(rows_container, bg=background, highlightthickness=0, bd=0)
+            row_frame.grid(row=row_index, column=0, sticky="ew")
+            row_frame.grid_columnconfigure(0, weight=0, minsize=220)
+            row_frame.grid_columnconfigure(1, weight=0, minsize=180)
+            row_frame.grid_columnconfigure(2, weight=1, minsize=300)
+
+            item_label = tk.Label(row_frame, text=item_value, anchor="w", justify="left", bg=background, fg=self.ui_colors["text_primary"], font=font, padx=8, pady=4)
+            value_label = tk.Label(row_frame, text=value_value, anchor="w", justify="left", bg=background, fg=self.ui_colors["text_primary"], font=font, padx=6, pady=4)
+            note_label = tk.Label(row_frame, text=note_value, anchor="w", justify="left", bg=background, fg=self.ui_colors["text_primary"], font=("TkDefaultFont", 9), padx=6, pady=4)
+            item_label.grid(row=0, column=0, sticky="nsew")
+            value_label.grid(row=0, column=1, sticky="nsew")
+            note_label.grid(row=0, column=2, sticky="nsew")
+
+            separator = tk.Frame(rows_container, height=1, bg=self.ui_colors["border"])
+            separator.grid(row=(row_index * 2) + 1, column=0, sticky="ew")
+            row_frame.grid_configure(row=row_index * 2)
+
+            row_widgets = {
+                "frame": row_frame,
+                "labels": (item_label, value_label, note_label),
+                "base_bg": background,
+                "is_section": category == "SECTION",
+            }
+            self._analysis_results_row_widgets.append(row_widgets)
+            for widget in (row_frame, item_label, value_label, note_label):
+                widget.bind("<Button-1>", lambda _event, idx=row_index: self._select_analysis_results_row(idx))
+
+        rows_container.grid_columnconfigure(0, weight=1)
+        self._relayout_analysis_result_rows()
+
+    def _select_analysis_results_row(self, row_index: int) -> None:
+        self._analysis_results_selected_index = row_index
+        selected_bg = "#DCEAFE"
+        for index, row in enumerate(self._analysis_results_row_widgets):
+            background = selected_bg if index == row_index else str(row["base_bg"])
+            frame = row["frame"]
+            labels = row["labels"]
+            frame.configure(bg=background)
+            for label in labels:
+                label.configure(bg=background)
+
+    def _relayout_analysis_result_rows(self) -> None:
+        container = self.analysis_results_rows_container
+        if container is None:
+            return
+        container.update_idletasks()
+        width = max(int(container.winfo_width()), 400)
+        item_width = 220
+        value_width = 180
+        note_width = max(240, width - item_width - value_width - 40)
+        for row in self._analysis_results_row_widgets:
+            labels = row["labels"]
+            labels[0].configure(wraplength=item_width - 16)
+            labels[1].configure(wraplength=value_width - 12)
+            labels[2].configure(wraplength=note_width - 12)
 
     def _build_analysis_export_payload(self) -> dict[str, Any]:
         rows = self._build_analysis_result_rows()
@@ -8657,18 +8758,14 @@ class DicomViewer:
         plt.show(block=False)
 
     def show_line_profile_for_selected_line(self) -> None:
-        measurement = self._get_selected_measurement_from_analysis("line", "line_profile_line_id", "line_profile")
-        if measurement is None:
-            self.analysis_results["line_info"].set("Line: Select Profile Line")
-            messagebox.showinfo("안내", "Profile Line을 선택하세요.")
+        context = self._prepare_selected_line_profile_context(show_warning=True)
+        if context is None:
             return
-        profile = self.extract_line_profile(measurement)
-        if profile is None:
-            return
-        summary = self.summarize_line_profile(profile)
-        metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
-        line_index = self._line_index_for_measurement_id(measurement.id)
-        line_label = f"Line {line_index}" if line_index is not None else measurement.id[:8]
+        measurement = context["measurement"]
+        profile = context["profile"]
+        summary = context["summary"]
+        metrics = context["metrics"]
+        line_label = context["line_label"]
         fwhm_text = "N/A" if summary["fwhm"] is None else f"{summary['fwhm']:.2f}{summary['distance_unit']}"
         self.analysis_results["line_info"].set(
             f"{line_label} | mean {summary['mean_intensity']:.2f} | peak {summary['peak_value']:.2f} | FWHM {fwhm_text}"
@@ -8799,21 +8896,87 @@ class DicomViewer:
                 target_id=measurement.id,
             )
         self.render_line_profile_chart(measurement, profile, summary)
-        save_path = filedialog.asksaveasfilename(
+
+    def _prepare_selected_line_profile_context(self, show_warning: bool = False) -> dict[str, Any] | None:
+        measurement = self._get_selected_measurement_from_analysis("line", "line_profile_line_id", "line_profile")
+        if measurement is None:
+            self.analysis_results["line_info"].set("Line: Select Profile Line")
+            if show_warning:
+                messagebox.showinfo("안내", "Profile Line을 선택하세요.")
+            return None
+        profile = self.extract_line_profile(measurement)
+        if profile is None:
+            if show_warning:
+                messagebox.showwarning("Line Profile", "선택한 라인에서 프로파일을 계산할 수 없습니다.")
+            return None
+        summary = self.summarize_line_profile(profile)
+        metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
+        line_index = self._line_index_for_measurement_id(measurement.id)
+        line_label = f"Line {line_index}" if line_index is not None else measurement.id[:8]
+        return {
+            "measurement": measurement,
+            "profile": profile,
+            "summary": summary,
+            "metrics": metrics,
+            "line_label": line_label,
+        }
+
+    def show_line_profile_feature_details(self) -> None:
+        context = self._prepare_selected_line_profile_context(show_warning=True)
+        if context is None:
+            return
+        summary = context["summary"]
+        line_label = context["line_label"]
+        peak_text = (
+            "N/A"
+            if not isinstance(summary.get("peak_value"), (int, float))
+            else f"{float(summary['peak_value']):.2f} @ {float(summary['peak_position']):.2f} {summary['distance_unit']}"
+        )
+        valley_text = (
+            "N/A"
+            if not isinstance(summary.get("valley_value"), (int, float))
+            else f"{float(summary['valley_value']):.2f} @ {float(summary['valley_position']):.2f} {summary['distance_unit']}"
+        )
+        fwhm_text = "N/A" if not isinstance(summary.get("fwhm"), (int, float)) else f"{float(summary['fwhm']):.2f} {summary['distance_unit']}"
+        messagebox.showinfo(
+            "Line Profile Details",
+            (
+                f"{line_label}\n"
+                f"Samples: {summary['sample_count']}\n"
+                f"Length: {summary['length_px']:.2f} px"
+                + ("" if summary["length_mm"] is None else f" ({float(summary['length_mm']):.2f} mm)")
+                + "\n"
+                f"Mean/Std: {summary['mean_intensity']:.2f} / {summary['std_intensity']:.2f}\n"
+                f"Peak: {peak_text}\n"
+                f"Valley: {valley_text}\n"
+                f"FWHM: {fwhm_text}"
+            ),
+        )
+
+    def export_selected_line_profile_csv(self) -> None:
+        context = self._prepare_selected_line_profile_context(show_warning=True)
+        if context is None:
+            return
+        profile = context["profile"]
+        line_label = str(context["line_label"]).replace(" ", "_")
+        path = filedialog.asksaveasfilename(
             title="라인 프로파일 CSV 저장",
             defaultextension=".csv",
+            initialfile=f"{line_label}_profile.csv",
             filetypes=[("CSV", "*.csv"), ("All Files", "*.*")],
         )
-        if save_path:
-            with open(save_path, "w", newline="", encoding="utf-8-sig") as handle:
-                writer = csv.writer(handle)
-                writer.writerow(["distance_px", "distance_mm", "intensity"])
-                distance_px = np.asarray(profile["distance_px"], dtype=np.float64)
-                distance_mm = None if profile.get("distance_mm") is None else np.asarray(profile["distance_mm"], dtype=np.float64)
-                intensity = np.asarray(profile["intensity"], dtype=np.float64)
-                for index, value in enumerate(intensity):
-                    distance_mm_value = "" if distance_mm is None else f"{float(distance_mm[index]):.6f}"
-                    writer.writerow([f"{float(distance_px[index]):.6f}", distance_mm_value, f"{float(value):.6f}"])
+        if not path:
+            return
+        distance_px = np.asarray(profile.get("distance_px", []), dtype=np.float64)
+        distance_mm = None if profile.get("distance_mm") is None else np.asarray(profile.get("distance_mm", []), dtype=np.float64)
+        intensity = np.asarray(profile.get("intensity", []), dtype=np.float64)
+        with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["distance_px", "distance_mm", "intensity"])
+            for index, value in enumerate(intensity):
+                mm_value = "" if distance_mm is None else f"{float(distance_mm[index]):.6f}"
+                writer.writerow([f"{float(distance_px[index]):.6f}", mm_value, f"{float(value):.6f}"])
+        messagebox.showinfo("Line Profile Export", f"CSV 저장 완료:\n{path}")
 
     def _parse_uniformity_role_filter(self) -> set[str]:
         raw = self.analysis_inputs["uniformity_role_filter"].get()
