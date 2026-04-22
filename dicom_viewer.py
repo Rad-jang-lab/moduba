@@ -407,6 +407,17 @@ class DicomViewer:
             ],
             relief=[("pressed", "sunken"), ("!pressed", "raised")],
         )
+        style.configure(
+            "AnalysisResults.Treeview",
+            background="#FFFFFF",
+            fieldbackground="#FFFFFF",
+            rowheight=24,
+        )
+        style.map(
+            "AnalysisResults.Treeview",
+            background=[("selected", "#DCEAFE")],
+            foreground=[("selected", self.ui_colors["text_primary"])],
+        )
 
     def _build_ui(self) -> None:
         self.main_vertical_split = tk.PanedWindow(
@@ -1128,6 +1139,9 @@ class DicomViewer:
         tree.column("item", width=220, anchor="w")
         tree.column("value", width=180, anchor="w")
         tree.column("note", width=420, anchor="w")
+        tree.tag_configure("section", font=("TkDefaultFont", 10, "bold"), background="#F8FAFC", foreground="#111827")
+        tree.tag_configure("zebra_even", background="#FFFFFF")
+        tree.tag_configure("zebra_odd", background="#F8FAFC")
         tree.grid(row=0, column=0, columnspan=2, sticky="nsew")
         scrollbar = ttk.Scrollbar(panel, orient="vertical", command=tree.yview)
         scrollbar.grid(row=0, column=2, sticky="ns")
@@ -1496,6 +1510,7 @@ class DicomViewer:
         style_name: str,
         rows: list[tuple[str, ...]],
         note_index: int,
+        max_lines_cap: int | None = None,
     ) -> None:
         default_font = tkfont.nametofont("TkDefaultFont")
         line_height = default_font.metrics("linespace")
@@ -1521,6 +1536,8 @@ class DicomViewer:
                     else:
                         width += char_width
             max_lines = max(max_lines, line_count)
+        if max_lines_cap is not None:
+            max_lines = min(max_lines, max_lines_cap)
         row_height = max(22, (line_height * max_lines) + 8)
         ttk.Style(self.root).configure(style_name, rowheight=row_height)
 
@@ -3243,10 +3260,15 @@ class DicomViewer:
             table.delete(item_id)
         grouped_rows = self._group_analysis_rows_for_panel(self._build_analysis_result_rows())
         inserted_rows: list[tuple[str, str, str]] = []
+        metric_row_index = 0
         for row in grouped_rows:
             category = str(row.get("category", "METRIC"))
             item_text = row["metric_name"] if category == "SECTION" else row.get("item_name", row["metric_name"])
-            note_text = self._build_analysis_note_text(row) if category != "SECTION" else ""
+            if category == "SECTION":
+                note_text = ""
+            else:
+                full_note_text = self._build_analysis_note_text(row)
+                note_text = full_note_text.splitlines()[0] if full_note_text else ""
             value_text = self._format_analysis_value_text(row) if category != "SECTION" else ""
             if category == "SECTION":
                 item_text = f"[{item_text}]"
@@ -3255,9 +3277,20 @@ class DicomViewer:
                 self._sanitize_ui_text("" if value_text is None else str(value_text)),
                 note_text,
             )
-            table.insert("", "end", values=values)
+            if category == "SECTION":
+                table.insert("", "end", values=values, tags=("section",))
+            else:
+                zebra_tag = "zebra_even" if metric_row_index % 2 == 0 else "zebra_odd"
+                table.insert("", "end", values=values, tags=(zebra_tag,))
+                metric_row_index += 1
             inserted_rows.append(values)
-        self._update_treeview_row_height_for_notes(table, "AnalysisResults.Treeview", inserted_rows, note_index=2)
+        self._update_treeview_row_height_for_notes(
+            table,
+            "AnalysisResults.Treeview",
+            inserted_rows,
+            note_index=2,
+            max_lines_cap=1,
+        )
 
     def _build_analysis_export_payload(self) -> dict[str, Any]:
         rows = self._build_analysis_result_rows()
