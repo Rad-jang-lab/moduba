@@ -84,6 +84,7 @@ def _build_viewer() -> DicomViewer:
     viewer.analysis_results = {
         "snr_preview": DummyVar(""),
         "snr_result": DummyVar(""),
+        "snr_ready_reason": DummyVar(""),
         "cnr_preview": DummyVar(""),
         "cnr_result": DummyVar(""),
     }
@@ -172,6 +173,25 @@ def test_snr_button_enabled_with_manual_selection_even_without_roles():
     viewer._update_analysis_action_button_state()
 
     assert viewer._analysis_action_buttons["snr"].state == "normal"
+    assert viewer.analysis_results["snr_ready_reason"].get().startswith("Ready:")
+
+
+def test_snr_button_enabled_with_manual_ids_even_without_combobox_selection():
+    viewer = _build_viewer()
+    signal = _add_roi(viewer, "roi_signal_manual_ids", (1, 1), (5, 5), role=None)
+    noise = _add_roi(viewer, "roi_noise_manual_ids", (5, 1), (9, 5), role=None)
+
+    viewer.analysis_inputs["snr_signal_roi_id"].set(signal.id)
+    viewer.analysis_inputs["snr_background_roi_id"].set(noise.id)
+    viewer._analysis_comboboxes = {
+        "snr_signal": DummyCombobox(""),
+        "snr_noise": DummyCombobox(""),
+    }
+
+    viewer._update_analysis_action_button_state()
+
+    assert viewer._analysis_action_buttons["snr"].state == "normal"
+    assert "signal=" in viewer.analysis_results["snr_ready_reason"].get()
 
 
 def test_cnr_button_enabled_with_manual_selection_even_without_roles():
