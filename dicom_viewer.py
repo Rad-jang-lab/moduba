@@ -439,7 +439,7 @@ class DicomViewer:
 
     def _build_toolbar_tabs(self, parent: ttk.Frame) -> None:
         notebook = ttk.Notebook(parent)
-        notebook.pack(fill="x")
+        notebook.pack(fill="both", expand=True)
 
         home_tab = self._add_toolbar_tab(notebook, "HOME")
         image_tab = self._add_toolbar_tab(notebook, "IMAGE")
@@ -461,7 +461,7 @@ class DicomViewer:
 
     def _build_subtoolbar_sections(self, parent: ttk.Frame, section_names: list[str]) -> dict[str, ttk.Frame]:
         wrapper = ttk.Frame(parent)
-        wrapper.pack(fill="x")
+        wrapper.pack(fill="both", expand=True)
         wrapper.columnconfigure(0, weight=1)
 
         selector_row = ttk.Frame(wrapper)
@@ -514,11 +514,12 @@ class DicomViewer:
 
     def _build_grouped_toolbar_strip(self, parent: ttk.Frame) -> ttk.Frame:
         wrapper = ttk.Frame(parent)
-        wrapper.pack(fill="x")
+        wrapper.pack(fill="both", expand=True)
+        wrapper.rowconfigure(0, weight=1)
         wrapper.columnconfigure(1, weight=1)
         canvas_background = self.ui_colors["bg_surface"]
-        canvas = tk.Canvas(wrapper, height=156, highlightthickness=0, bg=canvas_background, bd=0)
-        canvas.grid(row=0, column=1, sticky="ew")
+        canvas = tk.Canvas(wrapper, highlightthickness=0, bg=canvas_background, bd=0)
+        canvas.grid(row=0, column=1, sticky="nsew")
         canvas.configure(yscrollincrement=16)
         y_scrollbar = ttk.Scrollbar(wrapper, orient="vertical", command=canvas.yview)
         y_scrollbar.grid(row=0, column=3, sticky="ns", padx=(4, 0))
@@ -550,10 +551,16 @@ class DicomViewer:
 
         def _refresh_scroll_region(_event: tk.Event | None = None) -> None:
             canvas.configure(scrollregion=canvas.bbox("all"))
+            requires_vertical_scroll = strip.winfo_reqheight() > canvas.winfo_height() + 1
+            if requires_vertical_scroll:
+                y_scrollbar.grid()
+            else:
+                y_scrollbar.grid_remove()
+                canvas.yview_moveto(0.0)
             _update_nav_buttons()
 
         def _resize_inner(_event: tk.Event) -> None:
-            canvas.itemconfigure(window_id, height=max(canvas.winfo_height(), strip.winfo_reqheight()))
+            canvas.itemconfigure(window_id, height=canvas.winfo_height())
             _refresh_scroll_region()
 
         def _on_mousewheel(event: tk.Event) -> None:
@@ -793,7 +800,7 @@ class DicomViewer:
 
     def _build_analysis_toolbar(self, tab: ttk.Frame) -> None:
         analysis_notebook = ttk.Notebook(tab)
-        analysis_notebook.pack(fill="x")
+        analysis_notebook.pack(fill="both", expand=True)
 
         signal_tab = ttk.Frame(analysis_notebook, padding=(4, 4, 4, 4))
         image_tab = ttk.Frame(analysis_notebook, padding=(4, 4, 4, 4))
