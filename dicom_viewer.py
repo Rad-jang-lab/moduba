@@ -327,7 +327,7 @@ class DicomViewer:
         self.result_history_table: ttk.Treeview | None = None
         self.history_metric_filter_var = tk.StringVar(value="All")
         self.history_search_var = tk.StringVar(value="")
-        self._history_item_to_store_index: dict[str, int] = {}
+        self._history_item_to_store_indices: dict[str, list[int]] = {}
         self.history_compare_button: ttk.Button | None = None
         self.line_profile_series_cache: dict[str, dict[str, Any]] = {}
         self._session_compare_state: dict[str, Any] = {"selected_entry_ids": [], "baseline_index": 0}
@@ -1121,7 +1121,7 @@ class DicomViewer:
         panel = ttk.LabelFrame(strip, text="Analysis Results", padding=(8, 6))
         panel.pack(side="left", padx=(0, 8), fill="both", expand=True)
         columns = ("item", "value", "note")
-        tree = ttk.Treeview(panel, columns=columns, show="headings", height=10)
+        tree = ttk.Treeview(panel, columns=columns, show="headings", height=10, style="AnalysisResults.Treeview")
         tree.heading("item", text="Item")
         tree.heading("value", text="Value")
         tree.heading("note", text="Note")
@@ -1158,8 +1158,27 @@ class DicomViewer:
         search_entry = ttk.Entry(toolbar, textvariable=self.history_search_var, width=32)
         search_entry.pack(side="left", padx=(6, 0))
         search_entry.bind("<KeyRelease>", lambda _event: self._refresh_result_history_table())
-        columns = ("timestamp", "image", "frame", "type", "target", "metric", "value", "unit", "note")
-        tree = ttk.Treeview(panel, columns=columns, show="headings", height=16, selectmode="extended")
+        columns = (
+            "timestamp",
+            "image",
+            "frame",
+            "type",
+            "target",
+            "metric",
+            "value",
+            "mean",
+            "std",
+            "min",
+            "max",
+            "area",
+            "length_px",
+            "length_mm",
+            "peaks",
+            "valleys",
+            "unit",
+            "note",
+        )
+        tree = ttk.Treeview(panel, columns=columns, show="headings", height=16, selectmode="extended", style="ResultHistory.Treeview")
         headers = {
             "timestamp": "Timestamp",
             "image": "Image Name",
@@ -1168,6 +1187,15 @@ class DicomViewer:
             "target": "ROI / Line Name",
             "metric": "Metric",
             "value": "Value",
+            "mean": "Mean",
+            "std": "Std",
+            "min": "Min",
+            "max": "Max",
+            "area": "Area",
+            "length_px": "Length(px)",
+            "length_mm": "Length(mm)",
+            "peaks": "Peaks",
+            "valleys": "Valleys",
             "unit": "Unit",
             "note": "Note",
         }
@@ -1179,8 +1207,17 @@ class DicomViewer:
             "target": 140,
             "metric": 120,
             "value": 90,
+            "mean": 90,
+            "std": 90,
+            "min": 90,
+            "max": 90,
+            "area": 90,
+            "length_px": 95,
+            "length_mm": 95,
+            "peaks": 80,
+            "valleys": 80,
             "unit": 90,
-            "note": 420,
+            "note": 320,
         }
         for key in columns:
             tree.heading(key, text=headers[key])
@@ -1313,16 +1350,179 @@ class DicomViewer:
         table = getattr(self, "result_history_table", None)
         if table is None:
             return
-        self._history_item_to_store_index = {}
-        for item_id in table.get_children():
-            table.delete(item_id)
         selected_type = self.history_metric_filter_var.get().strip() if hasattr(self, "history_metric_filter_var") else "All"
         search_text = self.history_search_var.get() if hasattr(self, "history_search_var") else ""
-        for store_index, entry in self.result_history_store.filtered_entries(selected_type, search_text):
-            item_id = table.insert("", "end", values=entry.to_row())
-            self._history_item_to_store_index[item_id] = store_index
+        grouped_rows = self.build_grouped_history_view(selected_type, search_text)
+        self.render_grouped_history_table(grouped_rows)
         self._restore_history_selection()
         self._update_history_compare_button_state()
+
+    @staticmethod
+    def _metric_bucket_key(metric_name: str) -> str | None:
+        normalized = metric_name.strip().lower().replace(" ", "")
+        if normalized in {"mean"}:
+            return "mean"
+        if normalized in {"std", "stddev", "standarddeviation"}:
+            return "std"
+        if normalized in {"min", "minimum"}:
+            return "min"
+        if normalized in {"max", "maximum"}:
+            return "max"
+        if normalized.startswith("area"):
+            return "area"
+        if normalized in {"length(px)", "lengthpx"}:
+            return "length_px"
+        if normalized in {"length(mm)", "lengthmm"}:
+            return "length_mm"
+        if normalized.startswith("peaks"):
+            return "peaks"
+        if normalized.startswith("valleys"):
+            return "valleys"
+        return None
+
+    def group_history_entries(self, rows: list[tuple[int, ResultHistoryEntry]]) -> list[dict[str, Any]]:
+        grouped: dict[tuple[str, str, int, str, str], dict[str, Any]] = {}
+        for store_index, entry in rows:
+            key = (
+                entry.timestamp,
+                entry.image_name,
+                int(entry.frame_index),
+                entry.measurement_type,
+                entry.target_name,
+            )
+            payload = grouped.setdefault(
+                key,
+                {
+                    "timestamp": entry.timestamp,
+                    "image_name": entry.image_name,
+                    "frame_index": str(entry.frame_index),
+                    "measurement_type": entry.measurement_type,
+                    "target_name": entry.target_name,
+                    "metric": "",
+                    "value": "",
+                    "mean": "",
+                    "std": "",
+                    "min": "",
+                    "max": "",
+                    "area": "",
+                    "length_px": "",
+                    "length_mm": "",
+                    "peaks": "",
+                    "valleys": "",
+                    "unit": "",
+                    "note": "",
+                    "store_indices": [],
+                    "entry_ids": [],
+                    "primary_entry": entry,
+                },
+            )
+            payload["store_indices"].append(store_index)
+            payload["entry_ids"].append(entry.entry_id)
+            bucket = self._metric_bucket_key(entry.metric)
+            value_text = f"{entry.value:.2f}"
+            if bucket is not None:
+                payload[bucket] = value_text
+            elif not payload["metric"]:
+                payload["metric"] = entry.metric
+                payload["value"] = value_text
+            notes = [line for line in [payload["note"], entry.note] if line]
+            payload["note"] = "\n".join(dict.fromkeys(notes))
+            units = [item for item in [payload["unit"], entry.unit] if item]
+            payload["unit"] = ", ".join(dict.fromkeys(units))
+        return sorted(
+            grouped.values(),
+            key=lambda row: (row["timestamp"], row["image_name"], row["frame_index"], row["measurement_type"], row["target_name"]),
+            reverse=True,
+        )
+
+    def build_grouped_history_view(self, measurement_type: str = "All", search_text: str = "") -> list[dict[str, Any]]:
+        raw_rows = self.result_history_store.filtered_entries(measurement_type, "")
+        grouped_rows = self.group_history_entries(raw_rows)
+        query = search_text.strip().lower()
+        if not query:
+            return grouped_rows
+        filtered: list[dict[str, Any]] = []
+        for row in grouped_rows:
+            haystack = " ".join(
+                [
+                    str(row.get("image_name", "")),
+                    str(row.get("target_name", "")),
+                    str(row.get("measurement_type", "")),
+                    str(row.get("metric", "")),
+                    str(row.get("note", "")),
+                ]
+            ).lower()
+            if query in haystack:
+                filtered.append(row)
+        return filtered
+
+    def render_grouped_history_table(self, grouped_rows: list[dict[str, Any]]) -> None:
+        table = getattr(self, "result_history_table", None)
+        if table is None:
+            return
+        self._history_item_to_store_indices = {}
+        for item_id in table.get_children():
+            table.delete(item_id)
+        row_values: list[tuple[str, ...]] = []
+        for row in grouped_rows:
+            values = (
+                str(row.get("timestamp", "")),
+                str(row.get("image_name", "")),
+                str(row.get("frame_index", "")),
+                str(row.get("measurement_type", "")),
+                str(row.get("target_name", "")),
+                str(row.get("metric", "")),
+                str(row.get("value", "")),
+                str(row.get("mean", "")),
+                str(row.get("std", "")),
+                str(row.get("min", "")),
+                str(row.get("max", "")),
+                str(row.get("area", "")),
+                str(row.get("length_px", "")),
+                str(row.get("length_mm", "")),
+                str(row.get("peaks", "")),
+                str(row.get("valleys", "")),
+                str(row.get("unit", "")),
+                str(row.get("note", "")),
+            )
+            item_id = table.insert("", "end", values=values)
+            self._history_item_to_store_indices[item_id] = list(row.get("store_indices", []))
+            row_values.append(values)
+        self._update_treeview_row_height_for_notes(table, "ResultHistory.Treeview", row_values, note_index=17)
+
+    def _update_treeview_row_height_for_notes(
+        self,
+        table: ttk.Treeview,
+        style_name: str,
+        rows: list[tuple[str, ...]],
+        note_index: int,
+    ) -> None:
+        default_font = tkfont.nametofont("TkDefaultFont")
+        line_height = default_font.metrics("linespace")
+        note_width = int(table.column("note", "width")) - 12
+        note_width = max(48, note_width)
+        max_lines = 1
+        for values in rows:
+            if note_index >= len(values):
+                continue
+            note_text = str(values[note_index] or "")
+            line_count = 0
+            for paragraph in note_text.split("\n"):
+                if not paragraph:
+                    line_count += 1
+                    continue
+                width = 0
+                line_count += 1
+                for char in paragraph:
+                    char_width = default_font.measure(char)
+                    if width + char_width > note_width and width > 0:
+                        line_count += 1
+                        width = char_width
+                    else:
+                        width += char_width
+            max_lines = max(max_lines, line_count)
+        row_height = max(22, (line_height * max_lines) + 8)
+        ttk.Style(self.root).configure(style_name, rowheight=row_height)
 
     def _selected_history_entries(self) -> list[tuple[int, ResultHistoryEntry]]:
         table = self.result_history_table
@@ -1330,11 +1530,15 @@ class DicomViewer:
             return []
         selected: list[tuple[int, ResultHistoryEntry]] = []
         all_entries = self.result_history_store.entries()
+        seen_indices: set[int] = set()
         for item_id in table.selection():
-            store_index = self._history_item_to_store_index.get(item_id)
-            if store_index is None or not (0 <= store_index < len(all_entries)):
-                continue
-            selected.append((store_index, all_entries[store_index]))
+            for store_index in self._history_item_to_store_indices.get(item_id, []):
+                if store_index in seen_indices:
+                    continue
+                if not (0 <= store_index < len(all_entries)):
+                    continue
+                selected.append((store_index, all_entries[store_index]))
+                seen_indices.add(store_index)
         return selected
 
     def delete_selected_history_rows(self) -> None:
@@ -1372,6 +1576,57 @@ class DicomViewer:
                     ]
                 )
 
+    @staticmethod
+    def _grouped_history_export_columns() -> tuple[str, ...]:
+        return (
+            "Timestamp",
+            "ImageName",
+            "Frame",
+            "MeasurementType",
+            "TargetName",
+            "Metric",
+            "Value",
+            "Mean",
+            "Std",
+            "Min",
+            "Max",
+            "Area",
+            "Length(px)",
+            "Length(mm)",
+            "Peaks",
+            "Valleys",
+            "Unit",
+            "Note",
+        )
+
+    def _write_grouped_result_history_csv(self, path: str, grouped_rows: list[dict[str, Any]]) -> None:
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(self._grouped_history_export_columns())
+            for row in grouped_rows:
+                writer.writerow(
+                    [
+                        row.get("timestamp", ""),
+                        row.get("image_name", ""),
+                        row.get("frame_index", ""),
+                        row.get("measurement_type", ""),
+                        row.get("target_name", ""),
+                        row.get("metric", ""),
+                        row.get("value", ""),
+                        row.get("mean", ""),
+                        row.get("std", ""),
+                        row.get("min", ""),
+                        row.get("max", ""),
+                        row.get("area", ""),
+                        row.get("length_px", ""),
+                        row.get("length_mm", ""),
+                        row.get("peaks", ""),
+                        row.get("valleys", ""),
+                        row.get("unit", ""),
+                        row.get("note", ""),
+                    ]
+                )
+
     def export_result_history_csv(self) -> None:
         path = filedialog.asksaveasfilename(
             title="Results History CSV 저장",
@@ -1380,7 +1635,11 @@ class DicomViewer:
         )
         if not path:
             return
-        self._write_result_history_csv(path, self.result_history_store.entries())
+        grouped_rows = self.build_grouped_history_view(
+            self.history_metric_filter_var.get().strip() if hasattr(self, "history_metric_filter_var") else "All",
+            self.history_search_var.get() if hasattr(self, "history_search_var") else "",
+        )
+        self._write_grouped_result_history_csv(path, grouped_rows)
         messagebox.showinfo("저장 완료", f"Results History CSV 저장 완료:\n{path}")
 
     def export_selected_result_history_csv(self) -> None:
@@ -1395,26 +1654,50 @@ class DicomViewer:
         )
         if not path:
             return
-        self._write_result_history_csv(path, [entry for _index, entry in selected_rows])
+        selected_indices = {index for index, _entry in selected_rows}
+        grouped_rows = [
+            row
+            for row in self.build_grouped_history_view(
+                self.history_metric_filter_var.get().strip() if hasattr(self, "history_metric_filter_var") else "All",
+                self.history_search_var.get() if hasattr(self, "history_search_var") else "",
+            )
+            if selected_indices.intersection(set(row.get("store_indices", [])))
+        ]
+        self._write_grouped_result_history_csv(path, grouped_rows)
         messagebox.showinfo("저장 완료", f"선택 행 CSV 저장 완료:\n{path}")
 
     def copy_result_history_to_clipboard(self) -> None:
         selected_rows = self._selected_history_entries()
-        entries = [entry for _index, entry in selected_rows] if selected_rows else self.result_history_store.entries()
-        lines = [",".join(self._history_export_columns())]
-        for entry in entries:
-            row = [
-                entry.timestamp,
-                entry.image_name,
-                str(entry.frame_index),
-                entry.measurement_type,
-                entry.target_name,
-                entry.metric,
-                f"{entry.value:.2f}",
-                entry.unit,
-                entry.note.replace("\n", " | "),
+        selected_indices = {index for index, _entry in selected_rows}
+        grouped_rows = self.build_grouped_history_view(
+            self.history_metric_filter_var.get().strip() if hasattr(self, "history_metric_filter_var") else "All",
+            self.history_search_var.get() if hasattr(self, "history_search_var") else "",
+        )
+        if selected_indices:
+            grouped_rows = [row for row in grouped_rows if selected_indices.intersection(set(row.get("store_indices", [])))]
+        lines = [",".join(self._grouped_history_export_columns())]
+        for row in grouped_rows:
+            values = [
+                str(row.get("timestamp", "")),
+                str(row.get("image_name", "")),
+                str(row.get("frame_index", "")),
+                str(row.get("measurement_type", "")),
+                str(row.get("target_name", "")),
+                str(row.get("metric", "")),
+                str(row.get("value", "")),
+                str(row.get("mean", "")),
+                str(row.get("std", "")),
+                str(row.get("min", "")),
+                str(row.get("max", "")),
+                str(row.get("area", "")),
+                str(row.get("length_px", "")),
+                str(row.get("length_mm", "")),
+                str(row.get("peaks", "")),
+                str(row.get("valleys", "")),
+                str(row.get("unit", "")),
+                str(row.get("note", "")).replace("\n", " | "),
             ]
-            lines.append(",".join(row))
+            lines.append(",".join(values))
         self.root.clipboard_clear()
         self.root.clipboard_append("\n".join(lines))
         messagebox.showinfo("Results History", "히스토리를 클립보드에 복사했습니다.")
@@ -1424,9 +1707,20 @@ class DicomViewer:
         self._session_compare_state["selected_entry_ids"] = [entry.entry_id for _index, entry in selected_rows]
         self._session_compare_state["baseline_index"] = 0
         self._update_history_compare_button_state()
-        if not selected_rows or len(selected_rows) != 1:
+        table = self.result_history_table
+        if table is None:
             return
-        _index, entry = selected_rows[0]
+        selection = list(table.selection())
+        if len(selection) != 1:
+            return
+        all_entries = self.result_history_store.entries()
+        store_indices = self._history_item_to_store_indices.get(selection[0], [])
+        if not store_indices:
+            return
+        primary_index = store_indices[0]
+        if not (0 <= primary_index < len(all_entries)):
+            return
+        entry = all_entries[primary_index]
         self.activate_history_entry(entry)
 
     def _restore_history_selection(self, selected_entry_ids: list[str] | None = None) -> None:
@@ -1436,12 +1730,17 @@ class DicomViewer:
         wanted_ids = list(selected_entry_ids or self._session_compare_state.get("selected_entry_ids", []))
         if not wanted_ids:
             return
-        id_to_items: dict[str, str] = {}
         all_entries = self.result_history_store.entries()
-        for item_id, store_index in self._history_item_to_store_index.items():
-            if 0 <= store_index < len(all_entries):
-                id_to_items[all_entries[store_index].entry_id] = item_id
-        item_ids = [id_to_items[entry_id] for entry_id in wanted_ids if entry_id in id_to_items]
+        id_to_items: dict[str, set[str]] = {}
+        for item_id, store_indices in self._history_item_to_store_indices.items():
+            for store_index in store_indices:
+                if not (0 <= store_index < len(all_entries)):
+                    continue
+                entry_id = all_entries[store_index].entry_id
+                id_to_items.setdefault(entry_id, set()).add(item_id)
+        item_ids: list[str] = []
+        for entry_id in wanted_ids:
+            item_ids.extend(sorted(id_to_items.get(entry_id, set())))
         if item_ids:
             table.selection_set(item_ids)
 
@@ -1449,7 +1748,8 @@ class DicomViewer:
         button = self.history_compare_button
         if button is None:
             return
-        selected_count = len(self._selected_history_entries())
+        table = self.result_history_table
+        selected_count = len(table.selection()) if table is not None else 0
         if 2 <= selected_count <= 5:
             button.configure(state="normal")
         else:
@@ -1995,14 +2295,28 @@ class DicomViewer:
                 ).pack(anchor="w", padx=8, pady=(0, 8))
 
     def compare_selected_history_rows(self) -> None:
-        selected_rows = self._selected_history_entries()
-        if len(selected_rows) < 2:
+        table = self.result_history_table
+        if table is None:
+            return
+        selected_items = list(table.selection())
+        if len(selected_items) < 2:
             messagebox.showinfo("Compare", "비교하려면 2개 이상 선택하세요.")
             return
-        if len(selected_rows) > 5:
+        if len(selected_items) > 5:
             messagebox.showinfo("Compare", "한 번에 최대 5개까지만 비교할 수 있습니다.")
             return
-        entries = [entry for _index, entry in selected_rows]
+        all_entries = self.result_history_store.entries()
+        entries: list[ResultHistoryEntry] = []
+        for item_id in selected_items:
+            store_indices = self._history_item_to_store_indices.get(item_id, [])
+            if not store_indices:
+                continue
+            store_index = store_indices[0]
+            if 0 <= store_index < len(all_entries):
+                entries.append(all_entries[store_index])
+        if len(entries) < 2:
+            messagebox.showinfo("Compare", "비교 가능한 결과를 찾지 못했습니다.")
+            return
         comparison = self.build_history_comparison(entries)
         if comparison["mixed_metrics"]:
             messagebox.showwarning("Compare", "같은 metric 비교를 권장합니다. (혼합 metric 계속 진행)")
@@ -2928,6 +3242,7 @@ class DicomViewer:
         for item_id in table.get_children():
             table.delete(item_id)
         grouped_rows = self._group_analysis_rows_for_panel(self._build_analysis_result_rows())
+        inserted_rows: list[tuple[str, str, str]] = []
         for row in grouped_rows:
             category = str(row.get("category", "METRIC"))
             item_text = row["metric_name"] if category == "SECTION" else row.get("item_name", row["metric_name"])
@@ -2935,15 +3250,14 @@ class DicomViewer:
             value_text = self._format_analysis_value_text(row) if category != "SECTION" else ""
             if category == "SECTION":
                 item_text = f"[{item_text}]"
-            table.insert(
-                "",
-                "end",
-                values=(
-                    self._sanitize_ui_text(str(item_text)),
-                    self._sanitize_ui_text("" if value_text is None else str(value_text)),
-                    note_text,
-                ),
+            values = (
+                self._sanitize_ui_text(str(item_text)),
+                self._sanitize_ui_text("" if value_text is None else str(value_text)),
+                note_text,
             )
+            table.insert("", "end", values=values)
+            inserted_rows.append(values)
+        self._update_treeview_row_height_for_notes(table, "AnalysisResults.Treeview", inserted_rows, note_index=2)
 
     def _build_analysis_export_payload(self) -> dict[str, Any]:
         rows = self._build_analysis_result_rows()
