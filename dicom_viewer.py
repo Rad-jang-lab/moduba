@@ -244,6 +244,7 @@ class DicomViewer:
         }
         self.analysis_last_run: dict[str, dict[str, Any]] = {}
         self._analysis_comboboxes: dict[str, ttk.Combobox] = {}
+        self._analysis_selector_vars: dict[str, tk.StringVar] = {}
         self._image_analysis_comboboxes: dict[str, ttk.Combobox] = {}
         self._cnr_noise_widgets: list[tk.Widget] = []
         self._analysis_action_buttons: dict[str, ttk.Button] = {}
@@ -837,13 +838,26 @@ class DicomViewer:
         self._refresh_analysis_selectors()
 
     def _build_signal_analysis_toolbar(self, strip: ttk.Frame) -> None:
+        for key in ("snr_signal", "snr_noise", "cnr_target", "cnr_reference", "cnr_noise"):
+            self._analysis_selector_vars[key] = tk.StringVar(value="")
+
         snr_group = ttk.LabelFrame(strip, text="SNR", padding=(8, 6))
         snr_group.pack(side="left", padx=(0, 8), fill="y")
         ttk.Label(snr_group, text="Input: Signal ROI").grid(row=0, column=0, sticky="w")
-        self._analysis_comboboxes["snr_signal"] = ttk.Combobox(snr_group, state="readonly", width=42)
+        self._analysis_comboboxes["snr_signal"] = ttk.Combobox(
+            snr_group,
+            state="readonly",
+            width=42,
+            textvariable=self._analysis_selector_vars["snr_signal"],
+        )
         self._analysis_comboboxes["snr_signal"].grid(row=1, column=0, sticky="ew", pady=(2, 4))
         ttk.Label(snr_group, text="Input: Background ROI").grid(row=2, column=0, sticky="w")
-        self._analysis_comboboxes["snr_noise"] = ttk.Combobox(snr_group, state="readonly", width=42)
+        self._analysis_comboboxes["snr_noise"] = ttk.Combobox(
+            snr_group,
+            state="readonly",
+            width=42,
+            textvariable=self._analysis_selector_vars["snr_noise"],
+        )
         self._analysis_comboboxes["snr_noise"].grid(row=3, column=0, sticky="ew", pady=(2, 4))
         ttk.Label(snr_group, text="Formula: mean(Signal ROI) / std(Background ROI)").grid(row=4, column=0, sticky="w")
         ttk.Label(snr_group, textvariable=self.signal_analysis_results["snr_preview"]).grid(row=5, column=0, sticky="w", pady=(2, 0))
@@ -859,14 +873,29 @@ class DicomViewer:
         ttk.Radiobutton(formula_cards, text="Option A | |S_A - S_B| / sigma_o", value="standard_noise", variable=self.analysis_inputs["cnr_formula"]).grid(row=0, column=0, sticky="w")
         ttk.Radiobutton(formula_cards, text="Option B | |S_A - S_B| / sqrt(sigma_A^2 + sigma_B^2)", value="dual_variance", variable=self.analysis_inputs["cnr_formula"]).grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Label(cnr_group, text="Input: Signal ROI").grid(row=1, column=0, sticky="w")
-        self._analysis_comboboxes["cnr_target"] = ttk.Combobox(cnr_group, state="readonly", width=42)
+        self._analysis_comboboxes["cnr_target"] = ttk.Combobox(
+            cnr_group,
+            state="readonly",
+            width=42,
+            textvariable=self._analysis_selector_vars["cnr_target"],
+        )
         self._analysis_comboboxes["cnr_target"].grid(row=2, column=0, sticky="ew", pady=(2, 4))
         ttk.Label(cnr_group, text="Input: Reference ROI").grid(row=3, column=0, sticky="w")
-        self._analysis_comboboxes["cnr_reference"] = ttk.Combobox(cnr_group, state="readonly", width=42)
+        self._analysis_comboboxes["cnr_reference"] = ttk.Combobox(
+            cnr_group,
+            state="readonly",
+            width=42,
+            textvariable=self._analysis_selector_vars["cnr_reference"],
+        )
         self._analysis_comboboxes["cnr_reference"].grid(row=4, column=0, sticky="ew", pady=(2, 4))
         noise_label = ttk.Label(cnr_group, text="Input: Background ROI")
         noise_label.grid(row=5, column=0, sticky="w")
-        self._analysis_comboboxes["cnr_noise"] = ttk.Combobox(cnr_group, state="readonly", width=42)
+        self._analysis_comboboxes["cnr_noise"] = ttk.Combobox(
+            cnr_group,
+            state="readonly",
+            width=42,
+            textvariable=self._analysis_selector_vars["cnr_noise"],
+        )
         self._analysis_comboboxes["cnr_noise"].grid(row=6, column=0, sticky="ew", pady=(2, 4))
         self._cnr_noise_widgets = [noise_label, self._analysis_comboboxes["cnr_noise"]]
         ttk.Label(cnr_group, textvariable=self.signal_analysis_results["cnr_preview"]).grid(row=7, column=0, sticky="w", pady=(2, 0))
@@ -933,12 +962,24 @@ class DicomViewer:
             combo.bind("<<ComboboxSelected>>", self._on_analysis_selector_changed, add="+")
 
     def _on_analysis_selector_changed(self, _event: tk.Event | None = None) -> None:
-        self._sync_analysis_display_value("roi", "snr_signal", "snr_signal_roi_id")
-        self._sync_analysis_display_value("roi", "snr_noise", "snr_background_roi_id")
-        self._sync_analysis_display_value("roi", "cnr_target", "cnr_target_roi_id")
-        self._sync_analysis_display_value("roi", "cnr_reference", "cnr_reference_roi_id")
-        self._sync_analysis_display_value("roi", "cnr_noise", "cnr_noise_roi_id")
+        self._sync_analysis_input_from_combobox("roi", "snr_signal", "snr_signal_roi_id")
+        self._sync_analysis_input_from_combobox("roi", "snr_noise", "snr_background_roi_id")
+        self._sync_analysis_input_from_combobox("roi", "cnr_target", "cnr_target_roi_id")
+        self._sync_analysis_input_from_combobox("roi", "cnr_reference", "cnr_reference_roi_id")
+        self._sync_analysis_input_from_combobox("roi", "cnr_noise", "cnr_noise_roi_id")
         self._update_analysis_action_button_state()
+
+    def _sync_analysis_input_from_combobox(self, kind: str, combobox_key: str, input_key: str) -> None:
+        combobox = self._analysis_comboboxes.get(combobox_key)
+        if combobox is None:
+            return
+        selected_label = combobox.get().strip()
+        if not selected_label:
+            return
+        option_map = self._analysis_option_maps.get(kind, {})
+        mapped_id = option_map.get(selected_label, "")
+        if mapped_id:
+            self.analysis_inputs[input_key].set(mapped_id)
 
     def _build_image_analysis_toolbar(self, tab: ttk.Frame) -> None:
         frame = ttk.Frame(tab)
@@ -1144,10 +1185,13 @@ class DicomViewer:
         if combobox is None:
             return
         selected_id = self.analysis_inputs[input_key].get()
+        option_map = self._analysis_option_maps.get(kind, {})
         if not selected_id:
+            current_label = combobox.get().strip()
+            if current_label and current_label in option_map:
+                return
             combobox.set("")
             return
-        option_map = self._analysis_option_maps.get(kind, {})
         for label, measurement_id in option_map.items():
             if measurement_id == selected_id:
                 combobox.set(label)
