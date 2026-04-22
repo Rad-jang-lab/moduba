@@ -191,7 +191,7 @@ def test_snr_button_enabled_with_manual_ids_even_without_combobox_selection():
     viewer._update_analysis_action_button_state()
 
     assert viewer._analysis_action_buttons["snr"].state == "normal"
-    assert "signal=" in viewer.analysis_results["snr_ready_reason"].get()
+    assert "measurement" in viewer.analysis_results["snr_ready_reason"].get()
 
 
 def test_cnr_button_enabled_with_manual_selection_even_without_roles():

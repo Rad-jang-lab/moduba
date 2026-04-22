@@ -4,6 +4,7 @@ import csv
 from dataclasses import dataclass, field
 from datetime import datetime
 import json
+import re
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -66,6 +67,10 @@ class RectRoi:
 
 
 class DicomViewer:
+    _UUID_PATTERN = re.compile(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    )
+
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("DICOM Viewer")
@@ -1011,24 +1016,14 @@ class DicomViewer:
     def _build_analysis_results_panel(self, strip: ttk.Frame) -> None:
         panel = ttk.LabelFrame(strip, text="Analysis Results", padding=(8, 6))
         panel.pack(side="left", padx=(0, 8), fill="both", expand=True)
-        columns = ("category", "metric", "status", "formula", "roi_ids", "roles", "stats", "value")
+        columns = ("item", "value", "note")
         tree = ttk.Treeview(panel, columns=columns, show="headings", height=10)
-        tree.heading("category", text="Category")
-        tree.heading("metric", text="Metric")
-        tree.heading("status", text="Status")
-        tree.heading("formula", text="Formula/Mode")
-        tree.heading("roi_ids", text="ROI IDs")
-        tree.heading("roles", text="Roles")
-        tree.heading("stats", text="Stats")
-        tree.heading("value", text="Result")
-        tree.column("category", width=110, anchor="w")
-        tree.column("metric", width=180, anchor="w")
-        tree.column("status", width=100, anchor="w")
-        tree.column("formula", width=220, anchor="w")
-        tree.column("roi_ids", width=220, anchor="w")
-        tree.column("roles", width=130, anchor="w")
-        tree.column("stats", width=320, anchor="w")
-        tree.column("value", width=220, anchor="w")
+        tree.heading("item", text="Item")
+        tree.heading("value", text="Value")
+        tree.heading("note", text="Note")
+        tree.column("item", width=220, anchor="w")
+        tree.column("value", width=180, anchor="w")
+        tree.column("note", width=420, anchor="w")
         tree.grid(row=0, column=0, columnspan=2, sticky="nsew")
         scrollbar = ttk.Scrollbar(panel, orient="vertical", command=tree.yview)
         scrollbar.grid(row=0, column=2, sticky="ns")
@@ -1276,17 +1271,18 @@ class DicomViewer:
                     missing_reasons.append("signal ROI 미선택")
                 if snr_noise_roi is None and manual_snr_noise_roi is None:
                     missing_reasons.append("background/noise ROI 미선택")
-                current_signal_id = self._read_analysis_selected_id("roi", "snr_signal_roi_id", "snr_signal")
-                current_noise_id = self._read_analysis_selected_id("roi", "snr_background_roi_id", "snr_noise")
                 if snr_ready:
-                    source_text = "role" if role_ready else "manual"
-                    snr_reason_var.set(
-                        f"Ready: {source_text} | signal={current_signal_id or '-'} | noise={current_noise_id or '-'}"
-                    )
+                    source_text = "role-based measurement" if role_ready else "manual measurement"
+                    snr_reason_var.set(f"Ready: {source_text}")
                 else:
-                    snr_reason_var.set(
-                        "Disabled: " + ", ".join(missing_reasons) if missing_reasons else "Disabled: ROI 입력 확인 필요"
-                    )
+                    if len(missing_reasons) == 2:
+                        snr_reason_var.set("Select Signal ROI and Noise ROI")
+                    elif "signal ROI 미선택" in missing_reasons:
+                        snr_reason_var.set("Signal ROI not selected")
+                    elif "background/noise ROI 미선택" in missing_reasons:
+                        snr_reason_var.set("Noise ROI not selected")
+                    else:
+                        snr_reason_var.set("ROI selection required")
         if cnr_button is not None:
             needs_noise = formula == "standard_noise"
             role_ready = cnr_target_roi is not None and cnr_reference_roi is not None and (cnr_noise_roi is not None or not needs_noise)
@@ -1324,7 +1320,7 @@ class DicomViewer:
     def _build_roi_analysis_options(self) -> list[tuple[str, str]]:
         options: list[tuple[str, str]] = []
         current_geometry = self._get_current_geometry_key()
-        roi_index = 0
+        roi_display_names = self._build_roi_display_name_map()
         for measurement in self.persistent_measurements:
             if measurement.kind != "roi":
                 continue
@@ -1332,7 +1328,6 @@ class DicomViewer:
                 continue
             if measurement.frame_index != self.current_frame:
                 continue
-            roi_index += 1
             metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
             signal_stats = dict(metrics.get("signal_stats") or {})
             mean = float(signal_stats.get("mean", 0.0))
@@ -1340,13 +1335,11 @@ class DicomViewer:
             std = float(signal_stats.get("std", 0.0))
             area_mm2 = metrics.get("area_mm2")
             area_text = f"{area_mm2:.1f} mm²" if isinstance(area_mm2, (int, float)) else f"{metrics['area_px']:.1f} px²"
-            role = self._get_measurement_roi_role(measurement)
-            role_text = f" | role={role}" if role is not None else ""
             label = (
-                f"{roi_index}번 ROI | 최소값 {min_val:.1f} | 평균값 {mean:.1f} | "
-                f"표준편차 {std:.1f} | 면적 {area_text}{role_text}"
+                f"{roi_display_names.get(measurement.id, 'ROI')} | Min {min_val:.1f} | Mean {mean:.1f} | "
+                f"SD {std:.1f} | Area {area_text}"
             )
-            options.append((measurement.id, label))
+            options.append((measurement.id, self._sanitize_ui_text(label)))
         return options
 
     def _get_roi_display_index(self, measurement_id: str) -> int | None:
@@ -1367,6 +1360,7 @@ class DicomViewer:
     def _build_line_analysis_options(self) -> list[tuple[str, str]]:
         options: list[tuple[str, str]] = []
         current_geometry = self._get_current_geometry_key()
+        line_index = 0
         for measurement in self.persistent_measurements:
             if measurement.kind != "line":
                 continue
@@ -1374,10 +1368,58 @@ class DicomViewer:
                 continue
             if measurement.frame_index != self.current_frame:
                 continue
+            line_index += 1
             metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
-            label = f"Line {measurement.id[:8]} | length {metrics['length_px']:.1f} px"
+            label = f"Line ROI {line_index} | length {metrics['length_px']:.1f} px"
             options.append((measurement.id, label))
         return options
+
+    @staticmethod
+    def _format_role_display_name(role: str | None, index: int) -> str:
+        role_to_name = {
+            "signal": "Signal ROI",
+            "noise": "Noise ROI",
+            "background": "Background ROI",
+            "target": "Target ROI",
+            "reference": "Reference ROI",
+        }
+        base_name = role_to_name.get(str(role or "").lower(), "ROI")
+        return base_name if index == 1 else f"{base_name} {index}"
+
+    def _build_roi_display_name_map(self) -> dict[str, str]:
+        current_geometry = self._get_current_geometry_key()
+        role_counts: dict[str, int] = {}
+        fallback_index = 0
+        display_map: dict[str, str] = {}
+        for measurement in self.persistent_measurements:
+            if measurement.kind != "roi":
+                continue
+            if not self._geometry_matches(measurement.geometry_key, current_geometry):
+                continue
+            if measurement.frame_index != self.current_frame:
+                continue
+            role = self._get_measurement_roi_role(measurement)
+            if role is None:
+                fallback_index += 1
+                display_map[measurement.id] = self._format_role_display_name(None, fallback_index)
+                continue
+            role_counts[role] = role_counts.get(role, 0) + 1
+            display_map[measurement.id] = self._format_role_display_name(role, role_counts[role])
+        return display_map
+
+    def _display_name_for_roi_id(self, roi_id: str | None) -> str:
+        if not roi_id:
+            return "ROI"
+        return self._build_roi_display_name_map().get(roi_id, "ROI")
+
+    def _sanitize_ui_text(self, text: str) -> str:
+        if not text:
+            return ""
+        cleaned = self._UUID_PATTERN.sub("", text)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned)
+        cleaned = cleaned.replace(" |  | ", " | ").replace(" | | ", " | ")
+        cleaned = cleaned.strip(" |,")
+        return cleaned if cleaned else "-"
 
     def _is_analysis_compatible_measurement(self, measurement: Measurement) -> bool:
         current_geometry = self._get_current_geometry_key()
@@ -1439,7 +1481,9 @@ class DicomViewer:
                     "roles": [] if role is None else [role],
                     "stats": stats,
                     "result_value": float(stats["mean"]),
-                    "result_text": f"mean={stats['mean']:.4f}",
+                    "item_name": self._display_name_for_roi_id(measurement.id),
+                    "note_text": "Current frame ROI statistics",
+                    "result_text": f"Mean: {stats['mean']:.2f}, SD: {stats['std']:.2f}",
                     "developer_meta": {
                         "source": "roi_stats_snapshot",
                         "measurement_id": measurement.id,
@@ -1494,7 +1538,9 @@ class DicomViewer:
                     "roles": roles,
                     "stats": stats,
                     "result_value": result_value,
-                    "result_text": result_text,
+                    "item_name": "SNR",
+                    "note_text": "Calculated from signal mean and noise SD",
+                    "result_text": (f"{result_value:.2f}" if isinstance(result_value, (int, float)) else result_text),
                     "developer_meta": snr,
                 }
             )
@@ -1547,7 +1593,9 @@ class DicomViewer:
                     "roles": roles,
                     "stats": stats,
                     "result_value": result_value,
-                    "result_text": result_text,
+                    "item_name": "CNR",
+                    "note_text": "Contrast difference divided by noise term",
+                    "result_text": (f"{result_value:.2f}" if isinstance(result_value, (int, float)) else result_text),
                     "developer_meta": cnr,
                 }
             )
@@ -1583,7 +1631,9 @@ class DicomViewer:
                     "roles": [],
                     "stats": stats,
                     "result_value": result_value,
-                    "result_text": result_text,
+                    "item_name": "Uniformity",
+                    "note_text": "Uniformity score in percent",
+                    "result_text": (f"{result_value:.2f}" if isinstance(result_value, (int, float)) else result_text),
                     "developer_meta": uniformity,
                 }
             )
@@ -1603,7 +1653,9 @@ class DicomViewer:
                     "roles": [],
                     "stats": line_stats,
                     "result_value": float(line_stats["length_px"]),
-                    "result_text": f"length={line_stats['length_px']:.1f}px, samples={line_stats['sample_count']}",
+                    "item_name": "Line Profile",
+                    "note_text": f"Samples: {line_stats['sample_count']}",
+                    "result_text": f"{line_stats['length_px']:.1f} px",
                     "developer_meta": line,
                 }
             )
@@ -1622,6 +1674,8 @@ class DicomViewer:
                     "stats": dict(row.get("stats") or {}),
                     "result_value": row.get("result_value"),
                     "result_text": str(row.get("result_text", "")),
+                    "item_name": str(row.get("item_name", row.get("metric_name", ""))),
+                    "note_text": str(row.get("note_text", "")),
                     "developer_meta": dict(row.get("developer_meta") or {}),
                 }
             )
@@ -1643,7 +1697,7 @@ class DicomViewer:
             ordered.append(
                 {
                     "category": "SECTION",
-                    "metric_name": "Final Metric Results",
+                    "metric_name": "Results",
                     "formula_mode": "",
                     "roi_ids": [],
                     "roles": [],
@@ -1660,7 +1714,7 @@ class DicomViewer:
             ordered.append(
                 {
                     "category": "SECTION",
-                    "metric_name": "ROI Snapshot Stats (Current Frame)",
+                    "metric_name": "ROI Stats",
                     "formula_mode": "",
                     "roi_ids": [],
                     "roles": [],
@@ -1683,23 +1737,22 @@ class DicomViewer:
             table.delete(item_id)
         grouped_rows = self._group_analysis_rows_for_panel(self._build_analysis_result_rows())
         for row in grouped_rows:
-            stats = dict(row.get("stats") or {})
-            status = str(stats.get("status", ""))
             category = str(row.get("category", "METRIC"))
+            item_text = row["metric_name"] if category == "SECTION" else row.get("item_name", row["metric_name"])
+            note_text = row.get("note_text", "")
+            value_text = row["result_text"] if row["result_text"] else row["result_value"]
             if category == "SECTION":
-                status = ""
+                value_text = ""
+                note_text = ""
+            if category == "SECTION":
+                item_text = f"[{item_text}]"
             table.insert(
                 "",
                 "end",
                 values=(
-                    category,
-                    row["metric_name"],
-                    status,
-                    row["formula_mode"],
-                    ",".join(row["roi_ids"]),
-                    ",".join(row["roles"]),
-                    self._format_analysis_stats(stats),
-                    row["result_text"] if row["result_text"] else row["result_value"],
+                    self._sanitize_ui_text(str(item_text)),
+                    self._sanitize_ui_text("" if value_text is None else str(value_text)),
+                    self._sanitize_ui_text(note_text),
                 ),
             )
 
@@ -6775,9 +6828,9 @@ class DicomViewer:
             },
         }
         if not roi_set:
-            preview_text = f"source={source}, roi_count=0"
-            result_text = f"Result: Missing ROI set ({source})"
-            self.analysis_results["uniformity_preview"].set(f"Preview: {preview_text}")
+            preview_text = "ROI set not selected"
+            result_text = "Uniformity unavailable"
+            self.analysis_results["uniformity_preview"].set("ROI selection required")
             self.analysis_results["uniformity_result"].set(result_text)
             uniformity_payload["status"] = "missing"
             uniformity_payload["reason"] = "no ROI set"
@@ -6794,9 +6847,9 @@ class DicomViewer:
             if roi_pixels.size > 0:
                 samples.append(roi_pixels.reshape(-1))
         if not samples:
-            preview_text = f"source={source}, roi_ids={','.join(roi_ids) if roi_ids else '-'}"
-            result_text = "Result: Missing ROI pixels (selected ROIs are empty)"
-            self.analysis_results["uniformity_preview"].set(f"Preview: {preview_text}")
+            preview_text = "Selected ROIs are empty"
+            result_text = "Uniformity unavailable"
+            self.analysis_results["uniformity_preview"].set(preview_text)
             self.analysis_results["uniformity_result"].set(result_text)
             uniformity_payload["status"] = "missing"
             uniformity_payload["reason"] = "ROI pixels unavailable"
@@ -6824,14 +6877,10 @@ class DicomViewer:
         }
         uniformity_payload["factors"] = [self._collect_analysis_factors(measurement) for measurement in roi_set]
         uniformity_value = selected_formula["calculator"](aggregate_stats)
-        preview_text = (
-            f"source={source}, n={len(roi_set)}, px={aggregate_stats['pixel_count']}, "
-            f"max={aggregate_stats['max']:.4f}, min={aggregate_stats['min']:.4f}, "
-            f"mean={aggregate_stats['mean']:.4f}, std={aggregate_stats['std']:.4f}"
-        )
+        preview_text = f"{len(roi_set)} ROIs selected"
         if uniformity_value is None:
-            result_text = f"Result: Invalid denominator ({formula_key})"
-            self.analysis_results["uniformity_preview"].set(f"Preview: {preview_text}")
+            result_text = "Uniformity unavailable"
+            self.analysis_results["uniformity_preview"].set(preview_text)
             self.analysis_results["uniformity_result"].set(result_text)
             uniformity_payload["status"] = "invalid"
             uniformity_payload["reason"] = "invalid denominator"
@@ -6846,8 +6895,8 @@ class DicomViewer:
             self._refresh_analysis_results_panel()
             messagebox.showwarning("Uniformity", "선택한 공식에서 분모가 0 또는 음수입니다.")
             return
-        result_text = f"Result: Uniformity={uniformity_value:.4f} ({formula_key})"
-        self.analysis_results["uniformity_preview"].set(f"Preview: {preview_text}")
+        result_text = f"Uniformity: {uniformity_value:.2f}"
+        self.analysis_results["uniformity_preview"].set(preview_text)
         self.analysis_results["uniformity_result"].set(result_text)
         uniformity_payload["status"] = "success"
         uniformity_payload["reason"] = ""
@@ -6895,9 +6944,9 @@ class DicomViewer:
             if noise_roi is None:
                 missing.append("background/noise role(또는 Noise ROI 수동 선택)")
             reason = " + ".join(missing)
-            preview_text = f"signal_roi={signal_roi_id or '-'} | noise_roi={noise_roi_id or '-'}"
-            result_text = f"Result: Missing inputs ({reason})"
-            self.analysis_results["snr_preview"].set(f"Preview: {preview_text}")
+            preview_text = "ROI selection required"
+            result_text = "SNR unavailable"
+            self.analysis_results["snr_preview"].set(preview_text)
             self.analysis_results["snr_result"].set(result_text)
             snr_payload["status"] = "missing"
             snr_payload["reason"] = reason
@@ -6912,11 +6961,8 @@ class DicomViewer:
         noise_metrics = self.compute_measurement(noise_roi, self._get_frame_pixel_array(noise_roi.frame_index))
         signal_mean = float((signal_metrics.get("signal_stats") or {}).get("mean", 0.0))
         noise_std = float((noise_metrics.get("signal_stats") or {}).get("std", 0.0))
-        preview_text = (
-            f"signal_roi={signal_roi.id} mean={signal_mean:.4f} | "
-            f"noise_roi={noise_roi.id} std={noise_std:.4f}"
-        )
-        self.analysis_results["snr_preview"].set(f"Preview: {preview_text}")
+        preview_text = "Signal ROI selected / Noise ROI selected"
+        self.analysis_results["snr_preview"].set(preview_text)
         snr_payload["signal_roi_id"] = signal_roi.id
         snr_payload["noise_roi_id"] = noise_roi.id
         snr_payload["inputs"] = {
@@ -6932,10 +6978,7 @@ class DicomViewer:
         snr_payload["preview"] = f"{signal_mean:.4f} / {noise_std:.4f}"
         snr_payload["preview_text"] = f"Preview: {preview_text}"
         if noise_std <= 0:
-            result_text = (
-                "Result: Invalid (noise std <= 0) "
-                f"| signal_roi={signal_roi.id} | noise_roi={noise_roi.id}"
-            )
+            result_text = "SNR unavailable"
             self.analysis_results["snr_result"].set(result_text)
             snr_payload["status"] = "invalid"
             snr_payload["reason"] = "noise std <= 0"
@@ -6946,11 +6989,7 @@ class DicomViewer:
             messagebox.showwarning("SNR", "Noise ROI 표준편차가 0입니다.")
             return
         snr = signal_mean / noise_std
-        result_text = (
-            f"Result: SNR={snr:.4f} "
-            f"(signal={signal_roi.id}, noise={noise_roi.id}, "
-            f"mean={signal_mean:.4f}, std={noise_std:.4f})"
-        )
+        result_text = f"Signal Mean: {signal_mean:.2f} | Noise SD: {noise_std:.2f} | SNR: {snr:.2f}"
         self.analysis_results["snr_result"].set(result_text)
         snr_payload["status"] = "success"
         snr_payload["reason"] = ""
@@ -7007,12 +7046,9 @@ class DicomViewer:
             if formula == "standard_noise" and noise_roi is None:
                 missing.append("noise role(또는 Noise ROI 수동 선택)")
             reason = " + ".join(missing)
-            preview_text = (
-                f"formula={formula}, target_roi={target_roi_id or '-'}, "
-                f"reference_roi={reference_roi_id or '-'}, noise_roi={noise_roi_id or '-'}"
-            )
-            result_text = f"Result: Missing inputs ({reason})"
-            self.analysis_results["cnr_preview"].set(f"Preview: {preview_text}")
+            preview_text = "ROI selection required"
+            result_text = "CNR unavailable"
+            self.analysis_results["cnr_preview"].set(preview_text)
             self.analysis_results["cnr_result"].set(result_text)
             cnr_payload["status"] = "missing"
             cnr_payload["reason"] = reason
@@ -7045,11 +7081,8 @@ class DicomViewer:
             assert noise_roi is not None
             noise_metrics = self.compute_measurement(noise_roi, self._get_frame_pixel_array(noise_roi.frame_index))
             noise_std = float((noise_metrics.get("signal_stats") or {}).get("std", 0.0))
-            preview_text = (
-                f"formula=|S_A-S_B|/sigma_o, target={target_roi.id}, reference={reference_roi.id}, "
-                f"noise={noise_roi.id}, numerator={numerator:.4f}, noise_std={noise_std:.4f}"
-            )
-            self.analysis_results["cnr_preview"].set(f"Preview: {preview_text}")
+            preview_text = "Target ROI selected / Reference ROI selected / Noise ROI selected"
+            self.analysis_results["cnr_preview"].set(preview_text)
             denominator = noise_std
             invalid_msg = "Noise ROI 표준편차가 0입니다."
             cnr_payload["noise_std"] = float(noise_std)
@@ -7057,22 +7090,15 @@ class DicomViewer:
             target_std = float((target_metrics.get("signal_stats") or {}).get("std", 0.0))
             reference_std = float((reference_metrics.get("signal_stats") or {}).get("std", 0.0))
             denominator = float(np.sqrt(target_std * target_std + reference_std * reference_std))
-            preview_text = (
-                "formula=|S_A-S_B|/sqrt(sigma_A^2+sigma_B^2), "
-                f"target={target_roi.id}, reference={reference_roi.id}, numerator={numerator:.4f}, "
-                f"target_std={target_std:.4f}, reference_std={reference_std:.4f}"
-            )
-            self.analysis_results["cnr_preview"].set(f"Preview: {preview_text}")
+            preview_text = "Target ROI selected / Reference ROI selected"
+            self.analysis_results["cnr_preview"].set(preview_text)
             invalid_msg = "Region A/Region B 분산 기반 분모가 0입니다."
             cnr_payload["target_std"] = float(target_std)
             cnr_payload["reference_std"] = float(reference_std)
         cnr_payload["preview_text"] = f"Preview: {preview_text}"
         cnr_payload["denominator"] = float(denominator)
         if denominator <= 0:
-            result_text = (
-                "Result: Invalid (denominator <= 0) "
-                f"| target={target_roi.id} | reference={reference_roi.id}"
-            )
+            result_text = "CNR unavailable"
             self.analysis_results["cnr_result"].set(result_text)
             cnr_payload["status"] = "invalid"
             cnr_payload["reason"] = "denominator <= 0"
@@ -7083,7 +7109,7 @@ class DicomViewer:
             messagebox.showwarning("CNR", invalid_msg)
             return
         cnr = numerator / denominator
-        result_text = f"Result: CNR={cnr:.4f} (formula={formula}, numerator={numerator:.4f}, denominator={denominator:.4f})"
+        result_text = f"Target Mean: {target_mean:.2f} | Reference Mean: {reference_mean:.2f} | CNR: {cnr:.2f}"
         self.analysis_results["cnr_result"].set(result_text)
         cnr_payload["status"] = "success"
         cnr_payload["reason"] = ""
