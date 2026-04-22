@@ -52,10 +52,10 @@ def test_group_analysis_rows_for_panel_separates_metric_and_snapshot_sections():
     grouped = DicomViewer._group_analysis_rows_for_panel(rows)
 
     assert grouped[0]["category"] == "SECTION"
-    assert grouped[0]["metric_name"] == "Final Metric Results"
+    assert grouped[0]["metric_name"] == "Results"
     assert grouped[1]["category"] == "METRIC"
     assert grouped[1]["metric_name"] == "SNR"
     assert grouped[2]["category"] == "SECTION"
-    assert grouped[2]["metric_name"] == "ROI Snapshot Stats (Current Frame)"
+    assert grouped[2]["metric_name"] == "ROI Stats"
     assert grouped[3]["category"] == "ROI_SNAPSHOT"
     assert grouped[3]["metric_name"] == "ROI_STATS"
