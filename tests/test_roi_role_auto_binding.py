@@ -218,3 +218,50 @@ def test_cnr_button_enabled_with_manual_selection_even_without_roles():
     viewer._update_analysis_action_button_state()
 
     assert viewer._analysis_action_buttons["cnr"].state == "normal"
+
+
+def test_selector_change_syncs_label_to_analysis_input_ids():
+    viewer = _build_viewer()
+    signal = _add_roi(viewer, "roi_signal_manual_evt", (1, 1), (5, 5), role=None)
+    noise = _add_roi(viewer, "roi_noise_manual_evt", (5, 1), (9, 5), role=None)
+    target = _add_roi(viewer, "roi_target_manual_evt", (1, 5), (5, 9), role=None)
+    reference = _add_roi(viewer, "roi_reference_manual_evt", (5, 5), (9, 9), role=None)
+
+    signal_label = "Signal ROI"
+    noise_label = "Noise ROI"
+    target_label = "Target ROI"
+    reference_label = "Reference ROI"
+    viewer._analysis_option_maps["roi"] = {
+        signal_label: signal.id,
+        noise_label: noise.id,
+        target_label: target.id,
+        reference_label: reference.id,
+    }
+    viewer._analysis_comboboxes = {
+        "snr_signal": DummyCombobox(signal_label),
+        "snr_noise": DummyCombobox(noise_label),
+        "cnr_target": DummyCombobox(target_label),
+        "cnr_reference": DummyCombobox(reference_label),
+        "cnr_noise": DummyCombobox(noise_label),
+    }
+
+    viewer._on_analysis_selector_changed()
+
+    assert viewer.analysis_inputs["snr_signal_roi_id"].get() == signal.id
+    assert viewer.analysis_inputs["snr_background_roi_id"].get() == noise.id
+    assert viewer.analysis_inputs["cnr_target_roi_id"].get() == target.id
+    assert viewer.analysis_inputs["cnr_reference_roi_id"].get() == reference.id
+    assert viewer.analysis_inputs["cnr_noise_roi_id"].get() == noise.id
+
+
+def test_sync_analysis_display_value_keeps_valid_label_when_input_id_empty():
+    viewer = _build_viewer()
+    signal = _add_roi(viewer, "roi_signal_label_keep", (1, 1), (5, 5), role=None)
+    signal_label = "Signal Label Keep"
+    viewer._analysis_option_maps["roi"] = {signal_label: signal.id}
+    viewer._analysis_comboboxes = {"snr_signal": DummyCombobox(signal_label)}
+    viewer.analysis_inputs["snr_signal_roi_id"].set("")
+
+    viewer._sync_analysis_display_value("roi", "snr_signal", "snr_signal_roi_id")
+
+    assert viewer._analysis_comboboxes["snr_signal"].get() == signal_label
