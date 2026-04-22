@@ -4741,9 +4741,15 @@ class DicomViewer:
         roi_cells_w, roi_cells_h = self._get_grid_roi_size_cells()
         x0 = int(np.clip(col * cell_size_px, 0, max(width - 1, 0)))
         y0 = int(np.clip(row * cell_size_px, 0, max(height - 1, 0)))
-        x1 = int(np.clip(x0 + (cell_size_px * roi_cells_w), 0, max(width - 1, 0)))
-        y1 = int(np.clip(y0 + (cell_size_px * roi_cells_h), 0, max(height - 1, 0)))
-        measurement = self._append_persistent_measurement("roi", (x0, y0), (x1, y1), extra_meta={"roi_type": "grid"})
+        x1 = int(np.clip(x0 + (cell_size_px * roi_cells_w), 0, width))
+        y1 = int(np.clip(y0 + (cell_size_px * roi_cells_h), 0, height))
+        measurement = self._append_persistent_measurement(
+            "roi",
+            (x0, y0),
+            (x1, y1),
+            extra_meta={"roi_type": "grid"},
+            roi_bounds_exclusive=True,
+        )
         if measurement is None:
             return None
         measurement.meta["grid_cell"] = {"row": int(row), "col": int(col)}
@@ -4761,6 +4767,56 @@ class DicomViewer:
         min_val = float(np.min(roi_array))
         max_val = float(np.max(roi_array))
         return {"mean": mean_val, "std": std_val, "min": min_val, "max": max_val}
+
+    @staticmethod
+    def _normalize_roi_bounds(
+        image_shape: tuple[int, ...],
+        start: tuple[int | float, int | float],
+        end: tuple[int | float, int | float],
+        ensure_non_empty: bool = True,
+    ) -> tuple[int, int, int, int]:
+        if len(image_shape) < 2:
+            return 0, 0, 0, 0
+        height = int(image_shape[0])
+        width = int(image_shape[1])
+        if width <= 0 or height <= 0:
+            return 0, 0, 0, 0
+        x0_raw = min(int(round(start[0])), int(round(end[0])))
+        y0_raw = min(int(round(start[1])), int(round(end[1])))
+        x1_raw = max(int(round(start[0])), int(round(end[0])))
+        y1_raw = max(int(round(start[1])), int(round(end[1])))
+        x0 = int(np.clip(x0_raw, 0, width))
+        y0 = int(np.clip(y0_raw, 0, height))
+        x1 = int(np.clip(x1_raw, 0, width))
+        y1 = int(np.clip(y1_raw, 0, height))
+        if ensure_non_empty:
+            if x1 <= x0:
+                if x0 >= width:
+                    x0 = max(width - 1, 0)
+                    x1 = width
+                else:
+                    x1 = min(x0 + 1, width)
+            if y1 <= y0:
+                if y0 >= height:
+                    y0 = max(height - 1, 0)
+                    y1 = height
+                else:
+                    y1 = min(y0 + 1, height)
+        return x0, y0, x1, y1
+
+    def _extract_roi_pixels(
+        self,
+        image_array: np.ndarray | None,
+        start: tuple[int | float, int | float],
+        end: tuple[int | float, int | float],
+        ensure_non_empty: bool = True,
+    ) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+        if image_array is None or image_array.ndim < 2:
+            return np.array([]), (0, 0, 0, 0)
+        x0, y0, x1, y1 = self._normalize_roi_bounds(image_array.shape, start, end, ensure_non_empty=ensure_non_empty)
+        if x1 <= x0 or y1 <= y0:
+            return np.array([]), (x0, y0, x1, y1)
+        return image_array[y0:y1, x0:x1], (x0, y0, x1, y1)
 
     @staticmethod
     def _extract_grid_cell_meta(meta: dict[str, Any]) -> dict[str, int] | None:
@@ -4988,16 +5044,8 @@ class DicomViewer:
                     "pixel_count": int(pixel_count),
                 }
             else:
-                height, width = image_array.shape[:2]
-                x0 = int(np.clip(roi_x, 0, max(width - 1, 0)))
-                y0 = int(np.clip(roi_y, 0, max(height - 1, 0)))
-                x1 = int(np.clip(max(start[0], end[0]), 0, max(width - 1, 0)))
-                y1 = int(np.clip(max(start[1], end[1]), 0, max(height - 1, 0)))
-                if x1 <= x0:
-                    x1 = min(x0 + 1, width)
-                if y1 <= y0:
-                    y1 = min(y0 + 1, height)
-                stats = self.compute_roi_statistics(image_array[y0:y1, x0:x1])
+                roi_pixels, (x0, y0, x1, y1) = self._extract_roi_pixels(image_array, measurement.start, measurement.end)
+                stats = self.compute_roi_statistics(roi_pixels)
                 roi_width_px = int(max(x1 - x0, 0))
                 roi_height_px = int(max(y1 - y0, 0))
                 roi_x = int(x0)
@@ -5335,15 +5383,32 @@ class DicomViewer:
         image_start: tuple[int, int],
         image_end: tuple[int, int],
         extra_meta: dict[str, Any] | None = None,
+        roi_bounds_exclusive: bool = False,
     ) -> Measurement | None:
         geometry_key = self._get_current_geometry_key()
         if geometry_key is None:
             return None
+        start_point = (float(image_start[0]), float(image_start[1]))
+        end_point = (float(image_end[0]), float(image_end[1]))
+        if mode == "roi":
+            frame_array = self._get_frame_pixel_array(self.current_frame)
+            if frame_array is None:
+                return None
+            if roi_bounds_exclusive:
+                x0, y0, x1, y1 = self._normalize_roi_bounds(frame_array.shape, image_start, image_end)
+            else:
+                x0_raw = min(int(round(image_start[0])), int(round(image_end[0])))
+                y0_raw = min(int(round(image_start[1])), int(round(image_end[1])))
+                x1_raw = max(int(round(image_start[0])), int(round(image_end[0]))) + 1
+                y1_raw = max(int(round(image_start[1])), int(round(image_end[1]))) + 1
+                x0, y0, x1, y1 = self._normalize_roi_bounds(frame_array.shape, (x0_raw, y0_raw), (x1_raw, y1_raw))
+            start_point = (float(x0), float(y0))
+            end_point = (float(x1), float(y1))
         measurement = Measurement(
             id=str(uuid.uuid4()),
             kind=mode,
-            start=(float(image_start[0]), float(image_start[1])),
-            end=(float(image_end[0]), float(image_end[1])),
+            start=start_point,
+            end=end_point,
             frame_index=int(self.current_frame),
             geometry_key=geometry_key,
             summary_text="",
@@ -5414,8 +5479,8 @@ class DicomViewer:
         return (
             min(x_values) >= 0
             and min(y_values) >= 0
-            and max(x_values) < target_width
-            and max(y_values) < target_height
+            and max(x_values) <= target_width
+            and max(y_values) <= target_height
         )
 
     @staticmethod
@@ -6017,11 +6082,8 @@ class DicomViewer:
             if roi is None:
                 self.image_analysis_results["image_result"].set("Result: Select scope ROI")
                 return
-            x0 = int(max(min(roi.start[0], roi.end[0]), 0))
-            y0 = int(max(min(roi.start[1], roi.end[1]), 0))
-            x1 = int(min(max(roi.start[0], roi.end[0]), min_w - 1))
-            y1 = int(min(max(roi.start[1], roi.end[1]), min_h - 1))
-            if x1 <= x0 or y1 <= y0:
+            roi_pixels, (x0, y0, x1, y1) = self._extract_roi_pixels(reference, roi.start, roi.end, ensure_non_empty=False)
+            if roi_pixels.size == 0 or x1 <= x0 or y1 <= y0:
                 self.image_analysis_results["image_result"].set("Result: Invalid ROI scope")
                 return
             reference = reference[y0:y1, x0:x1]
@@ -6135,15 +6197,7 @@ class DicomViewer:
         frame = self._get_frame_pixel_array(measurement.frame_index)
         if frame is None:
             return None
-        x0, y0 = measurement.start
-        x1, y1 = measurement.end
-        xmin, xmax = sorted((int(round(x0)), int(round(x1))))
-        ymin, ymax = sorted((int(round(y0)), int(round(y1))))
-        xmin = int(np.clip(xmin, 0, frame.shape[1] - 1))
-        xmax = int(np.clip(xmax, 0, frame.shape[1] - 1))
-        ymin = int(np.clip(ymin, 0, frame.shape[0] - 1))
-        ymax = int(np.clip(ymax, 0, frame.shape[0] - 1))
-        roi = frame[ymin : ymax + 1, xmin : xmax + 1]
+        roi, (_x0, _y0, _x1, _y1) = self._extract_roi_pixels(frame, measurement.start, measurement.end, ensure_non_empty=False)
         if roi.size == 0:
             return None
         return RoiStats(
