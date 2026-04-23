@@ -75,7 +75,7 @@ class ResultHistoryEntry:
     measurement_type: str
     target_name: str
     metric: str
-    value: float
+    value: float | None
     unit: str
     note: str
     measurement_mode: str
@@ -84,8 +84,11 @@ class ResultHistoryEntry:
     related_target_ids: list[str] = field(default_factory=list)
     group_id: str = ""
     study_id: str = ""
+    extra_payload: dict[str, Any] | None = None
+    reason_codes: list[str] = field(default_factory=list)
 
     def to_row(self) -> tuple[str, str, str, str, str, str, str, str, str]:
+        value_text = "-" if self.value is None else f"{self.value:.2f}"
         return (
             self.timestamp,
             self.image_name,
@@ -93,7 +96,7 @@ class ResultHistoryEntry:
             self.measurement_type,
             self.target_name,
             self.metric,
-            f"{self.value:.2f}",
+            value_text,
             self.unit,
             self.note,
         )
@@ -156,6 +159,15 @@ class StudySession:
 
 SESSION_SCHEMA_VERSION = "1.0"
 PRESET_SCHEMA_VERSION = "1.0"
+
+MTF_METRIC_MTF50 = "MTF50"
+MTF_METRIC_MTF10 = "MTF10"
+MTF_METRIC_NYQUIST_MTF = "NYQUIST_MTF"
+MTF_METRIC_EDGE_ANGLE_DEG = "EDGE_ANGLE_DEG"
+MTF_METRIC_EDGE_SNR = "EDGE_SNR"
+MTF_METRIC_ROI_WIDTH_MM = "ROI_WIDTH_MM"
+MTF_METRIC_ROI_HEIGHT_MM = "ROI_HEIGHT_MM"
+MTF_METRIC_INVALID = "INVALID"
 
 
 class DicomViewer:
@@ -1432,17 +1444,41 @@ class DicomViewer:
         measurement_type: str,
         target_name: str,
         metric: str,
-        value: float,
+        value: float | None,
         unit: str,
         note: str,
         measurement_mode: str = "",
         target_id: str = "",
         related_target_ids: list[str] | None = None,
+        extra_payload: dict[str, Any] | None = None,
+        reason_codes: list[str] | None = None,
+        group_id: str = "",
+        study_id: str = "",
     ) -> None:
         if not hasattr(self, "result_history_store") or self.result_history_store is None:
             self.result_history_store = ResultHistoryStore()
         context = self._current_history_context()
-        group = self._get_or_create_active_analysis_group(context)
+        requested_group_id = str(group_id or "").strip()
+        if requested_group_id and requested_group_id in getattr(self, "analysis_groups", {}):
+            group = self.analysis_groups[requested_group_id]
+        else:
+            group = self._get_or_create_active_analysis_group(context)
+            if requested_group_id and requested_group_id != group.group_id:
+                group = ImageAnalysisGroup(
+                    group_id=requested_group_id,
+                    study_id=str(study_id or group.study_id),
+                    source_image_path=str(context.get("image_path", "")),
+                    image_name=str(context.get("image_name", "N/A")),
+                    created_at=str(context.get("timestamp", datetime.utcnow().isoformat())),
+                    frame_indices=[int(context.get("frame_index", 0))],
+                )
+                self.analysis_groups[group.group_id] = group
+                if not hasattr(self, "study_sessions") or self.study_sessions is None:
+                    self.study_sessions = {}
+                study = self.study_sessions.get(group.study_id)
+                if study is not None and group.group_id not in study.group_ids:
+                    study.group_ids.append(group.group_id)
+                self.active_group_id = group.group_id
         entry = ResultHistoryEntry(
             entry_id=str(uuid.uuid4()),
             timestamp=context["timestamp"],
@@ -1451,15 +1487,17 @@ class DicomViewer:
             measurement_type=measurement_type,
             target_name=target_name,
             metric=metric,
-            value=float(value),
+            value=(float(value) if isinstance(value, (int, float)) else None),
             unit=unit,
             note=note,
             measurement_mode=measurement_mode or context["measurement_mode"],
             source_image_path=str(context.get("image_path", "")),
             target_id=target_id,
             related_target_ids=list(related_target_ids or []),
-            group_id=group.group_id,
-            study_id=group.study_id,
+            group_id=str(group_id or group.group_id),
+            study_id=str(study_id or group.study_id),
+            extra_payload=dict(extra_payload) if isinstance(extra_payload, dict) else None,
+            reason_codes=[str(code) for code in (reason_codes or [])],
         )
         self.result_history_store.append(entry)
         group.entry_ids.append(entry.entry_id)
@@ -1478,7 +1516,7 @@ class DicomViewer:
             "measurement_type": entry.measurement_type,
             "target_name": entry.target_name,
             "metric": entry.metric,
-            "value": float(entry.value),
+            "value": (float(entry.value) if isinstance(entry.value, (int, float)) else None),
             "unit": entry.unit,
             "note": entry.note,
             "measurement_mode": entry.measurement_mode,
@@ -1487,10 +1525,23 @@ class DicomViewer:
             "related_target_ids": list(entry.related_target_ids),
             "group_id": entry.group_id,
             "study_id": entry.study_id,
+            "extra_payload": dict(entry.extra_payload or {}),
+            "reason_codes": [str(code) for code in (entry.reason_codes or [])],
         }
 
     @staticmethod
     def _deserialize_history_entry(payload: dict[str, Any]) -> ResultHistoryEntry:
+        raw_value = payload.get("value")
+        parsed_value: float | None
+        if isinstance(raw_value, (int, float)):
+            parsed_value = float(raw_value)
+        elif isinstance(raw_value, str) and raw_value.strip():
+            try:
+                parsed_value = float(raw_value)
+            except ValueError:
+                parsed_value = None
+        else:
+            parsed_value = None
         return ResultHistoryEntry(
             entry_id=str(payload.get("entry_id") or uuid.uuid4()),
             timestamp=str(payload.get("timestamp", "")),
@@ -1499,7 +1550,7 @@ class DicomViewer:
             measurement_type=str(payload.get("measurement_type", "")),
             target_name=str(payload.get("target_name", "")),
             metric=str(payload.get("metric", "")),
-            value=float(payload.get("value", 0.0)),
+            value=parsed_value,
             unit=str(payload.get("unit", "")),
             note=str(payload.get("note", "")),
             measurement_mode=str(payload.get("measurement_mode", "unknown")),
@@ -1508,6 +1559,8 @@ class DicomViewer:
             related_target_ids=[str(item) for item in (payload.get("related_target_ids") or [])],
             group_id=str(payload.get("group_id", "")),
             study_id=str(payload.get("study_id", "")),
+            extra_payload=dict(payload.get("extra_payload") or {}),
+            reason_codes=[str(code) for code in (payload.get("reason_codes") or [])],
         )
 
     def _refresh_result_history_table(self) -> None:
@@ -1543,6 +1596,12 @@ class DicomViewer:
         if normalized.startswith("valleys"):
             return "valleys"
         return None
+
+    @staticmethod
+    def _format_history_value(value: float | None) -> str:
+        if isinstance(value, (int, float)):
+            return f"{float(value):.2f}"
+        return "-"
 
     def group_history_entries(self, rows: list[tuple[int, ResultHistoryEntry]]) -> list[dict[str, Any]]:
         grouped: dict[tuple[str, str, int, str, str], dict[str, Any]] = {}
@@ -1583,7 +1642,7 @@ class DicomViewer:
             payload["store_indices"].append(store_index)
             payload["entry_ids"].append(entry.entry_id)
             bucket = self._metric_bucket_key(entry.metric)
-            value_text = f"{entry.value:.2f}"
+            value_text = self._format_history_value(entry.value)
             if bucket is not None:
                 payload[bucket] = value_text
             elif not payload["metric"]:
@@ -1740,7 +1799,7 @@ class DicomViewer:
                         entry.measurement_type,
                         entry.target_name,
                         entry.metric,
-                        f"{entry.value:.2f}",
+                        self._format_history_value(entry.value),
                         entry.unit,
                         entry.note,
                     ]
@@ -2245,6 +2304,10 @@ class DicomViewer:
         canvas.create_text(12, (top + bottom) / 2, text="ΔIntensity", fill="#374151", angle=90)
 
     def build_history_comparison(self, entries: list[ResultHistoryEntry]) -> dict[str, Any]:
+        comparable_entries = [entry for entry in entries if isinstance(entry.value, (int, float))]
+        if len(comparable_entries) < 2:
+            raise ValueError("at least two numeric history rows are required for comparison")
+        entries = comparable_entries
         baseline = entries[0]
         mixed_metrics = len({entry.metric for entry in entries}) > 1
         values = [float(entry.value) for entry in entries]
@@ -2299,8 +2362,8 @@ class DicomViewer:
                     "difference": difference,
                     "percent_change": self._format_percent_change(float(entry.value), float(baseline.value)),
                     "is_baseline": entry is baseline,
-                    "is_min": abs(entry.value - min_value) < 1e-12,
-                    "is_max": abs(entry.value - max_value) < 1e-12,
+                    "is_min": abs(float(entry.value) - min_value) < 1e-12,
+                    "is_max": abs(float(entry.value) - max_value) < 1e-12,
                     "features": entry_features,
                     "delta_peak_position": delta_peak_pos,
                     "delta_peak_value": delta_peak_value,
@@ -2347,7 +2410,7 @@ class DicomViewer:
                     entry.measurement_type,
                     entry.target_name,
                     entry.metric,
-                    f"{entry.value:.2f}",
+                    self._format_history_value(entry.value),
                     entry.unit,
                     "-" if row["is_baseline"] else f"{row['difference']:.2f}",
                     "-" if row["is_baseline"] else row["percent_change"],
@@ -2479,7 +2542,11 @@ class DicomViewer:
             messagebox.showinfo("Compare", "한 번에 최대 5개까지만 비교할 수 있습니다.")
             return
         entries = [entry for _index, entry in result_entries]
-        comparison = self.build_history_comparison(entries)
+        try:
+            comparison = self.build_history_comparison(entries)
+        except ValueError:
+            messagebox.showwarning("Compare", "숫자 값이 있는 행 2개 이상을 선택하세요.")
+            return
         if comparison["mixed_metrics"]:
             messagebox.showwarning("Compare", "같은 metric 비교를 권장합니다. (혼합 metric 계속 진행)")
         self.render_history_comparison(comparison)
@@ -2488,7 +2555,9 @@ class DicomViewer:
     def _latest_metric_value(entries: list[ResultHistoryEntry], metric_name: str, measurement_type: str) -> float | None:
         for entry in reversed(entries):
             if entry.measurement_type == measurement_type and entry.metric.strip().upper() == metric_name.strip().upper():
-                return float(entry.value)
+                if isinstance(entry.value, (int, float)):
+                    return float(entry.value)
+                return None
         return None
 
     @staticmethod
@@ -3470,6 +3539,131 @@ class DicomViewer:
             measurement_mode="analysis",
             related_target_ids=related_target_ids,
         )
+
+    @staticmethod
+    def _build_mtf_summary_note(mtf_result: dict[str, Any]) -> str:
+        parts: list[str] = []
+        validity = mtf_result.get("calculation_validity")
+        if validity is not None:
+            parts.append(str(validity))
+        iec = mtf_result.get("iec_compliance")
+        if iec is not None:
+            parts.append(f"IEC={iec}")
+        qa_grade = mtf_result.get("qa_grade")
+        if qa_grade:
+            parts.append(f"QA={qa_grade}")
+        warnings = mtf_result.get("warnings")
+        if isinstance(warnings, list) and warnings:
+            compact_warnings = [str(item) for item in warnings if item]
+            if compact_warnings:
+                parts.append(f"warnings={','.join(compact_warnings)}")
+        return " | ".join(parts)
+
+    @staticmethod
+    def _resolve_mtf_frequency_unit(mtf_result: dict[str, Any]) -> str:
+        key_metrics = mtf_result.get("key_mtf_metrics") or {}
+        for key in ("unit", "frequency_unit"):
+            value = key_metrics.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for key in ("frequency_unit", "unit"):
+            value = mtf_result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return "lp/mm"
+
+    @staticmethod
+    def _extract_mtf_roi_size_mm(mtf_result: dict[str, Any]) -> tuple[float | None, float | None]:
+        roi_size = mtf_result.get("roi_size_mm")
+        if isinstance(roi_size, dict):
+            width = roi_size.get("width") if isinstance(roi_size.get("width"), (int, float)) else roi_size.get("w")
+            height = roi_size.get("height") if isinstance(roi_size.get("height"), (int, float)) else roi_size.get("h")
+            return (
+                float(width) if isinstance(width, (int, float)) else None,
+                float(height) if isinstance(height, (int, float)) else None,
+            )
+        if isinstance(roi_size, (list, tuple)) and len(roi_size) >= 2:
+            width = roi_size[0]
+            height = roi_size[1]
+            return (
+                float(width) if isinstance(width, (int, float)) else None,
+                float(height) if isinstance(height, (int, float)) else None,
+            )
+        return None, None
+
+    @staticmethod
+    def _is_mtf_result_invalid(mtf_result: dict[str, Any]) -> bool:
+        validity = str(mtf_result.get("calculation_validity", "")).strip().lower()
+        status = str(mtf_result.get("calculation_status", "")).strip().lower()
+        return validity == "invalid" or status == "reject"
+
+    def append_mtf_result_to_history(self, mtf_result: dict[str, Any], context: dict[str, Any]) -> None:
+        payload = dict(mtf_result or {})
+        run_context = dict(context or {})
+        reason_codes = [str(code) for code in (payload.get("reason_codes") or []) if code]
+        summary_note = self._build_mtf_summary_note(payload)
+        roi_width_mm, roi_height_mm = self._extract_mtf_roi_size_mm(payload)
+        if isinstance(roi_width_mm, (int, float)) and isinstance(roi_height_mm, (int, float)):
+            summary_note = f"{summary_note} | ROI={roi_width_mm:g}x{roi_height_mm:g}mm" if summary_note else f"ROI={roi_width_mm:g}x{roi_height_mm:g}mm"
+        target_name = str(run_context.get("image_id") or "MTF")
+        related_target_ids = [str(run_context.get("roi_id"))] if run_context.get("roi_id") else []
+
+        if self._is_mtf_result_invalid(payload):
+            invalid_note = (
+                f"MTF rejected: calculation_validity={payload.get('calculation_validity', '')}; "
+                f"reason_codes=[{', '.join(reason_codes)}]"
+            )
+            self._append_history_entry(
+                measurement_type="MTF",
+                target_name=target_name,
+                metric=MTF_METRIC_INVALID,
+                value=None,
+                unit="",
+                note=invalid_note,
+                measurement_mode="analysis",
+                target_id=str(run_context.get("roi_id", "")),
+                related_target_ids=related_target_ids,
+                extra_payload=payload,
+                reason_codes=reason_codes,
+                group_id=str(run_context.get("group_id", "")),
+                study_id=str(run_context.get("study_id", "")),
+            )
+            return
+
+        frequency_unit = self._resolve_mtf_frequency_unit(payload)
+        key_metrics = payload.get("key_mtf_metrics") or {}
+        metric_rows = [
+            (MTF_METRIC_MTF50, key_metrics.get("mtf50"), frequency_unit),
+            (MTF_METRIC_MTF10, key_metrics.get("mtf10"), frequency_unit),
+            (MTF_METRIC_NYQUIST_MTF, key_metrics.get("nyquist_mtf"), frequency_unit),
+            (MTF_METRIC_EDGE_ANGLE_DEG, payload.get("edge_angle_deg"), "deg"),
+            (MTF_METRIC_EDGE_SNR, payload.get("edge_snr"), ""),
+            (MTF_METRIC_ROI_WIDTH_MM, roi_width_mm, "mm"),
+            (MTF_METRIC_ROI_HEIGHT_MM, roi_height_mm, "mm"),
+        ]
+        for metric, metric_value, unit in metric_rows:
+            if not isinstance(metric_value, (int, float)):
+                continue
+            self._append_history_entry(
+                measurement_type="MTF",
+                target_name=target_name,
+                metric=metric,
+                value=float(metric_value),
+                unit=unit,
+                note=summary_note,
+                measurement_mode="analysis",
+                target_id=str(run_context.get("roi_id", "")),
+                related_target_ids=related_target_ids,
+                extra_payload=payload,
+                reason_codes=reason_codes,
+                group_id=str(run_context.get("group_id", "")),
+                study_id=str(run_context.get("study_id", "")),
+            )
+
+    def complete_mtf_analysis(self, mtf_result: dict[str, Any], context: dict[str, Any]) -> None:
+        self.analysis_last_run["mtf"] = {"result": dict(mtf_result or {}), "context": dict(context or {})}
+        self.append_mtf_result_to_history(mtf_result, context)
+        self._refresh_analysis_results_panel()
 
     @staticmethod
     def _group_analysis_rows_for_panel(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
