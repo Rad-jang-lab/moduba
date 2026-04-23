@@ -17,6 +17,10 @@ import pydicom
 from PIL import Image, ImageDraw, ImageTk
 from pydicom.errors import InvalidDicomError
 from dicom_loader import DicomLoader
+from mtf_engine import calculate_slanted_edge_mtf
+from mtf_iec_reporting import evaluate_iec_reporting
+from mtf_integrity import evaluate_mtf_integrity
+from mtf_qa_grading import grade_mtf_for_internal_qa
 
 
 @dataclass
@@ -320,6 +324,9 @@ class DicomViewer:
             "uniformity_role_filter": tk.StringVar(value="signal"),
             "uniformity_roi_ids": tk.StringVar(value=""),
             "line_profile_line_id": tk.StringVar(value=""),
+            "mtf_active_roi_id": tk.StringVar(value=""),
+            "mtf_imaging_mode": tk.StringVar(value="general_radiography"),
+            "mtf_operating_mode": tk.StringVar(value="strict_iec"),
         }
         self.signal_analysis_results: dict[str, tk.StringVar] = {
             "snr_preview": tk.StringVar(value="Preview: -"),
@@ -330,6 +337,10 @@ class DicomViewer:
             "uniformity_preview": tk.StringVar(value="Preview: -"),
             "uniformity_result": tk.StringVar(value="Result: -"),
             "line_info": tk.StringVar(value="Line: -"),
+            "mtf_selected_roi_status": tk.StringVar(value="Selected ROI: none"),
+            "mtf_validation_summary": tk.StringVar(value="Validation: bind a rectangular ROI"),
+            "mtf_warning_summary": tk.StringVar(value="Warnings: -"),
+            "mtf_reason_codes": tk.StringVar(value="Reason Codes: -"),
         }
         self.image_analysis_inputs: dict[str, tk.StringVar] = {
             "reference_image_id": tk.StringVar(value=""),
@@ -357,6 +368,9 @@ class DicomViewer:
         self._image_analysis_comboboxes: dict[str, ttk.Combobox] = {}
         self._cnr_noise_widgets: list[tk.Widget] = []
         self._analysis_action_buttons: dict[str, ttk.Button] = {}
+        self._mtf_summary_value_vars: dict[str, tk.StringVar] = {}
+        self._mtf_graph_canvas: tk.Canvas | None = None
+        self._mtf_graph_status_var = tk.StringVar(value="MTF Curve: no result")
         self._uniformity_roi_listbox: tk.Listbox | None = None
         self.analysis_results_table: ttk.Frame | None = None
         self.analysis_results_canvas: tk.Canvas | None = None
@@ -1099,8 +1113,86 @@ class DicomViewer:
         ttk.Button(line_group, text="Export Profile CSV", command=self.export_selected_line_profile_csv).grid(row=6, column=0, sticky="ew", pady=(4, 0))
         ttk.Label(line_group, textvariable=self.snr_workflow_var).grid(row=7, column=0, sticky="w", pady=(2, 0))
 
+        self._build_mtf_analysis_panel(strip)
         self._build_analysis_results_panel(strip)
         self._bind_analysis_selector_events()
+
+    def _build_mtf_analysis_panel(self, strip: ttk.Frame) -> None:
+        panel = ttk.LabelFrame(strip, text="MTF Analysis", padding=(8, 6))
+        panel.pack(side="left", padx=(0, 8), fill="both", expand=True)
+
+        input_group = ttk.LabelFrame(panel, text="Input", padding=(6, 4))
+        input_group.grid(row=0, column=0, sticky="ew")
+        ttk.Label(input_group, textvariable=self.signal_analysis_results["mtf_selected_roi_status"]).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(input_group, text="Imaging Mode").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        imaging_combo = ttk.Combobox(
+            input_group,
+            state="readonly",
+            width=24,
+            textvariable=self.analysis_inputs["mtf_imaging_mode"],
+            values=[
+                "general_radiography | General Radiography",
+                "mammography | Mammography",
+            ],
+        )
+        imaging_combo.grid(row=1, column=1, sticky="ew", pady=(4, 0))
+        ttk.Label(input_group, text="Operating Mode").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        operating_combo = ttk.Combobox(
+            input_group,
+            state="readonly",
+            width=24,
+            textvariable=self.analysis_inputs["mtf_operating_mode"],
+            values=[
+                "strict_iec | Strict IEC",
+                "exploratory_mode | Exploratory",
+            ],
+        )
+        operating_combo.grid(row=2, column=1, sticky="ew", pady=(4, 0))
+        imaging_combo.set("general_radiography | General Radiography")
+        operating_combo.set("strict_iec | Strict IEC")
+        ttk.Button(input_group, text="Use Selected ROI as Edge ROI", command=self._bind_selected_roi_to_mtf).grid(row=3, column=0, sticky="ew", pady=(6, 0), padx=(0, 4))
+        self._analysis_action_buttons["mtf"] = ttk.Button(input_group, text="Run MTF Analysis", command=self._run_mtf_analysis, state="disabled")
+        self._analysis_action_buttons["mtf"].grid(row=3, column=1, sticky="ew", pady=(6, 0))
+        ttk.Button(input_group, text="Show MTF Details", command=self._show_mtf_details).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Label(input_group, textvariable=self.signal_analysis_results["mtf_validation_summary"]).grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        summary_group = ttk.LabelFrame(panel, text="Result Summary", padding=(6, 4))
+        summary_group.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        summary_items = [
+            ("MTF50", "mtf50"),
+            ("MTF10", "mtf10"),
+            ("Nyquist MTF", "nyquist_mtf"),
+            ("Edge Angle", "edge_angle"),
+            ("Edge SNR", "edge_snr"),
+            ("ROI Width", "roi_width"),
+            ("ROI Height", "roi_height"),
+            ("Calculation Validity", "calculation_validity"),
+            ("IEC Compliance", "iec_compliance"),
+            ("QA Grade", "qa_grade"),
+        ]
+        for row_index, (label, key) in enumerate(summary_items):
+            ttk.Label(summary_group, text=f"{label}:").grid(row=row_index, column=0, sticky="w")
+            var = tk.StringVar(value="-")
+            self._mtf_summary_value_vars[key] = var
+            ttk.Label(summary_group, textvariable=var).grid(row=row_index, column=1, sticky="w", padx=(8, 0))
+
+        warning_group = ttk.LabelFrame(panel, text="Warnings / Validation", padding=(6, 4))
+        warning_group.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(warning_group, textvariable=self.signal_analysis_results["mtf_warning_summary"], justify="left").grid(row=0, column=0, sticky="w")
+        ttk.Label(warning_group, textvariable=self.signal_analysis_results["mtf_reason_codes"], justify="left").grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        graph_group = ttk.LabelFrame(panel, text="Graph", padding=(6, 4))
+        graph_group.grid(row=3, column=0, sticky="nsew", pady=(6, 0))
+        canvas = tk.Canvas(graph_group, width=360, height=180, bg="#FFFFFF", highlightthickness=1, highlightbackground=self.ui_colors["border"])
+        canvas.grid(row=0, column=0, sticky="nsew")
+        self._mtf_graph_canvas = canvas
+        ttk.Label(graph_group, textvariable=self._mtf_graph_status_var).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(graph_group, text="ESF: future-ready").grid(row=2, column=0, sticky="w")
+        ttk.Label(graph_group, text="LSF: future-ready").grid(row=3, column=0, sticky="w")
+        graph_group.grid_columnconfigure(0, weight=1)
+        graph_group.grid_rowconfigure(0, weight=1)
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_rowconfigure(3, weight=1)
 
     def _bind_analysis_selector_events(self) -> None:
         for key in ("snr_signal", "snr_noise", "cnr_target", "cnr_reference", "cnr_noise"):
@@ -1119,6 +1211,13 @@ class DicomViewer:
         self._sync_analysis_input_from_combobox("roi", "cnr_reference", "cnr_reference_roi_id")
         self._sync_analysis_input_from_combobox("roi", "cnr_noise", "cnr_noise_roi_id")
         self._update_analysis_action_button_state()
+
+    @staticmethod
+    def _parse_prefixed_value(raw_value: str, default: str) -> str:
+        value = str(raw_value or "").strip()
+        if not value:
+            return default
+        return value.split("|", 1)[0].strip()
 
     def _on_line_profile_selection_changed(self, _event: tk.Event | None = None) -> None:
         self._sync_analysis_input_from_combobox("line", "line_profile", "line_profile_line_id")
@@ -2822,6 +2921,7 @@ class DicomViewer:
             for index in selected_indexes:
                 listbox.selection_set(index)
         self._auto_bind_analysis_inputs_from_roles(overwrite_existing=False)
+        self._sync_mtf_roi_binding_state()
         self._update_uniformity_input_ui()
         self._refresh_analysis_results_panel()
         self._refresh_image_analysis_selectors()
@@ -3035,6 +3135,17 @@ class DicomViewer:
             )
             cnr_ready = role_ready or manual_ready
             cnr_button.configure(state="normal" if cnr_ready else "disabled")
+        mtf_button = action_buttons.get("mtf")
+        if mtf_button is not None:
+            mtf_active_var = self.analysis_inputs.get("mtf_active_roi_id")
+            mtf_active_id = mtf_active_var.get() if mtf_active_var is not None else ""
+            mtf_roi = self._find_measurement_by_id(mtf_active_id, expected_kind="roi")
+            mtf_ready = mtf_roi is not None and self._is_analysis_compatible_measurement(mtf_roi)
+            mtf_button.configure(state="normal" if mtf_ready else "disabled")
+            if mtf_ready:
+                self.analysis_results["mtf_validation_summary"].set("Validation: ready")
+            else:
+                self.analysis_results["mtf_validation_summary"].set("Validation: select and bind a rectangular ROI")
 
     def _auto_bind_analysis_inputs_from_roles(self, overwrite_existing: bool = False) -> None:
         role_assignment = {
@@ -3129,6 +3240,231 @@ class DicomViewer:
         if not roi_id:
             return self._format_roi_label(0)
         return self._build_roi_display_name_map().get(roi_id, self._format_roi_label(0))
+
+    def _sync_mtf_roi_binding_state(self) -> None:
+        mtf_active_var = self.analysis_inputs.get("mtf_active_roi_id")
+        if mtf_active_var is None:
+            return
+        roi_id = mtf_active_var.get().strip()
+        measurement = self._find_measurement_by_id(roi_id, expected_kind="roi") if roi_id else None
+        if measurement is None:
+            mtf_active_var.set("")
+            self.analysis_results["mtf_selected_roi_status"].set("Selected ROI: none")
+        else:
+            self.analysis_results["mtf_selected_roi_status"].set(
+                f"Selected ROI: {self._display_name_for_roi_id(measurement.id)} ({measurement.id[:8]})"
+            )
+
+    def _bind_selected_roi_to_mtf(self) -> None:
+        selected_id = str(self.selected_persistent_measurement_id or "").strip()
+        if not selected_id:
+            self.analysis_results["mtf_validation_summary"].set("Validation: no ROI selected")
+            messagebox.showinfo("MTF Analysis", "선택된 ROI가 없습니다.")
+            return
+        measurement = self._find_measurement_by_id(selected_id)
+        if measurement is None:
+            self.analysis_results["mtf_validation_summary"].set("Validation: selected object no longer exists")
+            return
+        if measurement.kind != "roi":
+            self.analysis_results["mtf_validation_summary"].set("Validation: MTF requires rectangular ROI")
+            messagebox.showwarning("MTF Analysis", "MTF는 사각형 ROI만 사용할 수 있습니다.")
+            return
+        mtf_active_var = self.analysis_inputs.get("mtf_active_roi_id")
+        if mtf_active_var is None:
+            return
+        mtf_active_var.set(measurement.id)
+        self._sync_mtf_roi_binding_state()
+        self._update_analysis_action_button_state()
+
+    def _build_mtf_run_context(self, measurement: Measurement) -> dict[str, Any]:
+        image_id = self.path_var.get().strip() if hasattr(self, "path_var") else ""
+        return {
+            "image_id": image_id or "current_image",
+            "frame_index": int(self.current_frame),
+            "roi_id": measurement.id,
+            "group_id": self.active_group_id,
+            "study_id": self.active_study_id,
+        }
+
+    def _run_mtf_analysis(self) -> None:
+        mtf_active_var = self.analysis_inputs.get("mtf_active_roi_id")
+        roi_id = mtf_active_var.get().strip() if mtf_active_var is not None else ""
+        measurement = self._find_measurement_by_id(roi_id, expected_kind="roi") if roi_id else None
+        if measurement is None:
+            self.analysis_results["mtf_validation_summary"].set("Validation: no bound ROI")
+            messagebox.showinfo("MTF Analysis", "먼저 사각형 ROI를 선택하고 바인딩하세요.")
+            return
+        frame = self._get_frame_pixel_array(measurement.frame_index)
+        roi_pixels, bounds = self._extract_roi_pixels(frame, measurement.start, measurement.end, ensure_non_empty=True)
+        if roi_pixels.size == 0:
+            self.analysis_results["mtf_validation_summary"].set("Validation: ROI pixels unavailable")
+            messagebox.showwarning("MTF Analysis", "ROI 픽셀을 추출할 수 없습니다.")
+            return
+        imaging_mode = self._parse_prefixed_value(self.analysis_inputs["mtf_imaging_mode"].get(), "general_radiography")
+        operating_mode = self._parse_prefixed_value(self.analysis_inputs["mtf_operating_mode"].get(), "strict_iec")
+        mtf_result = self._execute_mtf_pipeline(roi_pixels, bounds, imaging_mode, operating_mode)
+        context = self._build_mtf_run_context(measurement)
+        self.complete_mtf_analysis(mtf_result, context)
+        self._update_mtf_analysis_ui(mtf_result)
+        self._update_analysis_action_button_state()
+
+    def _estimate_edge_snr_for_roi(self, roi_pixels: np.ndarray) -> float | None:
+        if roi_pixels.size == 0:
+            return None
+        p10 = float(np.percentile(roi_pixels, 10))
+        p90 = float(np.percentile(roi_pixels, 90))
+        noise = float(np.std(roi_pixels))
+        if noise <= 0:
+            return None
+        return abs(p90 - p10) / noise
+
+    def _execute_mtf_pipeline(
+        self,
+        roi_pixels: np.ndarray,
+        bounds: tuple[int, int, int, int],
+        imaging_mode: str,
+        operating_mode: str,
+    ) -> dict[str, Any]:
+        phase1 = calculate_slanted_edge_mtf(roi_pixels)
+        edge_snr = self._estimate_edge_snr_for_roi(roi_pixels)
+        phase2 = evaluate_mtf_integrity(phase1, edge_snr=edge_snr, clipping_detected=False)
+        phase3 = grade_mtf_for_internal_qa(phase1, phase2)
+        spacing = self._get_pixel_spacing_mm()
+        roi_width_px = max(bounds[2] - bounds[0], 0)
+        roi_height_px = max(bounds[3] - bounds[1], 0)
+        roi_width_mm = float(roi_width_px * spacing[1]) if spacing is not None else None
+        roi_height_mm = float(roi_height_px * spacing[0]) if spacing is not None else None
+        phase4 = evaluate_iec_reporting(
+            {
+                "iec_reporting_requested": True,
+                "imaging_mode": imaging_mode,
+                "operating_mode": operating_mode,
+                "linearity_status": "raw",
+                "calculation_status": phase1.get("calculation_status"),
+                "calculation_validity": phase1.get("calculation_status") == "pass",
+                "edge_angle_deg": phase1.get("edge_angle_deg"),
+                "averaging_method": "esf",
+                "pixel_spacing_available": spacing is not None,
+                "roi_size_mm": {"width_mm": roi_width_mm, "height_mm": roi_height_mm},
+                "reason_codes": phase2.get("reason_codes", []),
+            }
+        )
+        key_metrics = {
+            "mtf50": phase1.get("mtf50"),
+            "mtf10": phase1.get("mtf10"),
+            "nyquist_mtf": self._lookup_nyquist_mtf(phase1.get("mtf_curve") or {}),
+            "frequency_unit": "cy/pixel",
+        }
+        result = {
+            "calculation_status": phase1.get("calculation_status", "reject"),
+            "calculation_validity": "valid" if phase1.get("calculation_status") == "pass" else "invalid",
+            "rejection_reason": phase1.get("rejection_reason"),
+            "edge_angle_deg": phase1.get("edge_angle_deg"),
+            "edge_snr": edge_snr,
+            "mtf_curve": phase1.get("mtf_curve") or {},
+            "key_mtf_metrics": key_metrics,
+            "warnings": phase2.get("warnings") or [],
+            "reason_codes": phase2.get("reason_codes") or [],
+            "qa_grade": phase3.get("qa_grade"),
+            "qa_status_summary": phase3.get("qa_status_summary"),
+            "iec_compliance": phase4.get("iec_reporting_status"),
+            "validation_summary": phase4.get("iec_reporting_summary"),
+            "roi_size_mm": {"width": roi_width_mm, "height": roi_height_mm},
+        }
+        if result["calculation_status"] != "pass":
+            result["reason_codes"] = list(dict.fromkeys((result["reason_codes"] or []) + ["PHASE1_REJECT"]))
+            if result.get("rejection_reason"):
+                result["warnings"] = list(dict.fromkeys((result.get("warnings") or []) + [str(result["rejection_reason"])]))
+        return result
+
+    @staticmethod
+    def _lookup_nyquist_mtf(mtf_curve: dict[str, Any]) -> float | None:
+        freqs = np.asarray(mtf_curve.get("frequency_cy_per_pixel", []), dtype=np.float64)
+        mtf = np.asarray(mtf_curve.get("mtf", []), dtype=np.float64)
+        if freqs.size == 0 or mtf.size == 0 or freqs.size != mtf.size:
+            return None
+        idx = int(np.argmin(np.abs(freqs - 0.5)))
+        value = mtf[idx]
+        return float(value) if np.isfinite(value) else None
+
+    def _update_mtf_analysis_ui(self, mtf_result: dict[str, Any]) -> None:
+        if not getattr(self, "_mtf_summary_value_vars", None):
+            return
+        key_metrics = mtf_result.get("key_mtf_metrics") or {}
+        invalid = self._is_mtf_result_invalid(mtf_result)
+        def _fmt(value: Any, suffix: str = "") -> str:
+            if isinstance(value, (int, float)):
+                return f"{float(value):.4f}{suffix}"
+            return "-"
+        if invalid:
+            for var in self._mtf_summary_value_vars.values():
+                var.set("-")
+            self._mtf_summary_value_vars["calculation_validity"].set(str(mtf_result.get("calculation_validity", "invalid")))
+            self._mtf_summary_value_vars["iec_compliance"].set(str(mtf_result.get("iec_compliance", "-")))
+            self.analysis_results["mtf_validation_summary"].set(str(mtf_result.get("validation_summary") or mtf_result.get("rejection_reason") or "Rejected"))
+        else:
+            self._mtf_summary_value_vars["mtf50"].set(_fmt(key_metrics.get("mtf50")))
+            self._mtf_summary_value_vars["mtf10"].set(_fmt(key_metrics.get("mtf10")))
+            self._mtf_summary_value_vars["nyquist_mtf"].set(_fmt(key_metrics.get("nyquist_mtf")))
+            self._mtf_summary_value_vars["edge_angle"].set(_fmt(mtf_result.get("edge_angle_deg"), " deg"))
+            self._mtf_summary_value_vars["edge_snr"].set(_fmt(mtf_result.get("edge_snr")))
+            roi_size = mtf_result.get("roi_size_mm") or {}
+            self._mtf_summary_value_vars["roi_width"].set(_fmt(roi_size.get("width"), " mm"))
+            self._mtf_summary_value_vars["roi_height"].set(_fmt(roi_size.get("height"), " mm"))
+            self._mtf_summary_value_vars["calculation_validity"].set(str(mtf_result.get("calculation_validity", "-")))
+            self._mtf_summary_value_vars["iec_compliance"].set(str(mtf_result.get("iec_compliance", "-")))
+            self._mtf_summary_value_vars["qa_grade"].set(str(mtf_result.get("qa_grade", "-")))
+            self.analysis_results["mtf_validation_summary"].set(str(mtf_result.get("validation_summary", "Validation: -")))
+        warnings = mtf_result.get("warnings") or []
+        reason_codes = mtf_result.get("reason_codes") or []
+        self.analysis_results["mtf_warning_summary"].set(f"Warnings: {', '.join(str(item) for item in warnings) if warnings else '-'}")
+        self.analysis_results["mtf_reason_codes"].set(f"Reason Codes: {', '.join(str(item) for item in reason_codes) if reason_codes else '-'}")
+        self._render_mtf_curve(mtf_result.get("mtf_curve") or {})
+
+    def _render_mtf_curve(self, mtf_curve: dict[str, Any]) -> None:
+        canvas = self._mtf_graph_canvas
+        if canvas is None:
+            return
+        canvas.delete("all")
+        width = int(canvas.winfo_width() or 360)
+        height = int(canvas.winfo_height() or 180)
+        pad_l, pad_r, pad_t, pad_b = 34, 10, 10, 26
+        plot_w = max(width - pad_l - pad_r, 20)
+        plot_h = max(height - pad_t - pad_b, 20)
+        canvas.create_rectangle(pad_l, pad_t, pad_l + plot_w, pad_t + plot_h, outline="#CBD5E1")
+        canvas.create_line(pad_l, pad_t + plot_h, pad_l + plot_w, pad_t + plot_h, fill="#64748B")
+        canvas.create_line(pad_l, pad_t, pad_l, pad_t + plot_h, fill="#64748B")
+        freqs = np.asarray(mtf_curve.get("frequency_cy_per_pixel", []), dtype=np.float64)
+        mtf = np.asarray(mtf_curve.get("mtf", []), dtype=np.float64)
+        if freqs.size < 2 or mtf.size < 2 or freqs.size != mtf.size:
+            self._mtf_graph_status_var.set("MTF Curve: unavailable")
+            return
+        finite = np.isfinite(freqs) & np.isfinite(mtf)
+        freqs = freqs[finite]
+        mtf = mtf[finite]
+        if freqs.size < 2:
+            self._mtf_graph_status_var.set("MTF Curve: unavailable")
+            return
+        xmax = float(np.max(freqs))
+        xmax = xmax if xmax > 0 else 1.0
+        mtf = np.clip(mtf, 0.0, 1.2)
+        points: list[float] = []
+        for x, y in zip(freqs, mtf):
+            px = pad_l + (float(x) / xmax) * plot_w
+            py = pad_t + plot_h - (float(y) / 1.2) * plot_h
+            points.extend([px, py])
+        if len(points) >= 4:
+            canvas.create_line(*points, fill="#0A84FF", width=2, smooth=True)
+        canvas.create_text(pad_l + plot_w / 2, height - 10, text="Frequency (cy/pixel)", fill="#334155")
+        canvas.create_text(12, pad_t + plot_h / 2, text="MTF", fill="#334155", angle=90)
+        self._mtf_graph_status_var.set(f"MTF Curve: {freqs.size} points")
+
+    def _show_mtf_details(self) -> None:
+        mtf_payload = (self.analysis_last_run.get("mtf") or {}).get("result")
+        if not mtf_payload:
+            messagebox.showinfo("MTF Analysis", "MTF 실행 결과가 없습니다.")
+            return
+        messagebox.showinfo("MTF Details", json.dumps(mtf_payload, indent=2, ensure_ascii=False))
 
     def _sanitize_ui_text(self, text: str) -> str:
         if not text:
@@ -3397,6 +3733,33 @@ class DicomViewer:
                     "developer_meta": line,
                 }
             )
+        mtf = self.analysis_last_run.get("mtf")
+        if mtf is not None:
+            result = dict(mtf.get("result") or {})
+            key_metrics = dict(result.get("key_mtf_metrics") or {})
+            metric_value = key_metrics.get("mtf50")
+            status_text = str(result.get("calculation_validity", result.get("calculation_status", "")))
+            reason_codes = ", ".join(str(item) for item in (result.get("reason_codes") or []))
+            rows.append(
+                {
+                    "metric_name": "MTF",
+                    "formula_mode": f"slanted_edge [{status_text}]",
+                    "roi_ids": [str((mtf.get('context') or {}).get("roi_id", ""))],
+                    "roles": [],
+                    "stats": {
+                        "mtf50": key_metrics.get("mtf50"),
+                        "mtf10": key_metrics.get("mtf10"),
+                        "nyquist_mtf": key_metrics.get("nyquist_mtf"),
+                        "edge_angle_deg": result.get("edge_angle_deg"),
+                        "edge_snr": result.get("edge_snr"),
+                    },
+                    "result_value": float(metric_value) if isinstance(metric_value, (int, float)) else None,
+                    "item_name": "MTF",
+                    "note_text": f"Validity={status_text}; reason_codes=[{reason_codes}]",
+                    "result_text": f"{float(metric_value):.4f}" if isinstance(metric_value, (int, float)) else status_text,
+                    "developer_meta": mtf,
+                }
+            )
         return rows
 
     def _build_analysis_result_rows(self) -> list[dict[str, Any]]:
@@ -3663,6 +4026,7 @@ class DicomViewer:
     def complete_mtf_analysis(self, mtf_result: dict[str, Any], context: dict[str, Any]) -> None:
         self.analysis_last_run["mtf"] = {"result": dict(mtf_result or {}), "context": dict(context or {})}
         self.append_mtf_result_to_history(mtf_result, context)
+        self._update_mtf_analysis_ui(dict(mtf_result or {}))
         self._refresh_analysis_results_panel()
 
     @staticmethod
