@@ -357,8 +357,6 @@ class DicomViewer:
         self.study_sessions: dict[str, StudySession] = {}
         self.active_study_id: str = ""
         self.active_group_id: str = ""
-        self._collapsed_study_ids: set[str] = set()
-        self._collapsed_group_ids: set[str] = set()
         self._history_row_meta_by_item_id: dict[str, dict[str, Any]] = {}
         self.history_metric_filter_var = tk.StringVar(value="All")
         self.history_search_var = tk.StringVar(value="")
@@ -1298,9 +1296,6 @@ class DicomViewer:
             tree.column(key, width=widths[key], anchor="w")
         tree.grid(row=1, column=0, columnspan=5, sticky="nsew")
         tree.bind("<<TreeviewSelect>>", self._on_history_row_selected, add="+")
-        tree.bind("<Double-1>", self._on_history_row_double_click, add="+")
-        tree.tag_configure("study_row", background="#F8FAFC")
-        tree.tag_configure("group_row", background="#F9FAFB")
         scrollbar = ttk.Scrollbar(panel, orient="vertical", command=tree.yview)
         scrollbar.grid(row=1, column=5, sticky="ns")
         tree.configure(yscrollcommand=scrollbar.set)
@@ -1521,8 +1516,8 @@ class DicomViewer:
             return
         selected_type = self.history_metric_filter_var.get().strip() if hasattr(self, "history_metric_filter_var") else "All"
         search_text = self.history_search_var.get() if hasattr(self, "history_search_var") else ""
-        grouped_rows = self.build_grouped_history_view(selected_type, search_text)
-        self.render_grouped_history_table(grouped_rows)
+        history_rows = self.build_flat_history_view(selected_type, search_text)
+        self.render_flat_history_table(history_rows)
         self._restore_history_selection()
         self._update_history_compare_button_state()
 
@@ -1604,7 +1599,7 @@ class DicomViewer:
             reverse=True,
         )
 
-    def build_grouped_history_view(self, measurement_type: str = "All", search_text: str = "") -> list[dict[str, Any]]:
+    def build_flat_history_view(self, measurement_type: str = "All", search_text: str = "") -> list[dict[str, Any]]:
         raw_rows = self.result_history_store.filtered_entries(measurement_type, "")
         grouped_rows = self.group_history_entries(raw_rows)
         query = search_text.strip().lower()
@@ -1622,128 +1617,14 @@ class DicomViewer:
             if (not query) or (query in haystack):
                 enriched = dict(row)
                 enriched["row_type"] = "result"
-                enriched["level"] = 2
+                primary_entry = enriched.get("primary_entry")
+                if isinstance(primary_entry, ResultHistoryEntry):
+                    enriched["study_id"] = str(primary_entry.study_id or "")
+                    enriched["group_id"] = str(primary_entry.group_id or "")
                 filtered_rows.append(enriched)
+        return filtered_rows
 
-        study_map = getattr(self, "study_sessions", {}) or {}
-        group_map = getattr(self, "analysis_groups", {}) or {}
-        collapsed_studies = getattr(self, "_collapsed_study_ids", set())
-        collapsed_groups = getattr(self, "_collapsed_group_ids", set())
-        default_study = self._ensure_default_study_session()
-        rows_by_study_group: dict[str, dict[str, list[dict[str, Any]]]] = {}
-        legacy_groups: dict[str, ImageAnalysisGroup] = {}
-        for row in filtered_rows:
-            primary_entry = row.get("primary_entry")
-            if not isinstance(primary_entry, ResultHistoryEntry):
-                continue
-            study_id = str(primary_entry.study_id or default_study.study_id)
-            group_id = str(primary_entry.group_id or "")
-            if not group_id:
-                legacy_key = f"{primary_entry.source_image_path}|{primary_entry.image_name}|{primary_entry.frame_index}"
-                if legacy_key not in legacy_groups:
-                    legacy_groups[legacy_key] = ImageAnalysisGroup(
-                        group_id=f"legacy:{legacy_key}",
-                        study_id=study_id,
-                        source_image_path=primary_entry.source_image_path,
-                        image_name=primary_entry.image_name,
-                        created_at=primary_entry.timestamp,
-                        frame_indices=[int(primary_entry.frame_index)],
-                    )
-                group_id = legacy_groups[legacy_key].group_id
-            rows_by_study_group.setdefault(study_id, {}).setdefault(group_id, []).append(row)
-
-        hierarchy_rows: list[dict[str, Any]] = []
-        for study_id, groups in rows_by_study_group.items():
-            study = study_map.get(study_id)
-            study_name = "Default Study" if study is None else study.name
-            study_row = {
-                "row_type": "study",
-                "level": 0,
-                "study_id": study_id,
-                "group_id": "",
-                "timestamp": "",
-                "image_name": "",
-                "frame_index": "",
-                "measurement_type": "Study",
-                "target_name": f"{'▸' if study_id in collapsed_studies else '▾'} {study_name} ({len(groups)} groups)",
-                "metric": "",
-                "value": "",
-                "mean": "",
-                "std": "",
-                "min": "",
-                "max": "",
-                "area": "",
-                "length_px": "",
-                "length_mm": "",
-                "peaks": "",
-                "valleys": "",
-                "unit": "",
-                "note": "",
-                "store_indices": [],
-            }
-            hierarchy_rows.append(study_row)
-            if study_id in collapsed_studies:
-                continue
-            for group_id, result_items in groups.items():
-                group_payload = group_map.get(group_id)
-                if group_payload is None:
-                    group_payload = next((item for item in legacy_groups.values() if item.group_id == group_id), None)
-                image_name = result_items[0].get("image_name", "") if group_payload is None else group_payload.image_name
-                frame_indices = [] if group_payload is None else list(group_payload.frame_indices)
-                if not frame_indices:
-                    frame_indices = sorted({int(item.get("frame_index", 0)) for item in result_items})
-                frame_text = ",".join(str(item) for item in frame_indices[:3])
-                if len(frame_indices) > 3:
-                    frame_text += ",..."
-                created_at = "" if group_payload is None else group_payload.created_at
-                created_at_text = created_at.replace("T", " ")[:19] if created_at else ""
-                roi_source_type = "manual" if group_payload is None else str(group_payload.roi_source_type or "manual")
-                source_group_text = "" if group_payload is None else str(group_payload.propagated_from_group_id or "")
-                source_note = f"source={roi_source_type}"
-                if source_group_text:
-                    source_note += f", from_group={source_group_text[:8]}"
-                group_row = {
-                    "row_type": "group",
-                    "level": 1,
-                    "study_id": study_id,
-                    "group_id": group_id,
-                    "timestamp": created_at_text,
-                    "image_name": image_name,
-                    "frame_index": frame_text,
-                    "measurement_type": "Group",
-                    "target_name": f"│ {'▸' if group_id in collapsed_groups else '▾'} {image_name}",
-                    "metric": "Frame",
-                    "value": frame_text,
-                    "mean": "",
-                    "std": "",
-                    "min": "",
-                    "max": "",
-                    "area": "",
-                    "length_px": "",
-                    "length_mm": "",
-                    "peaks": "",
-                    "valleys": "",
-                    "unit": "",
-                    "note": (
-                        (f"created: {created_at_text} | " if created_at_text else "")
-                        + source_note
-                    ),
-                    "store_indices": [],
-                }
-                hierarchy_rows.append(group_row)
-                if group_id in collapsed_groups:
-                    continue
-                for result_row in result_items:
-                    child = dict(result_row)
-                    child["target_name"] = f"│   └ {child.get('target_name', '')}"
-                    child["row_type"] = "result"
-                    child["level"] = 2
-                    child["study_id"] = study_id
-                    child["group_id"] = group_id
-                    hierarchy_rows.append(child)
-        return hierarchy_rows
-
-    def render_grouped_history_table(self, grouped_rows: list[dict[str, Any]]) -> None:
+    def render_flat_history_table(self, history_rows: list[dict[str, Any]]) -> None:
         table = getattr(self, "result_history_table", None)
         if table is None:
             return
@@ -1752,7 +1633,7 @@ class DicomViewer:
         for item_id in table.get_children():
             table.delete(item_id)
         row_values: list[tuple[str, ...]] = []
-        for row in grouped_rows:
+        for row in history_rows:
             values = (
                 str(row.get("timestamp", "")),
                 str(row.get("image_name", "")),
@@ -1773,14 +1654,8 @@ class DicomViewer:
                 str(row.get("unit", "")),
                 str(row.get("note", "")),
             )
-            tags: tuple[str, ...] = ()
-            row_type = str(row.get("row_type", "result"))
-            if row_type == "study":
-                tags = ("study_row",)
-            elif row_type == "group":
-                tags = ("group_row",)
-            item_id = table.insert("", "end", values=values, tags=tags)
-            self._history_item_to_store_indices[item_id] = list(row.get("store_indices", [])) if row_type == "result" else []
+            item_id = table.insert("", "end", values=values)
+            self._history_item_to_store_indices[item_id] = list(row.get("store_indices", []))
             self._history_row_meta_by_item_id[item_id] = dict(row)
             row_values.append(values)
         self._update_treeview_row_height_for_notes(table, "ResultHistory.Treeview", row_values, note_index=17)
@@ -1872,7 +1747,7 @@ class DicomViewer:
                 )
 
     @staticmethod
-    def _grouped_history_export_columns() -> tuple[str, ...]:
+    def _history_table_export_columns() -> tuple[str, ...]:
         return (
             "Timestamp",
             "ImageName",
@@ -1894,11 +1769,11 @@ class DicomViewer:
             "Note",
         )
 
-    def _write_grouped_result_history_csv(self, path: str, grouped_rows: list[dict[str, Any]]) -> None:
+    def _write_flat_result_history_csv(self, path: str, history_rows: list[dict[str, Any]]) -> None:
         with open(path, "w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
-            writer.writerow(self._grouped_history_export_columns())
-            for row in grouped_rows:
+            writer.writerow(self._history_table_export_columns())
+            for row in history_rows:
                 if str(row.get("row_type", "result")) != "result":
                     continue
                 writer.writerow(
@@ -1932,11 +1807,11 @@ class DicomViewer:
         )
         if not path:
             return
-        grouped_rows = self.build_grouped_history_view(
+        history_rows = self.build_flat_history_view(
             self.history_metric_filter_var.get().strip() if hasattr(self, "history_metric_filter_var") else "All",
             self.history_search_var.get() if hasattr(self, "history_search_var") else "",
         )
-        self._write_grouped_result_history_csv(path, grouped_rows)
+        self._write_flat_result_history_csv(path, history_rows)
         messagebox.showinfo("저장 완료", f"Results History CSV 저장 완료:\n{path}")
 
     def export_selected_result_history_csv(self) -> None:
@@ -1952,28 +1827,28 @@ class DicomViewer:
         if not path:
             return
         selected_indices = {index for index, _entry in selected_rows}
-        grouped_rows = [
+        history_rows = [
             row
-            for row in self.build_grouped_history_view(
+            for row in self.build_flat_history_view(
                 self.history_metric_filter_var.get().strip() if hasattr(self, "history_metric_filter_var") else "All",
                 self.history_search_var.get() if hasattr(self, "history_search_var") else "",
             )
             if selected_indices.intersection(set(row.get("store_indices", [])))
         ]
-        self._write_grouped_result_history_csv(path, grouped_rows)
+        self._write_flat_result_history_csv(path, history_rows)
         messagebox.showinfo("저장 완료", f"선택 행 CSV 저장 완료:\n{path}")
 
     def copy_result_history_to_clipboard(self) -> None:
         selected_rows = self._selected_history_entries()
         selected_indices = {index for index, _entry in selected_rows}
-        grouped_rows = self.build_grouped_history_view(
+        history_rows = self.build_flat_history_view(
             self.history_metric_filter_var.get().strip() if hasattr(self, "history_metric_filter_var") else "All",
             self.history_search_var.get() if hasattr(self, "history_search_var") else "",
         )
         if selected_indices:
-            grouped_rows = [row for row in grouped_rows if selected_indices.intersection(set(row.get("store_indices", [])))]
-        lines = [",".join(self._grouped_history_export_columns())]
-        for row in grouped_rows:
+            history_rows = [row for row in history_rows if selected_indices.intersection(set(row.get("store_indices", [])))]
+        lines = [",".join(self._history_table_export_columns())]
+        for row in history_rows:
             if str(row.get("row_type", "result")) != "result":
                 continue
             values = [
@@ -2022,38 +1897,6 @@ class DicomViewer:
         entry = all_entries[primary_index]
         self.activate_history_entry(entry)
 
-    def _on_history_row_double_click(self, _event: tk.Event | None = None) -> None:
-        table = self.result_history_table
-        if table is None:
-            return
-        focus_item = table.focus()
-        if not focus_item:
-            return
-        row_meta = self._history_row_meta_by_item_id.get(focus_item, {})
-        row_type = str(row_meta.get("row_type", "result"))
-        if not hasattr(self, "_collapsed_study_ids"):
-            self._collapsed_study_ids = set()
-        if not hasattr(self, "_collapsed_group_ids"):
-            self._collapsed_group_ids = set()
-        if row_type == "study":
-            study_id = str(row_meta.get("study_id", ""))
-            if not study_id:
-                return
-            if study_id in self._collapsed_study_ids:
-                self._collapsed_study_ids.discard(study_id)
-            else:
-                self._collapsed_study_ids.add(study_id)
-            self._refresh_result_history_table()
-        elif row_type == "group":
-            group_id = str(row_meta.get("group_id", ""))
-            if not group_id:
-                return
-            if group_id in self._collapsed_group_ids:
-                self._collapsed_group_ids.discard(group_id)
-            else:
-                self._collapsed_group_ids.add(group_id)
-            self._refresh_result_history_table()
-
     def _restore_history_selection(self, selected_entry_ids: list[str] | None = None) -> None:
         table = self.result_history_table
         if table is None:
@@ -2079,31 +1922,11 @@ class DicomViewer:
         button = self.history_compare_button
         if button is None:
             return
-        result_selected_count = len(self._selected_history_entries())
-        group_selected_count = len(self._selected_history_group_rows())
-        selected_count = result_selected_count if result_selected_count >= 2 else group_selected_count
+        selected_count = len(self._selected_history_entries())
         if 2 <= selected_count <= 5:
             button.configure(state="normal")
         else:
             button.configure(state="disabled")
-
-    def _selected_history_group_rows(self) -> list[dict[str, Any]]:
-        table = self.result_history_table
-        if table is None:
-            return []
-        rows: list[dict[str, Any]] = []
-        seen_group_ids: set[str] = set()
-        row_meta_map = getattr(self, "_history_row_meta_by_item_id", {})
-        for item_id in table.selection():
-            meta = row_meta_map.get(item_id, {})
-            if str(meta.get("row_type", "")) != "group":
-                continue
-            group_id = str(meta.get("group_id", ""))
-            if not group_id or group_id in seen_group_ids:
-                continue
-            rows.append(meta)
-            seen_group_ids.add(group_id)
-        return rows
 
     @staticmethod
     def _format_percent_change(current: float, baseline: float) -> str:
@@ -2649,30 +2472,17 @@ class DicomViewer:
         if table is None:
             return
         result_entries = self._selected_history_entries()
-        if len(result_entries) >= 2:
-            if len(result_entries) > 5:
-                messagebox.showinfo("Compare", "한 번에 최대 5개까지만 비교할 수 있습니다.")
-                return
-            entries = [entry for _index, entry in result_entries]
-            comparison = self.build_history_comparison(entries)
-            if comparison["mixed_metrics"]:
-                messagebox.showwarning("Compare", "같은 metric 비교를 권장합니다. (혼합 metric 계속 진행)")
-            self.render_history_comparison(comparison)
-            return
-
-        selected_group_rows = self._selected_history_group_rows()
-        if len(selected_group_rows) < 2:
+        if len(result_entries) < 2:
             messagebox.showinfo("Compare", "비교하려면 2개 이상 선택하세요.")
             return
-        if len(selected_group_rows) > 5:
+        if len(result_entries) > 5:
             messagebox.showinfo("Compare", "한 번에 최대 5개까지만 비교할 수 있습니다.")
             return
-        group_ids = [str(row.get("group_id", "")) for row in selected_group_rows if str(row.get("group_id", ""))]
-        if len(group_ids) < 2:
-            messagebox.showinfo("Compare", "비교 가능한 group을 찾지 못했습니다.")
-            return
-        group_comparison = self.build_group_history_comparison(group_ids)
-        self.render_group_history_comparison(group_comparison)
+        entries = [entry for _index, entry in result_entries]
+        comparison = self.build_history_comparison(entries)
+        if comparison["mixed_metrics"]:
+            messagebox.showwarning("Compare", "같은 metric 비교를 권장합니다. (혼합 metric 계속 진행)")
+        self.render_history_comparison(comparison)
 
     @staticmethod
     def _latest_metric_value(entries: list[ResultHistoryEntry], metric_name: str, measurement_type: str) -> float | None:
@@ -8934,12 +8744,6 @@ class DicomViewer:
         self.study_sessions.clear()
         self.active_study_id = ""
         self.active_group_id = ""
-        if not hasattr(self, "_collapsed_study_ids"):
-            self._collapsed_study_ids = set()
-        if not hasattr(self, "_collapsed_group_ids"):
-            self._collapsed_group_ids = set()
-        self._collapsed_study_ids.clear()
-        self._collapsed_group_ids.clear()
         self._session_compare_state = {"selected_entry_ids": [], "baseline_index": 0}
         self.line_profile_series_cache.clear()
         self.analysis_last_run = {}
