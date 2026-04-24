@@ -4,6 +4,7 @@ import csv
 from dataclasses import dataclass, field
 from datetime import datetime
 import json
+import re
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -16,6 +17,13 @@ import pydicom
 from PIL import Image, ImageDraw, ImageTk
 from pydicom.errors import InvalidDicomError
 from dicom_loader import DicomLoader
+from mtf_engine import calculate_slanted_edge_mtf
+from mtf_iec_reporting import evaluate_iec_reporting
+from mtf_integrity import evaluate_mtf_integrity
+from mtf_qa_grading import grade_mtf_for_internal_qa
+from domain_store import DomainStore
+from window_b_services import AnalysisResultController, HistoryController, SessionController, ReportExportController
+from window_b_manager import WindowBManager
 
 
 @dataclass
@@ -65,7 +73,129 @@ class RectRoi:
     visible: bool = True
 
 
+@dataclass
+class MeasurementDrawProjection:
+    measurement_id: str
+    kind: str
+    start: tuple[float, float]
+    end: tuple[float, float]
+    frame_index: int
+    geometry_key: str
+    role: str | None
+    meta: dict[str, Any]
+    summary_text: str
+    selected: bool = False
+
+
+@dataclass
+class ResultHistoryEntry:
+    entry_id: str
+    timestamp: str
+    image_name: str
+    frame_index: int
+    measurement_type: str
+    target_name: str
+    metric: str
+    value: float | None
+    unit: str
+    note: str
+    measurement_mode: str
+    source_image_path: str = ""
+    target_id: str = ""
+    related_target_ids: list[str] = field(default_factory=list)
+    group_id: str = ""
+    study_id: str = ""
+    extra_payload: dict[str, Any] | None = None
+    reason_codes: list[str] = field(default_factory=list)
+
+    def to_row(self) -> tuple[str, str, str, str, str, str, str, str, str]:
+        value_text = "-" if self.value is None else f"{self.value:.2f}"
+        return (
+            self.timestamp,
+            self.image_name,
+            str(self.frame_index),
+            self.measurement_type,
+            self.target_name,
+            self.metric,
+            value_text,
+            self.unit,
+            self.note,
+        )
+
+
+class ResultHistoryStore:
+    def __init__(self) -> None:
+        self._entries: list[ResultHistoryEntry] = []
+
+    def append(self, entry: ResultHistoryEntry) -> None:
+        self._entries.append(entry)
+
+    def remove_indices(self, indices: list[int]) -> None:
+        for index in sorted(set(indices), reverse=True):
+            if 0 <= index < len(self._entries):
+                self._entries.pop(index)
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+    def entries(self) -> list[ResultHistoryEntry]:
+        return list(self._entries)
+
+    def filtered_entries(self, measurement_type: str = "All", search_text: str = "") -> list[tuple[int, ResultHistoryEntry]]:
+        query = search_text.strip().lower()
+        selected_type = measurement_type.strip()
+        rows: list[tuple[int, ResultHistoryEntry]] = []
+        for index, entry in enumerate(self._entries):
+            if selected_type and selected_type != "All" and entry.measurement_type != selected_type:
+                continue
+            if query:
+                haystack = f"{entry.image_name} {entry.target_name} {entry.metric}".lower()
+                if query not in haystack:
+                    continue
+            rows.append((index, entry))
+        return rows
+
+
+@dataclass
+class ImageAnalysisGroup:
+    group_id: str
+    study_id: str
+    source_image_path: str
+    image_name: str
+    created_at: str
+    entry_ids: list[str] = field(default_factory=list)
+    frame_indices: list[int] = field(default_factory=list)
+    roi_source_type: str = "manual"
+    propagated_from_group_id: str = ""
+    propagated_from_measurement_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class StudySession:
+    study_id: str
+    name: str
+    created_at: str
+    group_ids: list[str] = field(default_factory=list)
+
+
+SESSION_SCHEMA_VERSION = "1.0"
+PRESET_SCHEMA_VERSION = "1.0"
+
+MTF_METRIC_MTF50 = "MTF50"
+MTF_METRIC_MTF10 = "MTF10"
+MTF_METRIC_NYQUIST_MTF = "NYQUIST_MTF"
+MTF_METRIC_EDGE_ANGLE_DEG = "EDGE_ANGLE_DEG"
+MTF_METRIC_EDGE_SNR = "EDGE_SNR"
+MTF_METRIC_ROI_WIDTH_MM = "ROI_WIDTH_MM"
+MTF_METRIC_ROI_HEIGHT_MM = "ROI_HEIGHT_MM"
+MTF_METRIC_INVALID = "INVALID"
+
+
 class DicomViewer:
+    _UUID_PATTERN = re.compile(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    )
+
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("DICOM Viewer")
@@ -116,7 +246,14 @@ class DicomViewer:
         self._active_crop_start: tuple[float, float] | None = None
         self._active_crop_end: tuple[float, float] | None = None
         self._active_crop_item_id: int | None = None
-        self.persistent_measurements: list[Measurement] = []
+        self.domain_store = DomainStore()
+        self._store_image_id = self.domain_store.add_image_context("", "current")
+        self.analysis_result_controller = AnalysisResultController()
+        self.history_controller = HistoryController()
+        self.session_controller = SessionController()
+        self.report_export_controller = ReportExportController()
+        self.window_b_manager = WindowBManager(self.root, self)
+        self.window_b_manager.bind_store_events()
         self.selected_persistent_measurement_id: str | None = None
         self._persistent_canvas_item_to_measurement_id: dict[int, str] = {}
         self.measurement_sets: dict[str, MeasurementSet] = {}
@@ -211,15 +348,23 @@ class DicomViewer:
             "uniformity_role_filter": tk.StringVar(value="signal"),
             "uniformity_roi_ids": tk.StringVar(value=""),
             "line_profile_line_id": tk.StringVar(value=""),
+            "mtf_active_roi_id": tk.StringVar(value=""),
+            "mtf_imaging_mode": tk.StringVar(value="general_radiography"),
+            "mtf_operating_mode": tk.StringVar(value="strict_iec"),
         }
         self.signal_analysis_results: dict[str, tk.StringVar] = {
             "snr_preview": tk.StringVar(value="Preview: -"),
             "snr_result": tk.StringVar(value="Result: -"),
+            "snr_ready_reason": tk.StringVar(value="Ready: 입력 대기"),
             "cnr_preview": tk.StringVar(value="Preview: -"),
             "cnr_result": tk.StringVar(value="Result: -"),
             "uniformity_preview": tk.StringVar(value="Preview: -"),
             "uniformity_result": tk.StringVar(value="Result: -"),
             "line_info": tk.StringVar(value="Line: -"),
+            "mtf_selected_roi_status": tk.StringVar(value="Selected ROI: none"),
+            "mtf_validation_summary": tk.StringVar(value="Validation: bind a rectangular ROI"),
+            "mtf_warning_summary": tk.StringVar(value="Warnings: -"),
+            "mtf_reason_codes": tk.StringVar(value="Reason Codes: -"),
         }
         self.image_analysis_inputs: dict[str, tk.StringVar] = {
             "reference_image_id": tk.StringVar(value=""),
@@ -243,11 +388,45 @@ class DicomViewer:
         }
         self.analysis_last_run: dict[str, dict[str, Any]] = {}
         self._analysis_comboboxes: dict[str, ttk.Combobox] = {}
+        self._analysis_selector_vars: dict[str, tk.StringVar] = {}
         self._image_analysis_comboboxes: dict[str, ttk.Combobox] = {}
         self._cnr_noise_widgets: list[tk.Widget] = []
         self._analysis_action_buttons: dict[str, ttk.Button] = {}
+        self._mtf_summary_value_vars: dict[str, tk.StringVar] = {}
+        self._mtf_graph_canvas: tk.Canvas | None = None
+        self._mtf_esf_canvas: tk.Canvas | None = None
+        self._mtf_lsf_canvas: tk.Canvas | None = None
+        self._mtf_curve_notebook: ttk.Notebook | None = None
+        self._mtf_curve_tabs: dict[str, ttk.Frame] = {}
+        self._mtf_graph_group: ttk.LabelFrame | None = None
+        self._mtf_right_frame: ttk.Frame | None = None
+        self._mtf_notebook: ttk.Notebook | None = None
+        self._mtf_tab: ttk.Frame | None = None
+        self._mtf_graph_redraw_job: str | None = None
+        self._last_mtf_curve_payload: dict[str, Any] = {}
+        self._last_esf_curve_payload: dict[str, Any] = {}
+        self._last_lsf_curve_payload: dict[str, Any] = {}
+        self._mtf_graph_status_var = tk.StringVar(value="MTF Curve: no result")
+        self._mtf_esf_status_var = tk.StringVar(value="ESF: 결과 없음")
+        self._mtf_lsf_status_var = tk.StringVar(value="LSF: 결과 없음")
         self._uniformity_roi_listbox: tk.Listbox | None = None
-        self.analysis_results_table: ttk.Treeview | None = None
+        self._analysis_ui_bindings_initialized = False
+        self.analysis_results_table: ttk.Frame | None = None
+        self.analysis_results_canvas: tk.Canvas | None = None
+        self.analysis_results_rows_container: ttk.Frame | None = None
+        self._analysis_results_row_widgets: list[dict[str, Any]] = []
+        self._analysis_results_selected_index: int | None = None
+        self.result_history_store = ResultHistoryStore()
+        self.result_history_table: ttk.Treeview | None = None
+        self.active_study_id: str = ""
+        self.active_group_id: str = ""
+        self._history_row_meta_by_item_id: dict[str, dict[str, Any]] = {}
+        self.history_metric_filter_var = tk.StringVar(value="All")
+        self.history_search_var = tk.StringVar(value="")
+        self._history_item_to_store_indices: dict[str, list[int]] = {}
+        self.history_compare_button: ttk.Button | None = None
+        self.line_profile_series_cache: dict[str, dict[str, Any]] = {}
+        self._session_compare_state: dict[str, Any] = {"selected_entry_ids": [], "baseline_index": 0}
         self.shortcut_var = tk.StringVar(
             value=(
                 "단축키: F 창맞춤 | 0/Ctrl+0 100% | R W/L 리셋 | "
@@ -283,6 +462,7 @@ class DicomViewer:
         }
         self._configure_ui_styles()
         self._build_ui()
+        self._ensure_default_study_session()
         self.measurement_mode.trace_add("write", self._on_measurement_mode_changed)
         self._on_measurement_mode_changed()
 
@@ -323,6 +503,18 @@ class DicomViewer:
                 ("disabled", "#F3F4F6"),
             ],
             relief=[("pressed", "sunken"), ("!pressed", "raised")],
+        )
+        style.configure(
+            "AnalysisResults.Treeview",
+            rowheight=22,
+            fieldbackground="#FFFFFF",
+            background="#FFFFFF",
+            bordercolor=self.ui_colors["border"],
+        )
+        style.map(
+            "AnalysisResults.Treeview",
+            background=[("selected", "#DCEAFE")],
+            foreground=[("selected", self.ui_colors["text_primary"])],
         )
 
     def _build_ui(self) -> None:
@@ -439,7 +631,7 @@ class DicomViewer:
 
     def _build_toolbar_tabs(self, parent: ttk.Frame) -> None:
         notebook = ttk.Notebook(parent)
-        notebook.pack(fill="x")
+        notebook.pack(fill="both", expand=True)
 
         home_tab = self._add_toolbar_tab(notebook, "HOME")
         image_tab = self._add_toolbar_tab(notebook, "IMAGE")
@@ -461,7 +653,7 @@ class DicomViewer:
 
     def _build_subtoolbar_sections(self, parent: ttk.Frame, section_names: list[str]) -> dict[str, ttk.Frame]:
         wrapper = ttk.Frame(parent)
-        wrapper.pack(fill="x")
+        wrapper.pack(fill="both", expand=True)
         wrapper.columnconfigure(0, weight=1)
 
         selector_row = ttk.Frame(wrapper)
@@ -514,15 +706,18 @@ class DicomViewer:
 
     def _build_grouped_toolbar_strip(self, parent: ttk.Frame) -> ttk.Frame:
         wrapper = ttk.Frame(parent)
-        wrapper.pack(fill="x")
+        wrapper.pack(fill="both", expand=True)
+        wrapper.rowconfigure(0, weight=1)
+        wrapper.rowconfigure(1, weight=0)
         wrapper.columnconfigure(1, weight=1)
         canvas_background = self.ui_colors["bg_surface"]
-        canvas = tk.Canvas(wrapper, height=156, highlightthickness=0, bg=canvas_background, bd=0)
-        canvas.grid(row=0, column=1, sticky="ew")
+        canvas = tk.Canvas(wrapper, highlightthickness=0, bg=canvas_background, bd=0)
+        canvas.grid(row=0, column=1, sticky="nsew")
         canvas.configure(yscrollincrement=16)
+        x_scrollbar = ttk.Scrollbar(wrapper, orient="horizontal", command=canvas.xview)
+        x_scrollbar.grid(row=1, column=1, sticky="ew", pady=(4, 0))
         y_scrollbar = ttk.Scrollbar(wrapper, orient="vertical", command=canvas.yview)
         y_scrollbar.grid(row=0, column=3, sticky="ns", padx=(4, 0))
-        canvas.configure(yscrollcommand=y_scrollbar.set)
         left_button = ttk.Button(
             wrapper,
             text="◀",
@@ -548,12 +743,33 @@ class DicomViewer:
             left_button.configure(state="disabled" if left_start <= 0.001 else "normal")
             right_button.configure(state="disabled" if right_end >= 0.999 else "normal")
 
+        def _on_xscroll(first: str, last: str) -> None:
+            x_scrollbar.set(first, last)
+            _update_nav_buttons()
+
         def _refresh_scroll_region(_event: tk.Event | None = None) -> None:
-            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.update_idletasks()
+            canvas_width = canvas.winfo_width()
+            canvas_height = canvas.winfo_height()
+            strip_width = strip.winfo_reqwidth()
+            strip_height = strip.winfo_reqheight()
+            canvas.itemconfigure(window_id, width=strip_width, height=strip_height)
+            canvas.configure(scrollregion=(0, 0, strip_width, strip_height))
+            requires_horizontal_scroll = strip_width > canvas_width + 1
+            requires_vertical_scroll = strip_height > canvas_height + 1
+            if requires_horizontal_scroll:
+                x_scrollbar.grid()
+            else:
+                x_scrollbar.grid_remove()
+                canvas.xview_moveto(0.0)
+            if requires_vertical_scroll:
+                y_scrollbar.grid()
+            else:
+                y_scrollbar.grid_remove()
+                canvas.yview_moveto(0.0)
             _update_nav_buttons()
 
         def _resize_inner(_event: tk.Event) -> None:
-            canvas.itemconfigure(window_id, height=max(canvas.winfo_height(), strip.winfo_reqheight()))
             _refresh_scroll_region()
 
         def _on_mousewheel(event: tk.Event) -> None:
@@ -588,7 +804,7 @@ class DicomViewer:
                 _bind_wheel(child)
 
         strip.bind("<Map>", lambda _event: _bind_wheel(strip), add="+")
-        canvas.configure(xscrollcommand=lambda _first, _last: _update_nav_buttons())
+        canvas.configure(xscrollcommand=_on_xscroll, yscrollcommand=y_scrollbar.set)
         _update_nav_buttons()
         return strip
 
@@ -636,6 +852,7 @@ class DicomViewer:
         ttk.Button(sections["Output"], text="현재 이미지 저장", command=self.export_current_image).pack(side="left", padx=(8, 0))
         ttk.Button(sections["Output"], text="측정 CSV 저장", command=self.export_measurements_csv).pack(side="left", padx=(8, 0))
         ttk.Button(sections["Output"], text="프레임 일괄 저장", command=self.export_all_frames).pack(side="left", padx=(8, 0))
+        ttk.Button(sections["Output"], text="Open Window B", command=self.open_window_b).pack(side="left", padx=(12, 0))
 
     def _build_image_toolbar(self, tab: ttk.Frame) -> None:
         sections = self._build_subtoolbar_sections(tab, ["File", "Navigate", "Display", "Transform"])
@@ -644,6 +861,10 @@ class DicomViewer:
         self.open_file_button.pack(side="left")
         self.open_folder_button = ttk.Button(sections["File"], text="폴더 열기", command=self.open_folder)
         self.open_folder_button.pack(side="left", padx=(8, 0))
+        ttk.Button(sections["File"], text="Save Session", command=self.save_analysis_session_via_window_b).pack(side="left", padx=(12, 0))
+        ttk.Button(sections["File"], text="Load Session", command=self.load_analysis_session_via_window_b).pack(side="left", padx=(8, 0))
+        ttk.Button(sections["File"], text="Save Preset", command=self.save_measurement_preset).pack(side="left", padx=(12, 0))
+        ttk.Button(sections["File"], text="Load Preset", command=self.load_measurement_preset).pack(side="left", padx=(8, 0))
 
         self.prev_image_button = ttk.Button(sections["Navigate"], text="이전 이미지", command=lambda: self.change_file(-1))
         self.prev_image_button.pack(side="left")
@@ -683,11 +904,6 @@ class DicomViewer:
             )
             button.grid(row=row, column=0, sticky="ew", pady=(0, 4))
             self._draw_tool_buttons[mode] = button
-        ttk.Separator(parent, orient="horizontal").grid(row=4, column=0, sticky="ew", pady=(2, 6))
-        ttk.Label(parent, text="ROI mode").grid(row=5, column=0, sticky="w")
-        ttk.Radiobutton(parent, text="Grid ROI", value="grid", variable=self.roi_draw_mode).grid(row=6, column=0, sticky="w")
-        ttk.Radiobutton(parent, text="Free ROI", value="free", variable=self.roi_draw_mode).grid(row=7, column=0, sticky="w")
-        ttk.Label(parent, text="Grid ON → polygon snap").grid(row=8, column=0, sticky="w", pady=(6, 0))
 
     def _set_measurement_mode(self, mode: str) -> None:
         self.measurement_mode.set(mode)
@@ -708,10 +924,6 @@ class DicomViewer:
 
     def _build_measure_toolbar(self, tab: ttk.Frame) -> None:
         strip = self._build_grouped_toolbar_strip(tab)
-
-        tools_group = ttk.LabelFrame(strip, text="Tools", padding=(8, 6))
-        tools_group.pack(side="left", padx=(0, 8), fill="y")
-        self._build_draw_tool_panel(tools_group)
 
         grid_group = ttk.LabelFrame(strip, text="Grid", padding=(8, 6))
         grid_group.pack(side="left", padx=(0, 8), fill="y")
@@ -752,30 +964,35 @@ class DicomViewer:
         self._sync_grid_spacing_from_mode()
         self._sync_grid_roi_size_from_mode()
 
-        measurement_group = ttk.LabelFrame(strip, text="Measurement", padding=(8, 6))
-        measurement_group.pack(side="left", padx=(0, 8), fill="y")
-        ttk.Label(measurement_group, text="ROI Geometry: X/Y, Width, Height, Area").grid(row=0, column=0, sticky="w")
-        ttk.Label(measurement_group, text="Display: mm first, px second").grid(row=1, column=0, sticky="w", pady=(2, 0))
-        ttk.Button(measurement_group, text="Grid ROI Summary", command=self._show_grid_roi_combined_summary).grid(
-            row=2, column=0, sticky="ew", pady=(6, 0)
-        )
+        roi_tool_group = ttk.LabelFrame(strip, text="ROI Tool", padding=(8, 6))
+        roi_tool_group.pack(side="left", padx=(0, 8), fill="y")
+        self._build_draw_tool_panel(roi_tool_group)
+
+        roi_mode_group = ttk.LabelFrame(strip, text="ROI Mode", padding=(8, 6))
+        roi_mode_group.pack(side="left", padx=(0, 8), fill="both", expand=True)
+        roi_mode_group.columnconfigure(0, weight=1)
+        ttk.Label(roi_mode_group, text="ROI mode").grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(roi_mode_group, text="Grid ROI", value="grid", variable=self.roi_draw_mode).grid(row=1, column=0, sticky="w")
+        ttk.Radiobutton(roi_mode_group, text="Free ROI", value="free", variable=self.roi_draw_mode).grid(row=2, column=0, sticky="w")
+        ttk.Label(roi_mode_group, text="Grid ON → polygon snap").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Separator(roi_mode_group, orient="horizontal").grid(row=4, column=0, sticky="ew", pady=(6, 6))
         ttk.Checkbutton(
-            measurement_group,
+            roi_mode_group,
             text="ROI Propagation",
             variable=self.roi_propagation_enabled,
-        ).grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ).grid(row=5, column=0, sticky="w")
         ttk.Radiobutton(
-            measurement_group,
+            roi_mode_group,
             text="Next frame/image",
             value="next",
             variable=self.roi_propagation_scope,
-        ).grid(row=4, column=0, sticky="w")
+        ).grid(row=6, column=0, sticky="w")
         ttk.Radiobutton(
-            measurement_group,
+            roi_mode_group,
             text="All navigated targets",
             value="all",
             variable=self.roi_propagation_scope,
-        ).grid(row=5, column=0, sticky="w")
+        ).grid(row=7, column=0, sticky="w")
 
         manage_group = ttk.LabelFrame(strip, text="Manage", padding=(8, 6))
         manage_group.pack(side="left", padx=(0, 8), fill="y")
@@ -792,55 +1009,106 @@ class DicomViewer:
         )
 
     def _build_analysis_toolbar(self, tab: ttk.Frame) -> None:
-        analysis_notebook = ttk.Notebook(tab)
-        analysis_notebook.pack(fill="x")
+        history_info = ttk.Frame(tab, padding=(12, 12))
+        history_info.pack(fill="both", expand=True)
+        ttk.Label(
+            history_info,
+            text="Analysis tools are available in Window B.",
+        ).pack(anchor="w")
+        ttk.Button(history_info, text="Open Window B", command=self.open_window_b).pack(anchor="w", pady=(8, 0))
+        ttk.Label(
+            history_info,
+            text="Use Window B for Signal/Image Analysis, Results, History, Session, and Report.",
+        ).pack(anchor="w", pady=(6, 0))
+        self._initialize_analysis_ui_bindings()
 
-        signal_tab = ttk.Frame(analysis_notebook, padding=(4, 4, 4, 4))
-        image_tab = ttk.Frame(analysis_notebook, padding=(4, 4, 4, 4))
-        analysis_notebook.add(signal_tab, text="Signal Analysis")
-        analysis_notebook.add(image_tab, text="Image Analysis")
-
-        signal_strip = self._build_grouped_toolbar_strip(signal_tab)
-        self._build_signal_analysis_toolbar(signal_strip)
-        self._build_image_analysis_toolbar(image_tab)
+    def _initialize_analysis_ui_bindings(self) -> None:
+        if self._analysis_ui_bindings_initialized:
+            return
         self.analysis_inputs["cnr_formula"].trace_add("write", self._update_cnr_formula_ui)
         self.analysis_inputs["uniformity_input_mode"].trace_add("write", self._update_uniformity_input_ui)
         self.image_analysis_inputs["scope_type"].trace_add("write", self._update_image_scope_ui)
+        self._analysis_ui_bindings_initialized = True
         self._update_cnr_formula_ui()
         self._update_uniformity_input_ui()
         self._update_image_scope_ui()
         self._refresh_analysis_selectors()
 
-    def _build_signal_analysis_toolbar(self, strip: ttk.Frame) -> None:
-        snr_group = ttk.LabelFrame(strip, text="SNR", padding=(8, 6))
-        snr_group.pack(side="left", padx=(0, 8), fill="y")
+    def _build_signal_analysis_toolbar(self, parent: ttk.Frame) -> None:
+        for key in ("snr_signal", "snr_noise", "cnr_target", "cnr_reference", "cnr_noise"):
+            self._analysis_selector_vars[key] = tk.StringVar(value="")
+
+        nested_notebook = ttk.Notebook(parent)
+        nested_notebook.pack(fill="both", expand=True)
+        snr_tab = ttk.Frame(nested_notebook, padding=(4, 4, 4, 4))
+        cnr_tab = ttk.Frame(nested_notebook, padding=(4, 4, 4, 4))
+        uniformity_tab = ttk.Frame(nested_notebook, padding=(4, 4, 4, 4))
+        line_profile_tab = ttk.Frame(nested_notebook, padding=(4, 4, 4, 4))
+        mtf_tab = ttk.Frame(nested_notebook, padding=(4, 4, 4, 4))
+        nested_notebook.add(snr_tab, text="SNR")
+        nested_notebook.add(cnr_tab, text="CNR")
+        nested_notebook.add(uniformity_tab, text="Uniformity")
+        nested_notebook.add(line_profile_tab, text="Line Profile")
+        nested_notebook.add(mtf_tab, text="MTF")
+        self._mtf_notebook = nested_notebook
+        self._mtf_tab = mtf_tab
+        nested_notebook.bind("<<NotebookTabChanged>>", self._on_signal_analysis_tab_changed, add="+")
+
+        snr_group = ttk.LabelFrame(snr_tab, text="SNR", padding=(8, 6))
+        snr_group.pack(fill="both", expand=True)
         ttk.Label(snr_group, text="Input: Signal ROI").grid(row=0, column=0, sticky="w")
-        self._analysis_comboboxes["snr_signal"] = ttk.Combobox(snr_group, state="readonly", width=42)
+        self._analysis_comboboxes["snr_signal"] = ttk.Combobox(
+            snr_group,
+            state="readonly",
+            width=42,
+            textvariable=self._analysis_selector_vars["snr_signal"],
+        )
         self._analysis_comboboxes["snr_signal"].grid(row=1, column=0, sticky="ew", pady=(2, 4))
         ttk.Label(snr_group, text="Input: Background ROI").grid(row=2, column=0, sticky="w")
-        self._analysis_comboboxes["snr_noise"] = ttk.Combobox(snr_group, state="readonly", width=42)
+        self._analysis_comboboxes["snr_noise"] = ttk.Combobox(
+            snr_group,
+            state="readonly",
+            width=42,
+            textvariable=self._analysis_selector_vars["snr_noise"],
+        )
         self._analysis_comboboxes["snr_noise"].grid(row=3, column=0, sticky="ew", pady=(2, 4))
         ttk.Label(snr_group, text="Formula: mean(Signal ROI) / std(Background ROI)").grid(row=4, column=0, sticky="w")
         ttk.Label(snr_group, textvariable=self.signal_analysis_results["snr_preview"]).grid(row=5, column=0, sticky="w", pady=(2, 0))
         ttk.Label(snr_group, textvariable=self.signal_analysis_results["snr_result"]).grid(row=6, column=0, sticky="w", pady=(2, 0))
         self._analysis_action_buttons["snr"] = ttk.Button(snr_group, text="Calculate SNR", command=self.calculate_snr_from_inputs)
         self._analysis_action_buttons["snr"].grid(row=7, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(snr_group, textvariable=self.signal_analysis_results["snr_ready_reason"]).grid(row=8, column=0, sticky="w", pady=(2, 0))
 
-        cnr_group = ttk.LabelFrame(strip, text="CNR", padding=(8, 6))
-        cnr_group.pack(side="left", padx=(0, 8), fill="y")
+        cnr_group = ttk.LabelFrame(cnr_tab, text="CNR", padding=(8, 6))
+        cnr_group.pack(fill="both", expand=True)
         formula_cards = ttk.LabelFrame(cnr_group, text="Formula Selection", padding=(6, 4))
         formula_cards.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         ttk.Radiobutton(formula_cards, text="Option A | |S_A - S_B| / sigma_o", value="standard_noise", variable=self.analysis_inputs["cnr_formula"]).grid(row=0, column=0, sticky="w")
         ttk.Radiobutton(formula_cards, text="Option B | |S_A - S_B| / sqrt(sigma_A^2 + sigma_B^2)", value="dual_variance", variable=self.analysis_inputs["cnr_formula"]).grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Label(cnr_group, text="Input: Signal ROI").grid(row=1, column=0, sticky="w")
-        self._analysis_comboboxes["cnr_target"] = ttk.Combobox(cnr_group, state="readonly", width=42)
+        self._analysis_comboboxes["cnr_target"] = ttk.Combobox(
+            cnr_group,
+            state="readonly",
+            width=42,
+            textvariable=self._analysis_selector_vars["cnr_target"],
+        )
         self._analysis_comboboxes["cnr_target"].grid(row=2, column=0, sticky="ew", pady=(2, 4))
         ttk.Label(cnr_group, text="Input: Reference ROI").grid(row=3, column=0, sticky="w")
-        self._analysis_comboboxes["cnr_reference"] = ttk.Combobox(cnr_group, state="readonly", width=42)
+        self._analysis_comboboxes["cnr_reference"] = ttk.Combobox(
+            cnr_group,
+            state="readonly",
+            width=42,
+            textvariable=self._analysis_selector_vars["cnr_reference"],
+        )
         self._analysis_comboboxes["cnr_reference"].grid(row=4, column=0, sticky="ew", pady=(2, 4))
         noise_label = ttk.Label(cnr_group, text="Input: Background ROI")
         noise_label.grid(row=5, column=0, sticky="w")
-        self._analysis_comboboxes["cnr_noise"] = ttk.Combobox(cnr_group, state="readonly", width=42)
+        self._analysis_comboboxes["cnr_noise"] = ttk.Combobox(
+            cnr_group,
+            state="readonly",
+            width=42,
+            textvariable=self._analysis_selector_vars["cnr_noise"],
+        )
         self._analysis_comboboxes["cnr_noise"].grid(row=6, column=0, sticky="ew", pady=(2, 4))
         self._cnr_noise_widgets = [noise_label, self._analysis_comboboxes["cnr_noise"]]
         ttk.Label(cnr_group, textvariable=self.signal_analysis_results["cnr_preview"]).grid(row=7, column=0, sticky="w", pady=(2, 0))
@@ -848,8 +1116,8 @@ class DicomViewer:
         self._analysis_action_buttons["cnr"] = ttk.Button(cnr_group, text="Calculate CNR", command=self.calculate_cnr_from_inputs)
         self._analysis_action_buttons["cnr"].grid(row=9, column=0, sticky="ew", pady=(6, 0))
 
-        uniformity_group = ttk.LabelFrame(strip, text="Uniformity", padding=(8, 6))
-        uniformity_group.pack(side="left", padx=(0, 8), fill="y")
+        uniformity_group = ttk.LabelFrame(uniformity_tab, text="Uniformity", padding=(8, 6))
+        uniformity_group.pack(fill="both", expand=True)
         ttk.Label(uniformity_group, text="Formula").grid(row=0, column=0, sticky="w")
         uniformity_formula_combo = ttk.Combobox(
             uniformity_group,
@@ -886,17 +1154,229 @@ class DicomViewer:
         ttk.Label(uniformity_group, textvariable=self.signal_analysis_results["uniformity_result"]).grid(row=9, column=0, sticky="w", pady=(2, 0))
         ttk.Button(uniformity_group, text="Calculate Uniformity", command=self.calculate_uniformity_from_inputs).grid(row=10, column=0, sticky="ew", pady=(6, 0))
 
-        line_group = ttk.LabelFrame(strip, text="Line Profile", padding=(8, 6))
-        line_group.pack(side="left", padx=(0, 8), fill="y")
+        line_group = ttk.LabelFrame(line_profile_tab, text="Line Profile", padding=(8, 6))
+        line_group.pack(fill="both", expand=True)
         ttk.Label(line_group, text="Input: Profile Line").grid(row=0, column=0, sticky="w")
         self._analysis_comboboxes["line_profile"] = ttk.Combobox(line_group, state="readonly", width=42)
         self._analysis_comboboxes["line_profile"].grid(row=1, column=0, sticky="ew", pady=(2, 4))
         ttk.Label(line_group, text="Formula: intensity(x) sampled along selected line").grid(row=2, column=0, sticky="w")
         ttk.Label(line_group, textvariable=self.signal_analysis_results["line_info"]).grid(row=3, column=0, sticky="w", pady=(2, 0))
         ttk.Button(line_group, text="Show Line Profile", command=self.show_line_profile_for_selected_line).grid(row=4, column=0, sticky="ew", pady=(6, 0))
-        ttk.Label(line_group, textvariable=self.snr_workflow_var).grid(row=5, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(line_group, text="Show Feature Details", command=self.show_line_profile_feature_details).grid(row=5, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(line_group, text="Export Profile CSV", command=self.export_selected_line_profile_csv).grid(row=6, column=0, sticky="ew", pady=(4, 0))
+        ttk.Label(line_group, textvariable=self.snr_workflow_var).grid(row=7, column=0, sticky="w", pady=(2, 0))
 
-        self._build_analysis_results_panel(strip)
+        self._build_mtf_analysis_panel(mtf_tab)
+        if False:  # pragma: no cover - legacy call path retained for auditable deprecation tracking
+            self._build_analysis_results_panel(parent)
+        self._bind_analysis_selector_events()
+
+    def _build_mtf_analysis_panel(self, strip: ttk.Frame) -> None:
+        panel = ttk.LabelFrame(strip, text="MTF Analysis", padding=(8, 6))
+        panel.pack(side="left", padx=(0, 8), fill="both", expand=True)
+
+        left_frame = ttk.Frame(panel)
+        left_frame.grid(row=0, column=0, sticky="nsew")
+        right_frame = ttk.Frame(panel)
+        right_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        self._mtf_right_frame = right_frame
+
+        input_group = ttk.LabelFrame(left_frame, text="Input", padding=(6, 4))
+        input_group.grid(row=0, column=0, sticky="ew")
+        ttk.Label(input_group, textvariable=self.signal_analysis_results["mtf_selected_roi_status"]).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(input_group, text="Imaging Mode").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        imaging_combo = ttk.Combobox(
+            input_group,
+            state="readonly",
+            width=24,
+            textvariable=self.analysis_inputs["mtf_imaging_mode"],
+            values=[
+                "general_radiography | General Radiography",
+                "mammography | Mammography",
+            ],
+        )
+        imaging_combo.grid(row=1, column=1, sticky="ew", pady=(4, 0))
+        ttk.Label(input_group, text="Operating Mode").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        operating_combo = ttk.Combobox(
+            input_group,
+            state="readonly",
+            width=24,
+            textvariable=self.analysis_inputs["mtf_operating_mode"],
+            values=[
+                "strict_iec | Strict IEC",
+                "exploratory_mode | Exploratory",
+            ],
+        )
+        operating_combo.grid(row=2, column=1, sticky="ew", pady=(4, 0))
+        imaging_combo.set("general_radiography | General Radiography")
+        operating_combo.set("strict_iec | Strict IEC")
+        ttk.Button(input_group, text="Use Selected ROI as Edge ROI", command=self._bind_selected_roi_to_mtf).grid(row=3, column=0, sticky="ew", pady=(6, 0), padx=(0, 4))
+        self._analysis_action_buttons["mtf"] = ttk.Button(input_group, text="Run MTF Analysis", command=self._run_mtf_analysis, state="disabled")
+        self._analysis_action_buttons["mtf"].grid(row=3, column=1, sticky="ew", pady=(6, 0))
+        ttk.Button(input_group, text="Show MTF Details", command=self._show_mtf_details).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Label(input_group, textvariable=self.signal_analysis_results["mtf_validation_summary"]).grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        summary_group = ttk.LabelFrame(left_frame, text="Result Summary", padding=(6, 4))
+        summary_group.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        summary_items = [
+            ("MTF50", "mtf50"),
+            ("MTF10", "mtf10"),
+            ("Nyquist MTF", "nyquist_mtf"),
+            ("Edge Angle", "edge_angle"),
+            ("Edge SNR", "edge_snr"),
+            ("ROI Width", "roi_width"),
+            ("ROI Height", "roi_height"),
+            ("Calculation Validity", "calculation_validity"),
+            ("IEC Compliance", "iec_compliance"),
+            ("QA Grade", "qa_grade"),
+        ]
+        for row_index, (label, key) in enumerate(summary_items):
+            ttk.Label(summary_group, text=f"{label}:").grid(row=row_index, column=0, sticky="w")
+            var = tk.StringVar(value="-")
+            self._mtf_summary_value_vars[key] = var
+            ttk.Label(summary_group, textvariable=var).grid(row=row_index, column=1, sticky="w", padx=(8, 0))
+
+        warning_group = ttk.LabelFrame(left_frame, text="Warnings / Validation", padding=(6, 4))
+        warning_group.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(warning_group, textvariable=self.signal_analysis_results["mtf_warning_summary"], justify="left").grid(row=0, column=0, sticky="w")
+        ttk.Label(warning_group, textvariable=self.signal_analysis_results["mtf_reason_codes"], justify="left").grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        graph_group = ttk.LabelFrame(right_frame, text="Curve Viewer", padding=(6, 4))
+        graph_group.grid(row=0, column=0, sticky="nsew")
+        self._mtf_graph_group = graph_group
+        curve_notebook = ttk.Notebook(graph_group)
+        curve_notebook.grid(row=0, column=0, sticky="nsew")
+        self._mtf_curve_notebook = curve_notebook
+        curve_notebook.bind("<<NotebookTabChanged>>", self._on_mtf_curve_tab_changed, add="+")
+        for key, title in (("mtf", "MTF"), ("esf", "ESF"), ("lsf", "LSF")):
+            tab = ttk.Frame(curve_notebook, padding=(2, 2, 2, 2))
+            curve_notebook.add(tab, text=title)
+            tab.grid_columnconfigure(0, weight=1)
+            tab.grid_rowconfigure(0, weight=1)
+            canvas = tk.Canvas(tab, width=360, height=180, bg="#FFFFFF", highlightthickness=1, highlightbackground=self.ui_colors["border"])
+            canvas.grid(row=0, column=0, sticky="nsew")
+            canvas.bind("<Configure>", self._on_mtf_graph_canvas_configure, add="+")
+            self._mtf_curve_tabs[key] = tab
+            if key == "mtf":
+                self._mtf_graph_canvas = canvas
+            elif key == "esf":
+                self._mtf_esf_canvas = canvas
+            else:
+                self._mtf_lsf_canvas = canvas
+        summary_group_right = ttk.LabelFrame(graph_group, text="Curve Summary", padding=(6, 4))
+        summary_group_right.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(summary_group_right, textvariable=self._mtf_graph_status_var).grid(row=0, column=0, sticky="w")
+        ttk.Label(summary_group_right, textvariable=self._mtf_esf_status_var).grid(row=1, column=0, sticky="w")
+        ttk.Label(summary_group_right, textvariable=self._mtf_lsf_status_var).grid(row=2, column=0, sticky="w")
+        graph_group.grid_columnconfigure(0, weight=1)
+        graph_group.grid_rowconfigure(0, weight=1, minsize=220)
+        left_frame.grid_columnconfigure(0, weight=1)
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_columnconfigure(1, weight=2)
+        panel.grid_rowconfigure(0, weight=1, minsize=260)
+        right_frame.grid_columnconfigure(0, weight=1)
+        right_frame.grid_rowconfigure(0, weight=1, minsize=240)
+
+    def _bind_analysis_selector_events(self) -> None:
+        for key in ("snr_signal", "snr_noise", "cnr_target", "cnr_reference", "cnr_noise"):
+            combo = self._analysis_comboboxes.get(key)
+            if combo is None:
+                continue
+            combo.bind("<<ComboboxSelected>>", self._on_analysis_selector_changed, add="+")
+        line_combo = self._analysis_comboboxes.get("line_profile")
+        if line_combo is not None:
+            line_combo.bind("<<ComboboxSelected>>", self._on_line_profile_selection_changed, add="+")
+
+    def _on_analysis_selector_changed(self, _event: tk.Event | None = None) -> None:
+        self._sync_analysis_input_from_combobox("roi", "snr_signal", "snr_signal_roi_id")
+        self._sync_analysis_input_from_combobox("roi", "snr_noise", "snr_background_roi_id")
+        self._sync_analysis_input_from_combobox("roi", "cnr_target", "cnr_target_roi_id")
+        self._sync_analysis_input_from_combobox("roi", "cnr_reference", "cnr_reference_roi_id")
+        self._sync_analysis_input_from_combobox("roi", "cnr_noise", "cnr_noise_roi_id")
+        self._update_analysis_action_button_state()
+
+    @staticmethod
+    def _parse_prefixed_value(raw_value: str, default: str) -> str:
+        value = str(raw_value or "").strip()
+        if not value:
+            return default
+        return value.split("|", 1)[0].strip()
+
+    def _on_line_profile_selection_changed(self, _event: tk.Event | None = None) -> None:
+        self._sync_analysis_input_from_combobox("line", "line_profile", "line_profile_line_id")
+        measurement = self._get_selected_measurement_from_analysis("line", "line_profile_line_id", "line_profile")
+        if measurement is None:
+            self.analysis_results["line_info"].set("Line: Select Profile Line")
+            return
+        profile = self.extract_line_profile(measurement)
+        if profile is None:
+            self.analysis_results["line_info"].set("Line: Profile unavailable")
+            return
+        summary = self.summarize_line_profile(profile)
+        line_index = self._line_index_for_measurement_id(measurement.id)
+        line_label = f"Line {line_index}" if line_index is not None else measurement.id[:8]
+        self.analysis_results["line_info"].set(
+            f"{line_label} | n={summary['sample_count']} | min={summary['min_intensity']:.2f} | "
+            f"max={summary['max_intensity']:.2f} | mean={summary['mean_intensity']:.2f}"
+        )
+
+    def _on_signal_analysis_tab_changed(self, event: tk.Event | None = None) -> None:
+        notebook = self._mtf_notebook
+        mtf_tab = self._mtf_tab
+        if notebook is None or mtf_tab is None:
+            return
+        if event is not None and event.widget is not notebook:
+            return
+        if notebook.select() != str(mtf_tab):
+            return
+        self._schedule_mtf_graph_redraw()
+
+    def _on_mtf_graph_canvas_configure(self, _event: tk.Event | None = None) -> None:
+        self._schedule_mtf_graph_redraw()
+
+    def _on_mtf_curve_tab_changed(self, _event: tk.Event | None = None) -> None:
+        self._schedule_mtf_graph_redraw()
+
+    def _schedule_mtf_graph_redraw(self) -> None:
+        canvas = self._mtf_graph_canvas
+        if canvas is None:
+            return
+        if self._mtf_graph_redraw_job is not None:
+            try:
+                canvas.after_cancel(self._mtf_graph_redraw_job)
+            except Exception:
+                pass
+        self._mtf_graph_redraw_job = canvas.after_idle(self._redraw_all_mtf_curves_from_cached_result)
+
+    def _redraw_all_mtf_curves_from_cached_result(self) -> None:
+        self._mtf_graph_redraw_job = None
+        canvas = self._mtf_graph_canvas
+        if canvas is None or not canvas.winfo_exists():
+            return
+        mtf_curve = self._last_mtf_curve_payload
+        esf_curve = self._last_esf_curve_payload
+        lsf_curve = self._last_lsf_curve_payload
+        if not mtf_curve or not esf_curve or not lsf_curve:
+            last_run = self._select_analysis_last_run("mtf") or {}
+            mtf_result = last_run.get("result") or {}
+            mtf_curve = mtf_curve or (mtf_result.get("mtf_curve") or {})
+            esf_curve = esf_curve or (mtf_result.get("esf_curve") or {})
+            lsf_curve = lsf_curve or (mtf_result.get("lsf_curve") or {})
+        self._render_mtf_curve(dict(mtf_curve or {}))
+        self._render_xy_curve(self._mtf_esf_canvas, dict(esf_curve or {}), "ESF", "x")
+        self._render_xy_curve(self._mtf_lsf_canvas, dict(lsf_curve or {}), "LSF", "x")
+
+    def _sync_analysis_input_from_combobox(self, kind: str, combobox_key: str, input_key: str) -> None:
+        combobox = self._analysis_comboboxes.get(combobox_key)
+        if combobox is None:
+            return
+        selected_label = combobox.get().strip()
+        if not selected_label:
+            return
+        option_map = self._analysis_option_maps.get(kind, {})
+        mapped_id = option_map.get(selected_label, "")
+        if mapped_id:
+            self.analysis_inputs[input_key].set(mapped_id)
 
     def _build_image_analysis_toolbar(self, tab: ttk.Frame) -> None:
         frame = ttk.Frame(tab)
@@ -928,30 +1408,1593 @@ class DicomViewer:
     def _build_analysis_results_panel(self, strip: ttk.Frame) -> None:
         panel = ttk.LabelFrame(strip, text="Analysis Results", padding=(8, 6))
         panel.pack(side="left", padx=(0, 8), fill="both", expand=True)
-        columns = ("metric", "formula", "roi_ids", "roles", "stats", "value")
-        tree = ttk.Treeview(panel, columns=columns, show="headings", height=10)
-        tree.heading("metric", text="Metric")
-        tree.heading("formula", text="Formula/Mode")
-        tree.heading("roi_ids", text="ROI IDs")
-        tree.heading("roles", text="Roles")
-        tree.heading("stats", text="Stats")
-        tree.heading("value", text="Result")
-        tree.column("metric", width=120, anchor="w")
-        tree.column("formula", width=220, anchor="w")
-        tree.column("roi_ids", width=230, anchor="w")
-        tree.column("roles", width=140, anchor="w")
-        tree.column("stats", width=360, anchor="w")
-        tree.column("value", width=180, anchor="w")
-        tree.grid(row=0, column=0, columnspan=2, sticky="nsew")
-        scrollbar = ttk.Scrollbar(panel, orient="vertical", command=tree.yview)
-        scrollbar.grid(row=0, column=2, sticky="ns")
-        tree.configure(yscrollcommand=scrollbar.set)
-        ttk.Button(panel, text="Export Results CSV", command=self.export_analysis_results_csv).grid(row=1, column=0, sticky="ew", pady=(6, 0), padx=(0, 4))
-        ttk.Button(panel, text="Export Results JSON", command=self.export_analysis_results_json).grid(row=1, column=1, sticky="ew", pady=(6, 0), padx=(4, 0))
+        header = ttk.Frame(panel)
+        header.grid(row=0, column=0, sticky="ew", columnspan=2)
+        header.columnconfigure(0, weight=0, minsize=220)
+        header.columnconfigure(1, weight=0, minsize=180)
+        header.columnconfigure(2, weight=1, minsize=300)
+        ttk.Label(header, text="Item", anchor="w").grid(row=0, column=0, sticky="ew", padx=(2, 8))
+        ttk.Label(header, text="Value", anchor="w").grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        ttk.Label(header, text="Note", anchor="w").grid(row=0, column=2, sticky="ew")
+
+        canvas = tk.Canvas(
+            panel,
+            background="#FFFFFF",
+            highlightthickness=1,
+            highlightbackground=self.ui_colors["border"],
+            bd=0,
+        )
+        canvas.grid(row=1, column=0, sticky="nsew", columnspan=2)
+        scrollbar = ttk.Scrollbar(panel, orient="vertical", command=canvas.yview)
+        scrollbar.grid(row=1, column=2, sticky="ns")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        rows_container = ttk.Frame(canvas)
+        rows_window = canvas.create_window((0, 0), window=rows_container, anchor="nw")
+
+        def _sync_scroll_region(_event: tk.Event) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _sync_row_container_width(_event: tk.Event) -> None:
+            canvas.itemconfigure(rows_window, width=_event.width)
+            self._relayout_analysis_result_rows()
+
+        rows_container.bind("<Configure>", _sync_scroll_region)
+        canvas.bind("<Configure>", _sync_row_container_width)
+
+        ttk.Button(panel, text="Export Results CSV", command=self.export_analysis_results_csv).grid(row=2, column=0, sticky="ew", pady=(6, 0), padx=(0, 4))
+        ttk.Button(panel, text="Export Results JSON", command=self.export_analysis_results_json).grid(row=2, column=1, sticky="ew", pady=(6, 0), padx=(4, 0))
         panel.grid_columnconfigure(0, weight=1)
         panel.grid_columnconfigure(1, weight=1)
-        panel.grid_rowconfigure(0, weight=1)
-        self.analysis_results_table = tree
+        panel.grid_rowconfigure(1, weight=1)
+        self.analysis_results_table = panel
+        self.analysis_results_canvas = canvas
+        self.analysis_results_rows_container = rows_container
+
+    def _build_results_history_panel(self, tab: ttk.Frame) -> None:
+        """
+        [DEPRECATED]
+        Window B panel factory 분리 이후 창 B에서는 더 이상 이 legacy builder를 호출하지 않는다.
+        현재는 제거 전 호출 경로 검증 단계로 유지된다.
+        삭제 전 조건:
+        - 창 A 호출 없음
+        - 창 B 호출 없음
+        - 테스트/동적 호출 없음
+        """
+        panel = ttk.LabelFrame(tab, text="Measurement History", padding=(8, 6))
+        panel.pack(fill="both", expand=True)
+        toolbar = ttk.Frame(panel)
+        toolbar.grid(row=0, column=0, columnspan=5, sticky="ew", pady=(0, 6))
+        ttk.Label(toolbar, text="Type Filter").pack(side="left")
+        filter_combo = ttk.Combobox(
+            toolbar,
+            state="readonly",
+            width=16,
+            values=["All", "ROI", "Analysis", "Line Profile"],
+            textvariable=self.history_metric_filter_var,
+        )
+        filter_combo.pack(side="left", padx=(6, 12))
+        filter_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_result_history_table())
+        ttk.Label(toolbar, text="Search").pack(side="left")
+        search_entry = ttk.Entry(toolbar, textvariable=self.history_search_var, width=32)
+        search_entry.pack(side="left", padx=(6, 0))
+        search_entry.bind("<KeyRelease>", lambda _event: self._refresh_result_history_table())
+        columns = (
+            "timestamp",
+            "image",
+            "frame",
+            "type",
+            "target",
+            "metric",
+            "value",
+            "mean",
+            "std",
+            "min",
+            "max",
+            "area",
+            "length_px",
+            "length_mm",
+            "peaks",
+            "valleys",
+            "unit",
+            "note",
+        )
+        tree = ttk.Treeview(panel, columns=columns, show="headings", height=16, selectmode="extended", style="ResultHistory.Treeview")
+        headers = {
+            "timestamp": "Timestamp",
+            "image": "Image Name",
+            "frame": "Frame Index",
+            "type": "Measurement Type",
+            "target": "ROI / Line Name",
+            "metric": "Metric",
+            "value": "Value",
+            "mean": "Mean",
+            "std": "Std",
+            "min": "Min",
+            "max": "Max",
+            "area": "Area",
+            "length_px": "Length(px)",
+            "length_mm": "Length(mm)",
+            "peaks": "Peaks",
+            "valleys": "Valleys",
+            "unit": "Unit",
+            "note": "Note",
+        }
+        widths = {
+            "timestamp": 170,
+            "image": 160,
+            "frame": 90,
+            "type": 140,
+            "target": 140,
+            "metric": 120,
+            "value": 90,
+            "mean": 90,
+            "std": 90,
+            "min": 90,
+            "max": 90,
+            "area": 90,
+            "length_px": 95,
+            "length_mm": 95,
+            "peaks": 80,
+            "valleys": 80,
+            "unit": 90,
+            "note": 320,
+        }
+        for key in columns:
+            tree.heading(key, text=headers[key])
+            tree.column(key, width=widths[key], anchor="w")
+        tree.grid(row=1, column=0, columnspan=5, sticky="nsew")
+        tree.bind("<<TreeviewSelect>>", self._on_history_row_selected, add="+")
+        scrollbar = ttk.Scrollbar(panel, orient="vertical", command=tree.yview)
+        scrollbar.grid(row=1, column=5, sticky="ns")
+        tree.configure(yscrollcommand=scrollbar.set)
+        ttk.Button(panel, text="Delete Selected", command=self.delete_selected_history_rows).grid(row=2, column=0, sticky="ew", pady=(6, 0), padx=(0, 4))
+        ttk.Button(panel, text="Clear All", command=self.clear_result_history).grid(row=2, column=1, sticky="ew", pady=(6, 0), padx=4)
+        ttk.Button(panel, text="Copy Clipboard", command=self.copy_result_history_to_clipboard).grid(row=2, column=2, sticky="ew", pady=(6, 0), padx=4)
+        ttk.Button(panel, text="Export Selected CSV", command=self.export_selected_result_history_csv).grid(row=2, column=3, sticky="ew", pady=(6, 0), padx=4)
+        ttk.Button(panel, text="Export All CSV", command=self.export_result_history_csv).grid(row=2, column=4, sticky="ew", pady=(6, 0), padx=(4, 0))
+        compare_button = ttk.Button(panel, text="Compare Selected", command=self.compare_selected_history_rows, state="disabled")
+        compare_button.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(6, 0))
+        for col in range(5):
+            panel.grid_columnconfigure(col, weight=1)
+        panel.grid_rowconfigure(1, weight=1)
+        self.result_history_table = tree
+        self.history_compare_button = compare_button
+
+    @staticmethod
+    def _history_export_columns() -> tuple[str, ...]:
+        return ("Timestamp", "ImageName", "Frame", "MeasurementType", "TargetName", "Metric", "Value", "Unit", "Note")
+
+    def _current_image_name(self) -> str:
+        file_paths = getattr(self, "file_paths", [])
+        current_file_index = int(getattr(self, "current_file_index", -1))
+        if file_paths and 0 <= current_file_index < len(file_paths):
+            return Path(file_paths[current_file_index]).name
+        path_text = ""
+        if hasattr(self, "path_var") and self.path_var is not None:
+            try:
+                path_text = self.path_var.get().strip()
+            except Exception:
+                path_text = ""
+        if path_text:
+            return Path(path_text).name
+        return "N/A"
+
+    def _current_history_context(self) -> dict[str, Any]:
+        measurement_mode = "unknown"
+        if hasattr(self, "measurement_mode") and self.measurement_mode is not None:
+            try:
+                measurement_mode = str(self.measurement_mode.get())
+            except Exception:
+                measurement_mode = "unknown"
+        return {
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "image_name": self._current_image_name(),
+            "image_path": self._get_current_image_path() if hasattr(self, "_get_current_image_path") else "",
+            "frame_index": int(self.current_frame),
+            "measurement_mode": measurement_mode,
+        }
+
+    def _ensure_default_study_session(self) -> StudySession:
+        self._ensure_domain_store()
+        study_sessions = self._select_study_sessions_map()
+        if not hasattr(self, "active_study_id"):
+            self.active_study_id = ""
+        if not hasattr(self, "active_group_id"):
+            self.active_group_id = ""
+        if self.active_study_id and self.active_study_id in study_sessions:
+            return study_sessions[self.active_study_id]
+        if study_sessions:
+            first_study = next(iter(study_sessions.values()))
+            self.active_study_id = first_study.study_id
+            return first_study
+        study_id = str(uuid.uuid4())
+        study = StudySession(
+            study_id=study_id,
+            name="Default Study",
+            created_at=datetime.utcnow().isoformat(),
+            group_ids=[],
+        )
+        study_sessions[study_id] = study
+        self.active_study_id = study_id
+        return study
+
+    def _get_or_create_active_analysis_group(self, context: dict[str, Any]) -> ImageAnalysisGroup:
+        self._ensure_domain_store()
+        analysis_groups = self._select_analysis_groups_map()
+        study = self._ensure_default_study_session()
+        current_path = str(context.get("image_path", "") or "")
+        current_image_name = str(context.get("image_name", "N/A"))
+        current_frame_index = int(context.get("frame_index", 0))
+        active_group = analysis_groups.get(self.active_group_id)
+        if active_group is not None:
+            same_image = active_group.source_image_path == current_path
+            if not current_path:
+                same_image = active_group.image_name == current_image_name
+            if same_image:
+                return active_group
+        roi_source = self._infer_group_roi_source_metadata()
+        group_id = str(uuid.uuid4())
+        group = ImageAnalysisGroup(
+            group_id=group_id,
+            study_id=study.study_id,
+            source_image_path=current_path,
+            image_name=current_image_name,
+            created_at=datetime.utcnow().isoformat(),
+            entry_ids=[],
+            frame_indices=[],
+            roi_source_type=str(roi_source.get("roi_source_type", "manual")),
+            propagated_from_group_id=str(roi_source.get("propagated_from_group_id", "")),
+            propagated_from_measurement_ids=[str(item) for item in roi_source.get("propagated_from_measurement_ids", [])],
+        )
+        analysis_groups[group_id] = group
+        if group_id not in study.group_ids:
+            study.group_ids.append(group_id)
+        self.active_group_id = group_id
+        return group
+
+    def _infer_group_roi_source_metadata(self) -> dict[str, Any]:
+        current_geometry = self._get_current_geometry_key()
+        if current_geometry is None:
+            return {"roi_source_type": "manual", "propagated_from_group_id": "", "propagated_from_measurement_ids": []}
+        frame_index = int(getattr(self, "current_frame", 0))
+        rois = [
+            measurement
+            for measurement in self._selector_measurements_for_current_frame(kind="roi")
+            if measurement.kind == "roi"
+            and measurement.frame_index == frame_index
+            and self._geometry_matches(measurement.geometry_key, current_geometry)
+        ]
+        propagated = [item for item in rois if str((item.meta or {}).get("propagated_from", ""))]
+        if not propagated:
+            return {"roi_source_type": "manual", "propagated_from_group_id": "", "propagated_from_measurement_ids": []}
+        source_group_id = str((propagated[0].meta or {}).get("propagated_from_group_id", ""))
+        source_ids = [str((item.meta or {}).get("propagated_from", "")) for item in propagated if (item.meta or {}).get("propagated_from")]
+        return {
+            "roi_source_type": "propagated",
+            "propagated_from_group_id": source_group_id,
+            "propagated_from_measurement_ids": source_ids,
+        }
+
+    def _append_history_entry(
+        self,
+        measurement_type: str,
+        target_name: str,
+        metric: str,
+        value: float | None,
+        unit: str,
+        note: str,
+        measurement_mode: str = "",
+        target_id: str = "",
+        related_target_ids: list[str] | None = None,
+        extra_payload: dict[str, Any] | None = None,
+        reason_codes: list[str] | None = None,
+        group_id: str = "",
+        study_id: str = "",
+    ) -> None:
+        if not hasattr(self, "result_history_store") or self.result_history_store is None:
+            self.result_history_store = ResultHistoryStore()
+        context = self._current_history_context()
+        requested_group_id = str(group_id or "").strip()
+        analysis_groups = self._select_analysis_groups_map()
+        study_sessions = self._select_study_sessions_map()
+        if requested_group_id and requested_group_id in analysis_groups:
+            group = analysis_groups[requested_group_id]
+        else:
+            group = self._get_or_create_active_analysis_group(context)
+            if requested_group_id and requested_group_id != group.group_id:
+                group = ImageAnalysisGroup(
+                    group_id=requested_group_id,
+                    study_id=str(study_id or group.study_id),
+                    source_image_path=str(context.get("image_path", "")),
+                    image_name=str(context.get("image_name", "N/A")),
+                    created_at=str(context.get("timestamp", datetime.utcnow().isoformat())),
+                    frame_indices=[int(context.get("frame_index", 0))],
+                )
+                analysis_groups[group.group_id] = group
+                study = study_sessions.get(group.study_id)
+                if study is not None and group.group_id not in study.group_ids:
+                    study.group_ids.append(group.group_id)
+                self.active_group_id = group.group_id
+        entry = ResultHistoryEntry(
+            entry_id=str(uuid.uuid4()),
+            timestamp=context["timestamp"],
+            image_name=context["image_name"],
+            frame_index=context["frame_index"],
+            measurement_type=measurement_type,
+            target_name=target_name,
+            metric=metric,
+            value=(float(value) if isinstance(value, (int, float)) else None),
+            unit=unit,
+            note=note,
+            measurement_mode=measurement_mode or context["measurement_mode"],
+            source_image_path=str(context.get("image_path", "")),
+            target_id=target_id,
+            related_target_ids=list(related_target_ids or []),
+            group_id=str(group_id or group.group_id),
+            study_id=str(study_id or group.study_id),
+            extra_payload=dict(extra_payload) if isinstance(extra_payload, dict) else None,
+            reason_codes=[str(code) for code in (reason_codes or [])],
+        )
+        self._action_history_append_entry(entry)
+        group.entry_ids.append(entry.entry_id)
+        frame_index = int(context.get("frame_index", 0))
+        if frame_index not in group.frame_indices:
+            group.frame_indices.append(frame_index)
+        self._refresh_result_history_table()
+
+    @staticmethod
+    def _serialize_history_entry(entry: ResultHistoryEntry) -> dict[str, Any]:
+        return {
+            "entry_id": entry.entry_id,
+            "timestamp": entry.timestamp,
+            "image_name": entry.image_name,
+            "frame_index": int(entry.frame_index),
+            "measurement_type": entry.measurement_type,
+            "target_name": entry.target_name,
+            "metric": entry.metric,
+            "value": (float(entry.value) if isinstance(entry.value, (int, float)) else None),
+            "unit": entry.unit,
+            "note": entry.note,
+            "measurement_mode": entry.measurement_mode,
+            "source_image_path": entry.source_image_path,
+            "target_id": entry.target_id,
+            "related_target_ids": list(entry.related_target_ids),
+            "group_id": entry.group_id,
+            "study_id": entry.study_id,
+            "extra_payload": dict(entry.extra_payload or {}),
+            "reason_codes": [str(code) for code in (entry.reason_codes or [])],
+        }
+
+    @staticmethod
+    def _deserialize_history_entry(payload: dict[str, Any]) -> ResultHistoryEntry:
+        raw_value = payload.get("value")
+        parsed_value: float | None
+        if isinstance(raw_value, (int, float)):
+            parsed_value = float(raw_value)
+        elif isinstance(raw_value, str) and raw_value.strip():
+            try:
+                parsed_value = float(raw_value)
+            except ValueError:
+                parsed_value = None
+        else:
+            parsed_value = None
+        return ResultHistoryEntry(
+            entry_id=str(payload.get("entry_id") or uuid.uuid4()),
+            timestamp=str(payload.get("timestamp", "")),
+            image_name=str(payload.get("image_name", "N/A")),
+            frame_index=int(payload.get("frame_index", 0)),
+            measurement_type=str(payload.get("measurement_type", "")),
+            target_name=str(payload.get("target_name", "")),
+            metric=str(payload.get("metric", "")),
+            value=parsed_value,
+            unit=str(payload.get("unit", "")),
+            note=str(payload.get("note", "")),
+            measurement_mode=str(payload.get("measurement_mode", "unknown")),
+            source_image_path=str(payload.get("source_image_path", "")),
+            target_id=str(payload.get("target_id", "")),
+            related_target_ids=[str(item) for item in (payload.get("related_target_ids") or [])],
+            group_id=str(payload.get("group_id", "")),
+            study_id=str(payload.get("study_id", "")),
+            extra_payload=dict(payload.get("extra_payload") or {}),
+            reason_codes=[str(code) for code in (payload.get("reason_codes") or [])],
+        )
+
+    def _refresh_result_history_table(self) -> None:
+        table = getattr(self, "result_history_table", None)
+        if table is None:
+            return
+        selected_type = self.history_metric_filter_var.get().strip() if hasattr(self, "history_metric_filter_var") else "All"
+        search_text = self.history_search_var.get() if hasattr(self, "history_search_var") else ""
+        history_rows = self.build_flat_history_view(selected_type, search_text)
+        self.render_flat_history_table(history_rows)
+        self._restore_history_selection()
+        self._update_history_compare_button_state()
+
+    @staticmethod
+    def _metric_bucket_key(metric_name: str) -> str | None:
+        normalized = metric_name.strip().lower().replace(" ", "")
+        if normalized in {"mean"}:
+            return "mean"
+        if normalized in {"std", "stddev", "standarddeviation"}:
+            return "std"
+        if normalized in {"min", "minimum"}:
+            return "min"
+        if normalized in {"max", "maximum"}:
+            return "max"
+        if normalized.startswith("area"):
+            return "area"
+        if normalized in {"length(px)", "lengthpx"}:
+            return "length_px"
+        if normalized in {"length(mm)", "lengthmm"}:
+            return "length_mm"
+        if normalized.startswith("peaks"):
+            return "peaks"
+        if normalized.startswith("valleys"):
+            return "valleys"
+        return None
+
+    @staticmethod
+    def _format_history_value(value: float | None) -> str:
+        if isinstance(value, (int, float)):
+            return f"{float(value):.2f}"
+        return "-"
+
+    def group_history_entries(self, rows: list[tuple[int, ResultHistoryEntry]]) -> list[dict[str, Any]]:
+        grouped: dict[tuple[str, str, int, str, str], dict[str, Any]] = {}
+        for store_index, entry in rows:
+            key = (
+                entry.timestamp,
+                entry.image_name,
+                int(entry.frame_index),
+                entry.measurement_type,
+                entry.target_name,
+            )
+            payload = grouped.setdefault(
+                key,
+                {
+                    "timestamp": entry.timestamp,
+                    "image_name": entry.image_name,
+                    "frame_index": str(entry.frame_index),
+                    "measurement_type": entry.measurement_type,
+                    "target_name": entry.target_name,
+                    "metric": "",
+                    "value": "",
+                    "mean": "",
+                    "std": "",
+                    "min": "",
+                    "max": "",
+                    "area": "",
+                    "length_px": "",
+                    "length_mm": "",
+                    "peaks": "",
+                    "valleys": "",
+                    "unit": "",
+                    "note": "",
+                    "store_indices": [],
+                    "entry_ids": [],
+                    "primary_entry": entry,
+                },
+            )
+            payload["store_indices"].append(store_index)
+            payload["entry_ids"].append(entry.entry_id)
+            bucket = self._metric_bucket_key(entry.metric)
+            value_text = self._format_history_value(entry.value)
+            if bucket is not None:
+                payload[bucket] = value_text
+            elif not payload["metric"]:
+                payload["metric"] = entry.metric
+                payload["value"] = value_text
+            notes = [line for line in [payload["note"], entry.note] if line]
+            payload["note"] = "\n".join(dict.fromkeys(notes))
+            units = [item for item in [payload["unit"], entry.unit] if item]
+            payload["unit"] = ", ".join(dict.fromkeys(units))
+        return sorted(
+            grouped.values(),
+            key=lambda row: (row["timestamp"], row["image_name"], row["frame_index"], row["measurement_type"], row["target_name"]),
+            reverse=True,
+        )
+
+    def build_flat_history_view(self, measurement_type: str = "All", search_text: str = "") -> list[dict[str, Any]]:
+        self._ensure_window_b_services()
+        raw_rows = self._select_filtered_history_entries(measurement_type, "")
+        grouped_rows = self.group_history_entries(raw_rows)
+        return self.history_controller.build_flat_history_view(grouped_rows, search_text=search_text)
+
+    def render_flat_history_table(self, history_rows: list[dict[str, Any]]) -> None:
+        table = getattr(self, "result_history_table", None)
+        if table is None:
+            return
+        self._history_item_to_store_indices = {}
+        self._history_row_meta_by_item_id = {}
+        for item_id in table.get_children():
+            table.delete(item_id)
+        row_values: list[tuple[str, ...]] = []
+        for row in history_rows:
+            values = (
+                str(row.get("timestamp", "")),
+                str(row.get("image_name", "")),
+                str(row.get("frame_index", "")),
+                str(row.get("measurement_type", "")),
+                str(row.get("target_name", "")),
+                str(row.get("metric", "")),
+                str(row.get("value", "")),
+                str(row.get("mean", "")),
+                str(row.get("std", "")),
+                str(row.get("min", "")),
+                str(row.get("max", "")),
+                str(row.get("area", "")),
+                str(row.get("length_px", "")),
+                str(row.get("length_mm", "")),
+                str(row.get("peaks", "")),
+                str(row.get("valleys", "")),
+                str(row.get("unit", "")),
+                str(row.get("note", "")),
+            )
+            item_id = table.insert("", "end", values=values)
+            self._history_item_to_store_indices[item_id] = list(row.get("store_indices", []))
+            self._history_row_meta_by_item_id[item_id] = dict(row)
+            row_values.append(values)
+        self._update_treeview_row_height_for_notes(table, "ResultHistory.Treeview", row_values, note_index=17)
+
+    def _update_treeview_row_height_for_notes(
+        self,
+        table: ttk.Treeview,
+        style_name: str,
+        rows: list[tuple[str, ...]],
+        note_index: int,
+    ) -> None:
+        default_font = tkfont.nametofont("TkDefaultFont")
+        line_height = default_font.metrics("linespace")
+        note_width = int(table.column("note", "width")) - 12
+        note_width = max(48, note_width)
+        max_lines = 1
+        for values in rows:
+            if note_index >= len(values):
+                continue
+            note_text = str(values[note_index] or "")
+            line_count = 0
+            for paragraph in note_text.split("\n"):
+                if not paragraph:
+                    line_count += 1
+                    continue
+                width = 0
+                line_count += 1
+                for char in paragraph:
+                    char_width = default_font.measure(char)
+                    if width + char_width > note_width and width > 0:
+                        line_count += 1
+                        width = char_width
+                    else:
+                        width += char_width
+            max_lines = max(max_lines, line_count)
+        row_height = max(22, (line_height * max_lines) + 8)
+        ttk.Style(self.root).configure(style_name, rowheight=row_height)
+
+    def _selected_history_entries(self) -> list[tuple[int, ResultHistoryEntry]]:
+        table = self.result_history_table
+        if table is None:
+            return []
+        selected: list[tuple[int, ResultHistoryEntry]] = []
+        all_entries = self._select_result_history_entries()
+        seen_indices: set[int] = set()
+        for item_id in table.selection():
+            for store_index in self._history_item_to_store_indices.get(item_id, []):
+                if store_index in seen_indices:
+                    continue
+                if not (0 <= store_index < len(all_entries)):
+                    continue
+                selected.append((store_index, all_entries[store_index]))
+                seen_indices.add(store_index)
+        return selected
+
+    def delete_selected_history_rows(self) -> None:
+        table = self.result_history_table
+        if table is None:
+            return
+        selected_rows = self._selected_history_entries()
+        if not selected_rows:
+            messagebox.showinfo("Results History", "삭제할 행을 선택하세요.")
+            return
+        indices = [index for index, _entry in selected_rows]
+        self._action_history_remove_indices(indices)
+        self._refresh_result_history_table()
+
+    def clear_result_history(self) -> None:
+        self._action_history_clear()
+        self._refresh_result_history_table()
+
+    def _write_result_history_csv(self, path: str, entries: list[ResultHistoryEntry]) -> None:
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(self._history_export_columns())
+            for entry in entries:
+                writer.writerow(
+                    [
+                        entry.timestamp,
+                        entry.image_name,
+                        str(entry.frame_index),
+                        entry.measurement_type,
+                        entry.target_name,
+                        entry.metric,
+                        self._format_history_value(entry.value),
+                        entry.unit,
+                        entry.note,
+                    ]
+                )
+
+    @staticmethod
+    def _history_table_export_columns() -> tuple[str, ...]:
+        return (
+            "Timestamp",
+            "ImageName",
+            "Frame",
+            "MeasurementType",
+            "TargetName",
+            "Metric",
+            "Value",
+            "Mean",
+            "Std",
+            "Min",
+            "Max",
+            "Area",
+            "Length(px)",
+            "Length(mm)",
+            "Peaks",
+            "Valleys",
+            "Unit",
+            "Note",
+        )
+
+    def _write_flat_result_history_csv(self, path: str, history_rows: list[dict[str, Any]]) -> None:
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(self._history_table_export_columns())
+            for row in history_rows:
+                if str(row.get("row_type", "result")) != "result":
+                    continue
+                writer.writerow(
+                    [
+                        row.get("timestamp", ""),
+                        row.get("image_name", ""),
+                        row.get("frame_index", ""),
+                        row.get("measurement_type", ""),
+                        row.get("target_name", ""),
+                        row.get("metric", ""),
+                        row.get("value", ""),
+                        row.get("mean", ""),
+                        row.get("std", ""),
+                        row.get("min", ""),
+                        row.get("max", ""),
+                        row.get("area", ""),
+                        row.get("length_px", ""),
+                        row.get("length_mm", ""),
+                        row.get("peaks", ""),
+                        row.get("valleys", ""),
+                        row.get("unit", ""),
+                        row.get("note", ""),
+                    ]
+                )
+
+    def export_result_history_csv(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Results History CSV 저장",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        history_rows = self.build_flat_history_view(
+            self.history_metric_filter_var.get().strip() if hasattr(self, "history_metric_filter_var") else "All",
+            self.history_search_var.get() if hasattr(self, "history_search_var") else "",
+        )
+        self._write_flat_result_history_csv(path, history_rows)
+        messagebox.showinfo("저장 완료", f"Results History CSV 저장 완료:\n{path}")
+
+    def export_selected_result_history_csv(self) -> None:
+        self._ensure_window_b_services()
+        selected_rows = self._selected_history_entries()
+        if not selected_rows:
+            messagebox.showinfo("Results History", "내보낼 행을 선택하세요.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="선택된 Results History CSV 저장",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        selected_indices = {index for index, _entry in selected_rows}
+        history_rows = self.build_flat_history_view(
+            self.history_metric_filter_var.get().strip() if hasattr(self, "history_metric_filter_var") else "All",
+            self.history_search_var.get() if hasattr(self, "history_search_var") else "",
+        )
+        history_rows = self.report_export_controller.filter_selected_rows(history_rows, selected_indices)
+        self._write_flat_result_history_csv(path, history_rows)
+        messagebox.showinfo("저장 완료", f"선택 행 CSV 저장 완료:\n{path}")
+
+    def copy_result_history_to_clipboard(self) -> None:
+        selected_rows = self._selected_history_entries()
+        selected_indices = {index for index, _entry in selected_rows}
+        history_rows = self.build_flat_history_view(
+            self.history_metric_filter_var.get().strip() if hasattr(self, "history_metric_filter_var") else "All",
+            self.history_search_var.get() if hasattr(self, "history_search_var") else "",
+        )
+        if selected_indices:
+            history_rows = [row for row in history_rows if selected_indices.intersection(set(row.get("store_indices", [])))]
+        lines = [",".join(self._history_table_export_columns())]
+        for row in history_rows:
+            if str(row.get("row_type", "result")) != "result":
+                continue
+            values = [
+                str(row.get("timestamp", "")),
+                str(row.get("image_name", "")),
+                str(row.get("frame_index", "")),
+                str(row.get("measurement_type", "")),
+                str(row.get("target_name", "")),
+                str(row.get("metric", "")),
+                str(row.get("value", "")),
+                str(row.get("mean", "")),
+                str(row.get("std", "")),
+                str(row.get("min", "")),
+                str(row.get("max", "")),
+                str(row.get("area", "")),
+                str(row.get("length_px", "")),
+                str(row.get("length_mm", "")),
+                str(row.get("peaks", "")),
+                str(row.get("valleys", "")),
+                str(row.get("unit", "")),
+                str(row.get("note", "")).replace("\n", " | "),
+            ]
+            lines.append(",".join(values))
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(lines))
+        messagebox.showinfo("Results History", "히스토리를 클립보드에 복사했습니다.")
+
+    def _on_history_row_selected(self, _event: tk.Event | None = None) -> None:
+        selected_rows = self._selected_history_entries()
+        self._session_compare_state["selected_entry_ids"] = [entry.entry_id for _index, entry in selected_rows]
+        self._session_compare_state["baseline_index"] = 0
+        self._update_history_compare_button_state()
+        table = self.result_history_table
+        if table is None:
+            return
+        selection = list(table.selection())
+        if len(selection) != 1:
+            return
+        all_entries = self._select_result_history_entries()
+        store_indices = self._history_item_to_store_indices.get(selection[0], [])
+        if not store_indices:
+            return
+        primary_index = store_indices[0]
+        if not (0 <= primary_index < len(all_entries)):
+            return
+        entry = all_entries[primary_index]
+        self.activate_history_entry(entry)
+
+    def _restore_history_selection(self, selected_entry_ids: list[str] | None = None) -> None:
+        table = self.result_history_table
+        if table is None:
+            return
+        wanted_ids = list(selected_entry_ids or self._session_compare_state.get("selected_entry_ids", []))
+        if not wanted_ids:
+            return
+        all_entries = self._select_result_history_entries()
+        id_to_items: dict[str, set[str]] = {}
+        for item_id, store_indices in self._history_item_to_store_indices.items():
+            for store_index in store_indices:
+                if not (0 <= store_index < len(all_entries)):
+                    continue
+                entry_id = all_entries[store_index].entry_id
+                id_to_items.setdefault(entry_id, set()).add(item_id)
+        item_ids: list[str] = []
+        for entry_id in wanted_ids:
+            item_ids.extend(sorted(id_to_items.get(entry_id, set())))
+        if item_ids:
+            table.selection_set(item_ids)
+
+    def _update_history_compare_button_state(self) -> None:
+        button = self.history_compare_button
+        if button is None:
+            return
+        selected_count = len(self._selected_history_entries())
+        if 2 <= selected_count <= 5:
+            button.configure(state="normal")
+        else:
+            button.configure(state="disabled")
+
+    @staticmethod
+    def _format_percent_change(current: float, baseline: float) -> str:
+        if abs(baseline) < 1e-12:
+            return "N/A"
+        return f"{((current - baseline) / baseline) * 100.0:.2f}%"
+
+    def _line_profile_cache_key(self, source_image_path: str, frame_index: int, target_id: str) -> str:
+        return f"{source_image_path}|{int(frame_index)}|{target_id}"
+
+    def resolve_line_profile_series(self, entry: ResultHistoryEntry) -> dict[str, Any] | None:
+        if entry.measurement_type != "Line Profile" or not entry.target_id:
+            return None
+        cache_key = self._line_profile_cache_key(entry.source_image_path, entry.frame_index, entry.target_id)
+        if cache_key in self.line_profile_series_cache:
+            return self.line_profile_series_cache[cache_key]
+        latest_line_profile = self._select_analysis_last_run("line_profile")
+        latest_inputs = latest_line_profile.get("inputs", {})
+        latest_result = latest_line_profile.get("result", {})
+        if latest_inputs.get("line_id") == entry.target_id and latest_result.get("distance_px"):
+            series = {
+                "distance_px": list(latest_result.get("distance_px", [])),
+                "distance_mm": latest_result.get("distance_mm"),
+                "intensity": list(latest_result.get("intensity", [])),
+            }
+            self.line_profile_series_cache[cache_key] = series
+            return series
+        measurement = self._find_measurement_by_id(entry.target_id, expected_kind="line")
+        if measurement is None:
+            return None
+        profile = self.extract_line_profile(measurement)
+        if profile is None:
+            return None
+        series = {
+            "distance_px": np.asarray(profile.get("distance_px", []), dtype=np.float64).tolist(),
+            "distance_mm": None
+            if profile.get("distance_mm") is None
+            else np.asarray(profile.get("distance_mm", []), dtype=np.float64).tolist(),
+            "intensity": np.asarray(profile.get("intensity", []), dtype=np.float64).tolist(),
+        }
+        self.line_profile_series_cache[cache_key] = series
+        return series
+
+    def build_line_profile_overlay_data(self, entries: list[ResultHistoryEntry]) -> dict[str, Any]:
+        profile_entries = [entry for entry in entries if entry.measurement_type == "Line Profile"]
+        if not profile_entries:
+            return {"series": [], "axis": "px", "missing": []}
+        deduped: list[ResultHistoryEntry] = []
+        seen_keys: set[tuple[str, str, int]] = set()
+        for entry in profile_entries:
+            key = (entry.source_image_path, entry.target_id, int(entry.frame_index))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append(entry)
+        series_data: list[dict[str, Any]] = []
+        missing_labels: list[str] = []
+        for index, entry in enumerate(deduped):
+            series = self.resolve_line_profile_series(entry)
+            if series is None:
+                missing_labels.append(entry.target_name or entry.metric)
+                continue
+            distance_px = np.asarray(series.get("distance_px", []), dtype=np.float64)
+            intensity = np.asarray(series.get("intensity", []), dtype=np.float64)
+            if distance_px.size == 0 or intensity.size == 0:
+                missing_labels.append(entry.target_name or entry.metric)
+                continue
+            distance_mm_raw = series.get("distance_mm")
+            distance_mm = None if distance_mm_raw is None else np.asarray(distance_mm_raw, dtype=np.float64)
+            feature_input = {
+                "distance_px": distance_px,
+                "distance_mm": distance_mm,
+                "intensity": intensity,
+            }
+            features = self.compute_profile_features(feature_input)
+            series_data.append(
+                {
+                    "label": entry.target_name or entry.metric,
+                    "distance_px": distance_px,
+                    "distance_mm": distance_mm,
+                    "intensity": intensity,
+                    "is_baseline": index == 0,
+                    "features": features,
+                }
+            )
+        use_mm_axis = bool(series_data) and all(
+            item["distance_mm"] is not None and len(item["distance_mm"]) == len(item["intensity"])
+            for item in series_data
+        )
+        return {
+            "series": series_data,
+            "axis": "mm" if use_mm_axis else "px",
+            "missing": missing_labels,
+        }
+
+    def render_line_profile_overlay_chart(self, parent: tk.Widget, overlay_data: dict[str, Any]) -> None:
+        canvas = tk.Canvas(parent, bg="white", height=220, highlightthickness=1, highlightbackground="#d1d5db")
+        canvas.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        series = overlay_data.get("series", [])
+        if not series:
+            canvas.create_text(12, 12, text="Line profile data unavailable", anchor="nw", fill="#6b7280")
+            return
+        axis_key = "distance_mm" if overlay_data.get("axis") == "mm" else "distance_px"
+        all_x = np.concatenate([np.asarray(item[axis_key], dtype=np.float64) for item in series])
+        all_y = np.concatenate([np.asarray(item["intensity"], dtype=np.float64) for item in series])
+        x_min, x_max = float(np.min(all_x)), float(np.max(all_x))
+        y_min, y_max = float(np.min(all_y)), float(np.max(all_y))
+        if abs(x_max - x_min) < 1e-9:
+            x_max = x_min + 1.0
+        if abs(y_max - y_min) < 1e-9:
+            y_max = y_min + 1.0
+        width = max(canvas.winfo_reqwidth(), 900)
+        height = 220
+        left, top, right, bottom = 56, 18, width - 16, height - 34
+        canvas.create_line(left, bottom, right, bottom, fill="#9ca3af")
+        canvas.create_line(left, top, left, bottom, fill="#9ca3af")
+        colors = ("#2563eb", "#dc2626", "#16a34a", "#a855f7", "#f59e0b")
+        for index, item in enumerate(series):
+            xs = np.asarray(item[axis_key], dtype=np.float64)
+            ys = np.asarray(item["intensity"], dtype=np.float64)
+            points: list[float] = []
+            for x_value, y_value in zip(xs, ys):
+                px = left + (float(x_value - x_min) / float(x_max - x_min)) * (right - left)
+                py = bottom - (float(y_value - y_min) / float(y_max - y_min)) * (bottom - top)
+                points.extend([px, py])
+            color = colors[index % len(colors)]
+            width_px = 3 if item.get("is_baseline") else 2
+            dash = () if item.get("is_baseline") else (4, 2)
+            if len(points) >= 4:
+                canvas.create_line(*points, fill=color, width=width_px, dash=dash, smooth=True)
+            self.render_profile_feature_markers(canvas, xs, ys, x_min, x_max, y_min, y_max, left, right, top, bottom, color)
+            legend_y = top + index * 16
+            canvas.create_line(right - 210, legend_y + 8, right - 188, legend_y + 8, fill=color, width=width_px, dash=dash)
+            canvas.create_text(right - 182, legend_y + 8, text=item["label"], anchor="w", fill="#111827")
+        x_label = "Distance (mm)" if overlay_data.get("axis") == "mm" else "Distance (px)"
+        canvas.create_text((left + right) / 2, height - 12, text=x_label, fill="#374151")
+        canvas.create_text(12, (top + bottom) / 2, text="Intensity", fill="#374151", angle=90)
+
+    def find_half_max_crossings(
+        self,
+        x_values: np.ndarray,
+        y_values: np.ndarray,
+        peak_index: int,
+        half_max: float,
+    ) -> tuple[float | None, float | None]:
+        left_cross: float | None = None
+        right_cross: float | None = None
+        for index in range(peak_index, 0, -1):
+            y1, y0 = float(y_values[index]), float(y_values[index - 1])
+            if (y1 - half_max) * (y0 - half_max) <= 0 and abs(y1 - y0) > 1e-12:
+                ratio = (half_max - y0) / (y1 - y0)
+                left_cross = float(x_values[index - 1] + ratio * (x_values[index] - x_values[index - 1]))
+                break
+        for index in range(peak_index, len(y_values) - 1):
+            y0, y1 = float(y_values[index]), float(y_values[index + 1])
+            if (y0 - half_max) * (y1 - half_max) <= 0 and abs(y1 - y0) > 1e-12:
+                ratio = (half_max - y0) / (y1 - y0)
+                right_cross = float(x_values[index] + ratio * (x_values[index + 1] - x_values[index]))
+                break
+        return left_cross, right_cross
+
+    def compute_fwhm(self, x_values: np.ndarray, y_values: np.ndarray, peak_index: int, peak_value: float) -> dict[str, Any]:
+        if len(x_values) < 3 or len(y_values) < 3 or peak_value <= 0:
+            return {"fwhm": None, "half_max": None, "left_cross": None, "right_cross": None}
+        half_max = float(peak_value * 0.5)
+        left_cross, right_cross = self.find_half_max_crossings(x_values, y_values, peak_index, half_max)
+        if left_cross is None or right_cross is None or right_cross <= left_cross:
+            return {"fwhm": None, "half_max": half_max, "left_cross": left_cross, "right_cross": right_cross}
+        return {
+            "fwhm": float(right_cross - left_cross),
+            "half_max": half_max,
+            "left_cross": left_cross,
+            "right_cross": right_cross,
+        }
+
+    def compute_profile_features(self, profile: dict[str, Any]) -> dict[str, Any]:
+        intensity = np.asarray(profile.get("intensity", []), dtype=np.float64)
+        if intensity.size == 0:
+            return {
+                "peak_value": None,
+                "peak_position": None,
+                "valley_value": None,
+                "valley_position": None,
+                "fwhm": None,
+                "distance_unit": "px",
+                "half_max": None,
+                "fwhm_left": None,
+                "fwhm_right": None,
+            }
+        distance_mm_raw = profile.get("distance_mm")
+        distance_mm = None if distance_mm_raw is None else np.asarray(distance_mm_raw, dtype=np.float64)
+        use_mm = distance_mm is not None and len(distance_mm) == len(intensity)
+        x_values = distance_mm if use_mm else np.asarray(profile.get("distance_px", []), dtype=np.float64)
+        if len(x_values) != len(intensity):
+            x_values = np.linspace(0.0, float(len(intensity) - 1), num=len(intensity))
+        peak_index = int(np.argmax(intensity))
+        valley_index = int(np.argmin(intensity))
+        peak_value = float(intensity[peak_index])
+        valley_value = float(intensity[valley_index])
+        fwhm_data = self.compute_fwhm(x_values, intensity, peak_index, peak_value)
+        return {
+            "peak_value": peak_value,
+            "peak_position": float(x_values[peak_index]),
+            "valley_value": valley_value,
+            "valley_position": float(x_values[valley_index]),
+            "fwhm": fwhm_data["fwhm"],
+            "distance_unit": "mm" if use_mm else "px",
+            "half_max": fwhm_data["half_max"],
+            "fwhm_left": fwhm_data["left_cross"],
+            "fwhm_right": fwhm_data["right_cross"],
+        }
+
+    def render_profile_feature_markers(
+        self,
+        canvas: tk.Canvas,
+        x_values: np.ndarray,
+        y_values: np.ndarray,
+        x_min: float,
+        x_max: float,
+        y_min: float,
+        y_max: float,
+        left: float,
+        right: float,
+        top: float,
+        bottom: float,
+        color: str,
+    ) -> None:
+        if len(x_values) < 2 or len(y_values) < 2:
+            return
+        profile = {"distance_px": x_values, "distance_mm": None, "intensity": y_values}
+        features = self.compute_profile_features(profile)
+        peak_pos = features.get("peak_position")
+        peak_val = features.get("peak_value")
+        if peak_pos is None or peak_val is None:
+            return
+        px = left + (float(peak_pos - x_min) / float(x_max - x_min)) * (right - left)
+        py = bottom - (float(peak_val - y_min) / float(y_max - y_min)) * (bottom - top)
+        canvas.create_oval(px - 3, py - 3, px + 3, py + 3, fill=color, outline="")
+        left_cross = features.get("fwhm_left")
+        right_cross = features.get("fwhm_right")
+        half_max = features.get("half_max")
+        if left_cross is None or right_cross is None or half_max is None:
+            return
+        x1 = left + (float(left_cross - x_min) / float(x_max - x_min)) * (right - left)
+        x2 = left + (float(right_cross - x_min) / float(x_max - x_min)) * (right - left)
+        yh = bottom - (float(half_max - y_min) / float(y_max - y_min)) * (bottom - top)
+        canvas.create_line(x1, yh, x2, yh, fill=color, width=2)
+
+    def build_delta_profile_data(self, overlay_data: dict[str, Any]) -> dict[str, Any]:
+        series = list(overlay_data.get("series", []))
+        if len(series) <= 1:
+            return {"series": [], "axis": overlay_data.get("axis", "px")}
+        baseline = next((item for item in series if item.get("is_baseline")), series[0])
+        axis_key = "distance_mm" if overlay_data.get("axis") == "mm" else "distance_px"
+        baseline_x = np.asarray(baseline.get(axis_key, []), dtype=np.float64)
+        baseline_y = np.asarray(baseline.get("intensity", []), dtype=np.float64)
+        delta_series: list[dict[str, Any]] = []
+        for item in series:
+            if item is baseline:
+                continue
+            target_y = np.asarray(item.get("intensity", []), dtype=np.float64)
+            usable = min(len(baseline_x), len(baseline_y), len(target_y))
+            if usable <= 1:
+                continue
+            delta_series.append(
+                {
+                    "label": f"{item['label']} vs baseline",
+                    "x": baseline_x[:usable],
+                    "delta": target_y[:usable] - baseline_y[:usable],
+                }
+            )
+        return {
+            "series": delta_series,
+            "axis": overlay_data.get("axis", "px"),
+            "baseline_label": baseline.get("label", "baseline"),
+        }
+
+    def render_delta_profile_chart(self, parent: tk.Widget, delta_data: dict[str, Any]) -> None:
+        series = list(delta_data.get("series", []))
+        if not series:
+            return
+        canvas = tk.Canvas(parent, bg="white", height=200, highlightthickness=1, highlightbackground="#d1d5db")
+        canvas.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        all_x = np.concatenate([np.asarray(item["x"], dtype=np.float64) for item in series])
+        all_y = np.concatenate([np.asarray(item["delta"], dtype=np.float64) for item in series] + [np.asarray([0.0])])
+        x_min, x_max = float(np.min(all_x)), float(np.max(all_x))
+        y_min, y_max = float(np.min(all_y)), float(np.max(all_y))
+        if abs(x_max - x_min) < 1e-9:
+            x_max = x_min + 1.0
+        if abs(y_max - y_min) < 1e-9:
+            y_max = y_min + 1.0
+        width = max(canvas.winfo_reqwidth(), 900)
+        height = 200
+        left, top, right, bottom = 56, 16, width - 16, height - 32
+        canvas.create_line(left, bottom, right, bottom, fill="#9ca3af")
+        canvas.create_line(left, top, left, bottom, fill="#9ca3af")
+        zero_py = bottom - (0.0 - y_min) / (y_max - y_min) * (bottom - top)
+        canvas.create_line(left, zero_py, right, zero_py, fill="#64748b", dash=(3, 3))
+        colors = ("#dc2626", "#16a34a", "#a855f7", "#f59e0b")
+        for index, item in enumerate(series):
+            xs = np.asarray(item["x"], dtype=np.float64)
+            ys = np.asarray(item["delta"], dtype=np.float64)
+            points: list[float] = []
+            for x_value, y_value in zip(xs, ys):
+                px = left + (float(x_value - x_min) / float(x_max - x_min)) * (right - left)
+                py = bottom - (float(y_value - y_min) / float(y_max - y_min)) * (bottom - top)
+                points.extend([px, py])
+            color = colors[index % len(colors)]
+            if len(points) >= 4:
+                canvas.create_line(*points, fill=color, width=2, smooth=True)
+            legend_y = top + index * 16
+            canvas.create_line(right - 260, legend_y + 8, right - 238, legend_y + 8, fill=color, width=2)
+            canvas.create_text(right - 232, legend_y + 8, text=item["label"], anchor="w", fill="#111827")
+        x_label = "Distance (mm)" if delta_data.get("axis") == "mm" else "Distance (px)"
+        canvas.create_text((left + right) / 2, height - 12, text=x_label, fill="#374151")
+        canvas.create_text(12, (top + bottom) / 2, text="ΔIntensity", fill="#374151", angle=90)
+
+    def build_history_comparison(self, entries: list[ResultHistoryEntry]) -> dict[str, Any]:
+        comparable_entries = [entry for entry in entries if isinstance(entry.value, (int, float))]
+        if len(comparable_entries) < 2:
+            raise ValueError("at least two numeric history rows are required for comparison")
+        entries = comparable_entries
+        baseline = entries[0]
+        mixed_metrics = len({entry.metric for entry in entries}) > 1
+        values = [float(entry.value) for entry in entries]
+        min_value = min(values)
+        max_value = max(values)
+        baseline_features: dict[str, Any] | None = None
+        if baseline.measurement_type == "Line Profile":
+            baseline_series = self.resolve_line_profile_series(baseline)
+            if baseline_series is not None:
+                baseline_features = self.compute_profile_features(
+                    {
+                        "distance_px": np.asarray(baseline_series.get("distance_px", []), dtype=np.float64),
+                        "distance_mm": None
+                        if baseline_series.get("distance_mm") is None
+                        else np.asarray(baseline_series.get("distance_mm", []), dtype=np.float64),
+                        "intensity": np.asarray(baseline_series.get("intensity", []), dtype=np.float64),
+                    }
+                )
+        rows: list[dict[str, Any]] = []
+        for entry in entries:
+            difference = float(entry.value - baseline.value)
+            entry_features: dict[str, Any] | None = None
+            if entry.measurement_type == "Line Profile":
+                series = self.resolve_line_profile_series(entry)
+                if series is not None:
+                    entry_features = self.compute_profile_features(
+                        {
+                            "distance_px": np.asarray(series.get("distance_px", []), dtype=np.float64),
+                            "distance_mm": None
+                            if series.get("distance_mm") is None
+                            else np.asarray(series.get("distance_mm", []), dtype=np.float64),
+                            "intensity": np.asarray(series.get("intensity", []), dtype=np.float64),
+                        }
+                    )
+            delta_peak_pos = None
+            delta_peak_value = None
+            delta_fwhm = None
+            if baseline_features is not None and entry_features is not None:
+                if isinstance(entry_features.get("peak_position"), (int, float)) and isinstance(
+                    baseline_features.get("peak_position"), (int, float)
+                ):
+                    delta_peak_pos = float(entry_features["peak_position"] - baseline_features["peak_position"])
+                if isinstance(entry_features.get("peak_value"), (int, float)) and isinstance(
+                    baseline_features.get("peak_value"), (int, float)
+                ):
+                    delta_peak_value = float(entry_features["peak_value"] - baseline_features["peak_value"])
+                if isinstance(entry_features.get("fwhm"), (int, float)) and isinstance(baseline_features.get("fwhm"), (int, float)):
+                    delta_fwhm = float(entry_features["fwhm"] - baseline_features["fwhm"])
+            rows.append(
+                {
+                    "entry": entry,
+                    "difference": difference,
+                    "percent_change": self._format_percent_change(float(entry.value), float(baseline.value)),
+                    "is_baseline": entry is baseline,
+                    "is_min": abs(float(entry.value) - min_value) < 1e-12,
+                    "is_max": abs(float(entry.value) - max_value) < 1e-12,
+                    "features": entry_features,
+                    "delta_peak_position": delta_peak_pos,
+                    "delta_peak_value": delta_peak_value,
+                    "delta_fwhm": delta_fwhm,
+                }
+            )
+        return {
+            "baseline": baseline,
+            "rows": rows,
+            "mixed_metrics": mixed_metrics,
+            "metric_name": baseline.metric,
+        }
+
+    def format_comparison_table(self, comparison: dict[str, Any]) -> list[tuple[str, ...]]:
+        formatted: list[tuple[str, ...]] = []
+        for row in comparison["rows"]:
+            entry: ResultHistoryEntry = row["entry"]
+            features = row.get("features") or {}
+            badge = ""
+            if row["is_min"]:
+                badge = "MIN"
+            if row["is_max"]:
+                badge = "MAX" if not badge else "MIN/MAX"
+            note_short = entry.note.replace("\n", " | ")
+            if len(note_short) > 80:
+                note_short = f"{note_short[:77]}..."
+            peak_value_text = "-"
+            peak_pos_text = "-"
+            fwhm_text = "-"
+            if isinstance(features.get("peak_value"), (int, float)):
+                peak_value_text = f"{float(features['peak_value']):.2f}"
+            if isinstance(features.get("peak_position"), (int, float)):
+                peak_pos_text = f"{float(features['peak_position']):.2f}"
+            if isinstance(features.get("fwhm"), (int, float)):
+                fwhm_text = f"{float(features['fwhm']):.2f}"
+            d_peak_pos = row.get("delta_peak_position")
+            d_peak_value = row.get("delta_peak_value")
+            d_fwhm = row.get("delta_fwhm")
+            formatted.append(
+                (
+                    entry.timestamp,
+                    entry.image_name,
+                    str(entry.frame_index),
+                    entry.measurement_type,
+                    entry.target_name,
+                    entry.metric,
+                    self._format_history_value(entry.value),
+                    entry.unit,
+                    "-" if row["is_baseline"] else f"{row['difference']:.2f}",
+                    "-" if row["is_baseline"] else row["percent_change"],
+                    peak_value_text,
+                    peak_pos_text,
+                    fwhm_text,
+                    "-" if d_peak_value is None or row["is_baseline"] else f"{float(d_peak_value):.2f}",
+                    "-" if d_peak_pos is None or row["is_baseline"] else f"{float(d_peak_pos):.2f}",
+                    "-" if d_fwhm is None or row["is_baseline"] else f"{float(d_fwhm):.2f}",
+                    badge,
+                    note_short,
+                )
+            )
+        return formatted
+
+    def render_history_comparison(self, comparison: dict[str, Any]) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Results History Compare")
+        dialog.geometry("1540x760")
+        header_text = (
+            f"Baseline: {comparison['baseline'].metric} @ {comparison['baseline'].timestamp} "
+            f"({comparison['baseline'].target_name})"
+        )
+        ttk.Label(dialog, text=header_text).pack(anchor="w", padx=8, pady=(8, 4))
+        columns = (
+            "timestamp",
+            "image",
+            "frame",
+            "type",
+            "target",
+            "metric",
+            "value",
+            "unit",
+            "diff",
+            "pct",
+            "peak_i",
+            "peak_pos",
+            "fwhm",
+            "d_peak_i",
+            "d_peak_pos",
+            "d_fwhm",
+            "highlight",
+            "note",
+        )
+        tree = ttk.Treeview(dialog, columns=columns, show="headings", height=14)
+        headers = {
+            "timestamp": "Timestamp",
+            "image": "Image Name",
+            "frame": "Frame",
+            "type": "Measurement Type",
+            "target": "Target Name",
+            "metric": "Metric",
+            "value": "Value",
+            "unit": "Unit",
+            "diff": "Difference",
+            "pct": "Percent Change",
+            "peak_i": "Peak I",
+            "peak_pos": "Peak Pos",
+            "fwhm": "FWHM",
+            "d_peak_i": "ΔPeak I",
+            "d_peak_pos": "ΔPeak Pos",
+            "d_fwhm": "ΔFWHM",
+            "highlight": "Min/Max",
+            "note": "Note",
+        }
+        widths = {
+            "timestamp": 150,
+            "image": 120,
+            "frame": 60,
+            "type": 110,
+            "target": 110,
+            "metric": 90,
+            "value": 70,
+            "unit": 60,
+            "diff": 85,
+            "pct": 95,
+            "peak_i": 80,
+            "peak_pos": 80,
+            "fwhm": 80,
+            "d_peak_i": 85,
+            "d_peak_pos": 90,
+            "d_fwhm": 80,
+            "highlight": 80,
+            "note": 220,
+        }
+        for key in columns:
+            tree.heading(key, text=headers[key])
+            tree.column(key, width=widths[key], anchor="w")
+        tree.tag_configure("baseline_row", background="#ecfeff")
+        tree.tag_configure("min_row", background="#eff6ff")
+        tree.tag_configure("max_row", background="#fef3c7")
+        tree.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        for row_tuple, row in zip(self.format_comparison_table(comparison), comparison["rows"]):
+            tags: list[str] = []
+            if row["is_baseline"]:
+                tags.append("baseline_row")
+            if row["is_min"]:
+                tags.append("min_row")
+            if row["is_max"]:
+                tags.append("max_row")
+            tree.insert("", "end", values=row_tuple, tags=tuple(tags))
+        overlay_data = self.build_line_profile_overlay_data([row["entry"] for row in comparison["rows"]])
+        if overlay_data.get("series") or overlay_data.get("missing"):
+            subtitle = ttk.Label(dialog, text="Line Profile Overlay", font=("TkDefaultFont", 9, "bold"))
+            subtitle.pack(anchor="w", padx=8, pady=(2, 4))
+            self.render_line_profile_overlay_chart(dialog, overlay_data)
+            delta_data = self.build_delta_profile_data(overlay_data)
+            if delta_data.get("series"):
+                delta_title = ttk.Label(dialog, text="Delta Profile (vs baseline)", font=("TkDefaultFont", 9, "bold"))
+                delta_title.pack(anchor="w", padx=8, pady=(0, 4))
+                self.render_delta_profile_chart(dialog, delta_data)
+            missing = overlay_data.get("missing", [])
+            if missing:
+                ttk.Label(
+                    dialog,
+                    text=f"profile data unavailable: {', '.join(missing)}",
+                    foreground="#92400e",
+                ).pack(anchor="w", padx=8, pady=(0, 8))
+
+    def compare_selected_history_rows(self) -> None:
+        table = self.result_history_table
+        if table is None:
+            return
+        result_entries = self._selected_history_entries()
+        if len(result_entries) < 2:
+            messagebox.showinfo("Compare", "비교하려면 2개 이상 선택하세요.")
+            return
+        if len(result_entries) > 5:
+            messagebox.showinfo("Compare", "한 번에 최대 5개까지만 비교할 수 있습니다.")
+            return
+        entries = [entry for _index, entry in result_entries]
+        try:
+            comparison = self.build_history_comparison(entries)
+        except ValueError:
+            messagebox.showwarning("Compare", "숫자 값이 있는 행 2개 이상을 선택하세요.")
+            return
+        if comparison["mixed_metrics"]:
+            messagebox.showwarning("Compare", "같은 metric 비교를 권장합니다. (혼합 metric 계속 진행)")
+        self.render_history_comparison(comparison)
+
+    @staticmethod
+    def _latest_metric_value(entries: list[ResultHistoryEntry], metric_name: str, measurement_type: str) -> float | None:
+        for entry in reversed(entries):
+            if entry.measurement_type == measurement_type and entry.metric.strip().upper() == metric_name.strip().upper():
+                if isinstance(entry.value, (int, float)):
+                    return float(entry.value)
+                return None
+        return None
+
+    @staticmethod
+    def _format_group_metric(value: float | None) -> str:
+        return "-" if value is None else f"{float(value):.2f}"
+
+    def build_group_history_comparison(self, group_ids: list[str]) -> dict[str, Any]:
+        all_entries = self._select_result_history_entries()
+        groups: list[dict[str, Any]] = []
+        line_overlay_entries: list[ResultHistoryEntry] = []
+        analysis_groups = self._select_analysis_groups_map()
+        for index, group_id in enumerate(group_ids):
+            group = analysis_groups.get(group_id)
+            if group is None:
+                continue
+            group_entries = [entry for entry in all_entries if entry.group_id == group_id]
+            if not group_entries:
+                continue
+            snr_value = self._latest_metric_value(group_entries, "SNR", "Analysis")
+            cnr_value = self._latest_metric_value(group_entries, "CNR", "Analysis")
+            uniformity_value = self._latest_metric_value(group_entries, "UNIFORMITY", "Analysis")
+            line_mean_value = self._latest_metric_value(group_entries, "PROFILEMEAN", "Line Profile")
+            groups.append(
+                {
+                    "group_id": group.group_id,
+                    "image_name": group.image_name,
+                    "frames": ",".join(str(item) for item in group.frame_indices) if group.frame_indices else "",
+                    "created_at": group.created_at.replace("T", " ")[:19],
+                    "roi_source_type": group.roi_source_type,
+                    "snr": snr_value,
+                    "cnr": cnr_value,
+                    "uniformity": uniformity_value,
+                    "line_mean": line_mean_value,
+                    "is_baseline": index == 0,
+                }
+            )
+            line_entry = next(
+                (
+                    entry
+                    for entry in reversed(group_entries)
+                    if entry.measurement_type == "Line Profile" and entry.target_id
+                ),
+                None,
+            )
+            if line_entry is not None:
+                line_overlay_entries.append(line_entry)
+        return {"groups": groups, "baseline_group_id": groups[0]["group_id"] if groups else "", "line_overlay_entries": line_overlay_entries}
+
+    def render_group_history_comparison(self, comparison: dict[str, Any]) -> None:
+        groups = list(comparison.get("groups", []))
+        if len(groups) < 2:
+            messagebox.showinfo("Compare", "비교 가능한 group 결과가 부족합니다.")
+            return
+        baseline = groups[0]
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Group Compare")
+        dialog.geometry("1320x700")
+        ttk.Label(
+            dialog,
+            text=f"Baseline Group: {baseline['image_name']} ({baseline['group_id'][:8]})",
+        ).pack(anchor="w", padx=8, pady=(8, 4))
+        columns = ("group", "image", "frames", "source", "snr", "d_snr", "cnr", "d_cnr", "uniformity", "d_uniformity", "line", "d_line")
+        tree = ttk.Treeview(dialog, columns=columns, show="headings", height=10)
+        headers = {
+            "group": "Group ID",
+            "image": "Image",
+            "frames": "Frames",
+            "source": "ROI Source",
+            "snr": "SNR",
+            "d_snr": "ΔSNR",
+            "cnr": "CNR",
+            "d_cnr": "ΔCNR",
+            "uniformity": "Uniformity",
+            "d_uniformity": "ΔUniformity",
+            "line": "Line Mean",
+            "d_line": "ΔLine Mean",
+        }
+        widths = {"group": 120, "image": 150, "frames": 90, "source": 120, "snr": 80, "d_snr": 90, "cnr": 80, "d_cnr": 90, "uniformity": 90, "d_uniformity": 100, "line": 90, "d_line": 100}
+        for key in columns:
+            tree.heading(key, text=headers[key])
+            tree.column(key, width=widths[key], anchor="w")
+        tree.tag_configure("baseline_row", background="#ecfeff")
+        tree.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        def _delta_text(value: float | None, baseline_value: float | None) -> str:
+            if value is None or baseline_value is None:
+                return "-"
+            return f"{(float(value) - float(baseline_value)):.2f}"
+
+        for row in groups:
+            values = (
+                str(row["group_id"])[:8],
+                str(row["image_name"]),
+                str(row["frames"]),
+                str(row["roi_source_type"]),
+                self._format_group_metric(row.get("snr")),
+                _delta_text(row.get("snr"), baseline.get("snr")),
+                self._format_group_metric(row.get("cnr")),
+                _delta_text(row.get("cnr"), baseline.get("cnr")),
+                self._format_group_metric(row.get("uniformity")),
+                _delta_text(row.get("uniformity"), baseline.get("uniformity")),
+                self._format_group_metric(row.get("line_mean")),
+                _delta_text(row.get("line_mean"), baseline.get("line_mean")),
+            )
+            tags = ("baseline_row",) if bool(row.get("is_baseline")) else ()
+            tree.insert("", "end", values=values, tags=tags)
+
+        overlay_entries = list(comparison.get("line_overlay_entries", []))
+        if len(overlay_entries) >= 2:
+            overlay_data = self.build_line_profile_overlay_data(overlay_entries)
+            if overlay_data.get("series"):
+                ttk.Label(dialog, text="Line Profile Overlay", font=("TkDefaultFont", 9, "bold")).pack(anchor="w", padx=8, pady=(2, 4))
+                self.render_line_profile_overlay_chart(dialog, overlay_data)
+                delta_data = self.build_delta_profile_data(overlay_data)
+                if delta_data.get("series"):
+                    ttk.Label(dialog, text="Delta Profile (vs baseline)", font=("TkDefaultFont", 9, "bold")).pack(anchor="w", padx=8, pady=(0, 4))
+                    self.render_delta_profile_chart(dialog, delta_data)
+
+    def resolve_history_entry_target(self, entry: ResultHistoryEntry) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "status": "ok",
+            "image_found": False,
+            "frame_found": False,
+            "measurement": None,
+            "related_measurements": [],
+            "message": "",
+        }
+        target_path = entry.source_image_path
+        if self.file_paths:
+            file_index = -1
+            if target_path and target_path in self.file_paths:
+                file_index = self.file_paths.index(target_path)
+            elif entry.image_name:
+                for index, path in enumerate(self.file_paths):
+                    if Path(path).name == entry.image_name:
+                        file_index = index
+                        break
+            if file_index >= 0 and file_index != self.current_file_index:
+                self._load_file(file_index, preserve_view_state=False)
+            result["image_found"] = file_index >= 0
+        else:
+            result["image_found"] = True
+
+        frame_index = int(entry.frame_index)
+        if self.frames and 0 <= frame_index < len(self.frames):
+            if self.current_frame != frame_index:
+                self.current_frame = frame_index
+                self._show_frame()
+            result["frame_found"] = True
+        else:
+            result["frame_found"] = False
+
+        measurement = None
+        if entry.target_id:
+            expected_kind = "roi" if entry.measurement_type == "ROI" else ("line" if entry.measurement_type == "Line Profile" else None)
+            measurement = self._find_measurement_by_id(entry.target_id, expected_kind=expected_kind)
+        if measurement is None and entry.measurement_type == "ROI":
+            display_map = self._build_roi_display_name_map()
+            for measurement_id, label in display_map.items():
+                if label == entry.target_name:
+                    measurement = self._find_measurement_by_id(measurement_id, expected_kind="roi")
+                    break
+        if measurement is None and entry.measurement_type == "Line Profile":
+            for candidate in self._selector_measurements_for_current_frame(kind="line"):
+                if candidate.kind != "line":
+                    continue
+                line_index = self._line_index_for_measurement_id(candidate.id)
+                if f"Line {line_index}" == entry.target_name:
+                    measurement = candidate
+                    break
+        result["measurement"] = measurement
+        related: list[Measurement] = []
+        for related_id in entry.related_target_ids:
+            found = self._find_measurement_by_id(related_id)
+            if found is not None:
+                related.append(found)
+        result["related_measurements"] = related
+
+        if not result["image_found"]:
+            result["status"] = "partial"
+            result["message"] = "Original target not available"
+        elif not result["frame_found"]:
+            result["status"] = "partial"
+            result["message"] = "Image found but frame unavailable"
+        elif measurement is None and entry.measurement_type in {"ROI", "Line Profile"}:
+            result["status"] = "partial"
+            result["message"] = "Image/frame found but ROI/Line no longer exists"
+        return result
+
+    def highlight_measurement_target(self, measurement: Measurement | None, related: list[Measurement] | None = None) -> None:
+        if measurement is not None:
+            self.selected_persistent_measurement_id = measurement.id
+        elif related:
+            self.selected_persistent_measurement_id = related[0].id
+        else:
+            self.selected_persistent_measurement_id = None
+        self._draw_persistent_measurements()
+
+    def activate_history_entry(self, entry: ResultHistoryEntry) -> None:
+        resolved = self.resolve_history_entry_target(entry)
+        measurement = resolved.get("measurement")
+        related = resolved.get("related_measurements", [])
+        self.highlight_measurement_target(measurement, related)
+
+        if entry.measurement_type == "Line Profile" and isinstance(measurement, Measurement):
+            self.analysis_inputs["line_profile_line_id"].set(measurement.id)
+            self._sync_analysis_display_value("line", "line_profile", "line_profile_line_id")
+            self._on_line_profile_selection_changed()
+        elif entry.measurement_type == "Analysis":
+            if related:
+                self.highlight_measurement_target(related[0], related)
+            metric = entry.metric
+            self.analysis_results["line_info"].set(f"History metric selected: {metric}")
+
+        message = str(resolved.get("message", "")).strip()
+        if message:
+            self.info_var.set(message)
+        else:
+            self.info_var.set(
+                f"History selected: {entry.measurement_type} | {entry.target_name} | Frame {entry.frame_index + 1}"
+            )
 
     def _refresh_analysis_selectors(self) -> None:
         roi_options = self._build_roi_analysis_options()
@@ -996,9 +3039,11 @@ class DicomViewer:
             for index in selected_indexes:
                 listbox.selection_set(index)
         self._auto_bind_analysis_inputs_from_roles(overwrite_existing=False)
+        self._sync_mtf_roi_binding_state()
         self._update_uniformity_input_ui()
         self._refresh_analysis_results_panel()
         self._refresh_image_analysis_selectors()
+        self._schedule_mtf_graph_redraw()
 
     def _refresh_image_analysis_selectors(self) -> None:
         image_options = self._build_image_analysis_options()
@@ -1098,10 +3143,13 @@ class DicomViewer:
         if combobox is None:
             return
         selected_id = self.analysis_inputs[input_key].get()
+        option_map = self._analysis_option_maps.get(kind, {})
         if not selected_id:
+            current_label = combobox.get().strip()
+            if current_label and current_label in option_map:
+                return
             combobox.set("")
             return
-        option_map = self._analysis_option_maps.get(kind, {})
         for label, measurement_id in option_map.items():
             if measurement_id == selected_id:
                 combobox.set(label)
@@ -1129,14 +3177,8 @@ class DicomViewer:
         if normalized_role is None:
             return None
         current_geometry = self._get_current_geometry_key()
-        for measurement in reversed(self.persistent_measurements):
-            if measurement.kind != "roi":
-                continue
-            if not self._geometry_matches(measurement.geometry_key, current_geometry):
-                continue
-            if measurement.frame_index != self.current_frame:
-                continue
-            if self._get_measurement_roi_role(measurement) == normalized_role:
+        for measurement in reversed(self._selector_measurements_for_current_frame(kind="roi")):
+            if self._geometry_matches(measurement.geometry_key, current_geometry) and self._get_measurement_roi_role(measurement) == normalized_role:
                 return measurement
         return None
 
@@ -1163,19 +3205,60 @@ class DicomViewer:
         cnr_button = action_buttons.get("cnr")
         signal_roi = self._find_roi_by_role("signal")
         snr_noise_roi = self._find_roi_by_role("background") or self._find_roi_by_role("noise")
+        manual_signal_roi = self._peek_selected_measurement_from_analysis("roi", "snr_signal_roi_id", "snr_signal")
+        manual_snr_noise_roi = self._peek_selected_measurement_from_analysis("roi", "snr_background_roi_id", "snr_noise")
         cnr_target_roi = self._find_roi_by_role("target")
         cnr_reference_roi = self._find_roi_by_role("reference")
         cnr_noise_roi = self._find_roi_by_role("noise")
+        manual_cnr_target_roi = self._peek_selected_measurement_from_analysis("roi", "cnr_target_roi_id", "cnr_target")
+        manual_cnr_reference_roi = self._peek_selected_measurement_from_analysis("roi", "cnr_reference_roi_id", "cnr_reference")
+        manual_cnr_noise_roi = self._peek_selected_measurement_from_analysis("roi", "cnr_noise_roi_id", "cnr_noise")
         formula_var = self.analysis_inputs.get("cnr_formula")
         formula = formula_var.get() if formula_var is not None else "standard_noise"
 
         if snr_button is not None:
-            snr_ready = signal_roi is not None and snr_noise_roi is not None
+            role_ready = signal_roi is not None and snr_noise_roi is not None
+            manual_ready = manual_signal_roi is not None and manual_snr_noise_roi is not None
+            snr_ready = role_ready or manual_ready
             snr_button.configure(state="normal" if snr_ready else "disabled")
+            snr_reason_var = self.analysis_results.get("snr_ready_reason")
+            if snr_reason_var is not None:
+                missing_reasons: list[str] = []
+                if signal_roi is None and manual_signal_roi is None:
+                    missing_reasons.append("signal ROI 미선택")
+                if snr_noise_roi is None and manual_snr_noise_roi is None:
+                    missing_reasons.append("background/noise ROI 미선택")
+                if snr_ready:
+                    source_text = "role-based measurement" if role_ready else "manual measurement"
+                    snr_reason_var.set(f"Ready: {source_text}")
+                else:
+                    if len(missing_reasons) == 2:
+                        snr_reason_var.set("Select Signal ROI and Noise ROI")
+                    elif "signal ROI 미선택" in missing_reasons:
+                        snr_reason_var.set("Signal ROI not selected")
+                    elif "background/noise ROI 미선택" in missing_reasons:
+                        snr_reason_var.set("Noise ROI not selected")
+                    else:
+                        snr_reason_var.set("ROI selection required")
         if cnr_button is not None:
             needs_noise = formula == "standard_noise"
-            cnr_ready = cnr_target_roi is not None and cnr_reference_roi is not None and (cnr_noise_roi is not None or not needs_noise)
+            role_ready = cnr_target_roi is not None and cnr_reference_roi is not None and (cnr_noise_roi is not None or not needs_noise)
+            manual_ready = manual_cnr_target_roi is not None and manual_cnr_reference_roi is not None and (
+                manual_cnr_noise_roi is not None or not needs_noise
+            )
+            cnr_ready = role_ready or manual_ready
             cnr_button.configure(state="normal" if cnr_ready else "disabled")
+        mtf_button = action_buttons.get("mtf")
+        if mtf_button is not None:
+            mtf_active_var = self.analysis_inputs.get("mtf_active_roi_id")
+            mtf_active_id = mtf_active_var.get() if mtf_active_var is not None else ""
+            mtf_roi = self._find_measurement_by_id(mtf_active_id, expected_kind="roi")
+            mtf_ready = mtf_roi is not None and self._is_analysis_compatible_measurement(mtf_roi)
+            mtf_button.configure(state="normal" if mtf_ready else "disabled")
+            if mtf_ready:
+                self.analysis_results["mtf_validation_summary"].set("Validation: ready")
+            else:
+                self.analysis_results["mtf_validation_summary"].set("Validation: select and bind a rectangular ROI")
 
     def _auto_bind_analysis_inputs_from_roles(self, overwrite_existing: bool = False) -> None:
         role_assignment = {
@@ -1204,16 +3287,8 @@ class DicomViewer:
 
     def _build_roi_analysis_options(self) -> list[tuple[str, str]]:
         options: list[tuple[str, str]] = []
-        current_geometry = self._get_current_geometry_key()
-        roi_index = 0
-        for measurement in self.persistent_measurements:
-            if measurement.kind != "roi":
-                continue
-            if not self._geometry_matches(measurement.geometry_key, current_geometry):
-                continue
-            if measurement.frame_index != self.current_frame:
-                continue
-            roi_index += 1
+        roi_display_names = self._build_roi_display_name_map()
+        for measurement in self._iter_visible_roi_measurements():
             metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
             signal_stats = dict(metrics.get("signal_stats") or {})
             mean = float(signal_stats.get("mean", 0.0))
@@ -1221,25 +3296,30 @@ class DicomViewer:
             std = float(signal_stats.get("std", 0.0))
             area_mm2 = metrics.get("area_mm2")
             area_text = f"{area_mm2:.1f} mm²" if isinstance(area_mm2, (int, float)) else f"{metrics['area_px']:.1f} px²"
-            role = self._get_measurement_roi_role(measurement)
-            role_text = f" | role={role}" if role is not None else ""
+            roi_name = roi_display_names.get(measurement.id, self._format_roi_label(0))
             label = (
-                f"{roi_index}번 ROI | 최소값 {min_val:.1f} | 평균값 {mean:.1f} | "
-                f"표준편차 {std:.1f} | 면적 {area_text}{role_text}"
+                f"{roi_name} | Min {min_val:.1f} | Mean {mean:.1f} | "
+                f"SD {std:.1f} | Area {area_text}"
             )
-            options.append((measurement.id, label))
+            options.append((measurement.id, self._sanitize_ui_text(label)))
         return options
 
-    def _get_roi_display_index(self, measurement_id: str) -> int | None:
+    def _iter_visible_roi_measurements(self) -> list[Measurement]:
         current_geometry = self._get_current_geometry_key()
+        return [
+            measurement
+            for measurement in self._selector_measurements_for_current_frame(kind="roi")
+            if self._geometry_matches(measurement.geometry_key, current_geometry)
+            and measurement.frame_index == self.current_frame
+        ]
+
+    @staticmethod
+    def _format_roi_label(index_zero_based: int) -> str:
+        return f"ROI {index_zero_based + 1}"
+
+    def _get_roi_display_index(self, measurement_id: str) -> int | None:
         roi_index = 0
-        for measurement in self.persistent_measurements:
-            if measurement.kind != "roi":
-                continue
-            if not self._geometry_matches(measurement.geometry_key, current_geometry):
-                continue
-            if measurement.frame_index != self.current_frame:
-                continue
+        for measurement in self._iter_visible_roi_measurements():
             roi_index += 1
             if measurement.id == measurement_id:
                 return roi_index
@@ -1248,17 +3328,361 @@ class DicomViewer:
     def _build_line_analysis_options(self) -> list[tuple[str, str]]:
         options: list[tuple[str, str]] = []
         current_geometry = self._get_current_geometry_key()
-        for measurement in self.persistent_measurements:
-            if measurement.kind != "line":
-                continue
+        line_index = 0
+        for measurement in self._selector_measurements_for_current_frame(kind="line"):
             if not self._geometry_matches(measurement.geometry_key, current_geometry):
                 continue
-            if measurement.frame_index != self.current_frame:
-                continue
+            line_index += 1
             metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
-            label = f"Line {measurement.id[:8]} | length {metrics['length_px']:.1f} px"
+            label = f"Line ROI {line_index} | length {metrics['length_px']:.1f} px"
             options.append((measurement.id, label))
         return options
+
+    def _build_roi_display_name_map(self) -> dict[str, str]:
+        display_map: dict[str, str] = {}
+        for index, measurement in enumerate(self._iter_visible_roi_measurements()):
+            display_map[measurement.id] = self._format_roi_label(index)
+        return display_map
+
+    def _display_name_for_roi_id(self, roi_id: str | None) -> str:
+        if not roi_id:
+            return self._format_roi_label(0)
+        return self._build_roi_display_name_map().get(roi_id, self._format_roi_label(0))
+
+    def _sync_mtf_roi_binding_state(self) -> None:
+        mtf_active_var = self.analysis_inputs.get("mtf_active_roi_id")
+        if mtf_active_var is None:
+            return
+        roi_id = mtf_active_var.get().strip()
+        measurement = self._find_measurement_by_id(roi_id, expected_kind="roi") if roi_id else None
+        if measurement is None:
+            mtf_active_var.set("")
+            self.analysis_results["mtf_selected_roi_status"].set("Selected ROI: none")
+        else:
+            self.analysis_results["mtf_selected_roi_status"].set(
+                f"Selected ROI: {self._display_name_for_roi_id(measurement.id)} ({measurement.id[:8]})"
+            )
+
+    def _bind_selected_roi_to_mtf(self) -> None:
+        selected_id = str(self.selected_persistent_measurement_id or "").strip()
+        if not selected_id:
+            self.analysis_results["mtf_validation_summary"].set("Validation: no ROI selected")
+            messagebox.showinfo("MTF Analysis", "선택된 ROI가 없습니다.")
+            return
+        measurement = self._find_measurement_by_id(selected_id)
+        if measurement is None:
+            self.analysis_results["mtf_validation_summary"].set("Validation: selected object no longer exists")
+            return
+        if measurement.kind != "roi":
+            self.analysis_results["mtf_validation_summary"].set("Validation: MTF requires rectangular ROI")
+            messagebox.showwarning("MTF Analysis", "MTF는 사각형 ROI만 사용할 수 있습니다.")
+            return
+        mtf_active_var = self.analysis_inputs.get("mtf_active_roi_id")
+        if mtf_active_var is None:
+            return
+        mtf_active_var.set(measurement.id)
+        self._sync_mtf_roi_binding_state()
+        self._update_analysis_action_button_state()
+
+    def _build_mtf_run_context(self, measurement: Measurement) -> dict[str, Any]:
+        image_id = self.path_var.get().strip() if hasattr(self, "path_var") else ""
+        return {
+            "image_id": image_id or "current_image",
+            "frame_index": int(self.current_frame),
+            "roi_id": measurement.id,
+            "group_id": self.active_group_id,
+            "study_id": self.active_study_id,
+        }
+
+    def _run_mtf_analysis(self) -> None:
+        mtf_active_var = self.analysis_inputs.get("mtf_active_roi_id")
+        roi_id = mtf_active_var.get().strip() if mtf_active_var is not None else ""
+        measurement = self._find_measurement_by_id(roi_id, expected_kind="roi") if roi_id else None
+        if measurement is None:
+            self.analysis_results["mtf_validation_summary"].set("Validation: no bound ROI")
+            messagebox.showinfo("MTF Analysis", "먼저 사각형 ROI를 선택하고 바인딩하세요.")
+            return
+        frame = self._get_frame_pixel_array(measurement.frame_index)
+        roi_pixels, bounds = self._extract_roi_pixels(frame, measurement.start, measurement.end, ensure_non_empty=True)
+        if roi_pixels.size == 0:
+            self.analysis_results["mtf_validation_summary"].set("Validation: ROI pixels unavailable")
+            messagebox.showwarning("MTF Analysis", "ROI 픽셀을 추출할 수 없습니다.")
+            return
+        imaging_mode = self._parse_prefixed_value(self.analysis_inputs["mtf_imaging_mode"].get(), "general_radiography")
+        operating_mode = self._parse_prefixed_value(self.analysis_inputs["mtf_operating_mode"].get(), "strict_iec")
+        mtf_result = self._execute_mtf_pipeline(roi_pixels, bounds, imaging_mode, operating_mode)
+        context = self._build_mtf_run_context(measurement)
+        self.complete_mtf_analysis(mtf_result, context)
+        self._update_mtf_analysis_ui(mtf_result)
+        self._update_analysis_action_button_state()
+
+    def _estimate_edge_snr_for_roi(self, roi_pixels: np.ndarray) -> float | None:
+        if roi_pixels.size == 0:
+            return None
+        p10 = float(np.percentile(roi_pixels, 10))
+        p90 = float(np.percentile(roi_pixels, 90))
+        noise = float(np.std(roi_pixels))
+        if noise <= 0:
+            return None
+        return abs(p90 - p10) / noise
+
+    def _execute_mtf_pipeline(
+        self,
+        roi_pixels: np.ndarray,
+        bounds: tuple[int, int, int, int],
+        imaging_mode: str,
+        operating_mode: str,
+    ) -> dict[str, Any]:
+        phase1 = calculate_slanted_edge_mtf(roi_pixels)
+        edge_snr = self._estimate_edge_snr_for_roi(roi_pixels)
+        phase2 = evaluate_mtf_integrity(phase1, edge_snr=edge_snr, clipping_detected=False)
+        phase3 = grade_mtf_for_internal_qa(phase1, phase2)
+        spacing = self._get_pixel_spacing_mm()
+        roi_width_px = max(bounds[2] - bounds[0], 0)
+        roi_height_px = max(bounds[3] - bounds[1], 0)
+        roi_width_mm = float(roi_width_px * spacing[1]) if spacing is not None else None
+        roi_height_mm = float(roi_height_px * spacing[0]) if spacing is not None else None
+        phase4 = evaluate_iec_reporting(
+            {
+                "iec_reporting_requested": True,
+                "imaging_mode": imaging_mode,
+                "operating_mode": operating_mode,
+                "linearity_status": "raw",
+                "calculation_status": phase1.get("calculation_status"),
+                "calculation_validity": phase1.get("calculation_status") == "pass",
+                "edge_angle_deg": phase1.get("edge_angle_deg"),
+                "averaging_method": "esf",
+                "pixel_spacing_available": spacing is not None,
+                "roi_size_mm": {"width_mm": roi_width_mm, "height_mm": roi_height_mm},
+                "reason_codes": phase2.get("reason_codes", []),
+            }
+        )
+        key_metrics = {
+            "mtf50": phase1.get("mtf50"),
+            "mtf10": phase1.get("mtf10"),
+            "nyquist_mtf": self._lookup_nyquist_mtf(phase1.get("mtf_curve") or {}),
+            "frequency_unit": "cy/pixel",
+        }
+        result = {
+            "calculation_status": phase1.get("calculation_status", "reject"),
+            "calculation_validity": "valid" if phase1.get("calculation_status") == "pass" else "invalid",
+            "rejection_reason": phase1.get("rejection_reason"),
+            "edge_angle_deg": phase1.get("edge_angle_deg"),
+            "edge_snr": edge_snr,
+            "mtf_curve": phase1.get("mtf_curve") or {},
+            "esf_curve": phase1.get("esf_curve") or {},
+            "lsf_curve": phase1.get("lsf_curve") or {},
+            "key_mtf_metrics": key_metrics,
+            "warnings": phase2.get("warnings") or [],
+            "reason_codes": phase2.get("reason_codes") or [],
+            "qa_grade": phase3.get("qa_grade"),
+            "qa_status_summary": phase3.get("qa_status_summary"),
+            "iec_compliance": phase4.get("iec_reporting_status"),
+            "validation_summary": phase4.get("iec_reporting_summary"),
+            "roi_size_mm": {"width": roi_width_mm, "height": roi_height_mm},
+        }
+        if result["calculation_status"] != "pass":
+            result["reason_codes"] = list(dict.fromkeys((result["reason_codes"] or []) + ["PHASE1_REJECT"]))
+            if result.get("rejection_reason"):
+                result["warnings"] = list(dict.fromkeys((result.get("warnings") or []) + [str(result["rejection_reason"])]))
+        return result
+
+    @staticmethod
+    def _lookup_nyquist_mtf(mtf_curve: dict[str, Any]) -> float | None:
+        freqs = np.asarray(mtf_curve.get("frequency_cy_per_pixel", []), dtype=np.float64)
+        mtf = np.asarray(mtf_curve.get("mtf", []), dtype=np.float64)
+        if freqs.size == 0 or mtf.size == 0 or freqs.size != mtf.size:
+            return None
+        idx = int(np.argmin(np.abs(freqs - 0.5)))
+        value = mtf[idx]
+        return float(value) if np.isfinite(value) else None
+
+    def _update_mtf_analysis_ui(self, mtf_result: dict[str, Any]) -> None:
+        if not getattr(self, "_mtf_summary_value_vars", None):
+            return
+        key_metrics = mtf_result.get("key_mtf_metrics") or {}
+        invalid = self._is_mtf_result_invalid(mtf_result)
+        def _fmt(value: Any, suffix: str = "") -> str:
+            if isinstance(value, (int, float)):
+                return f"{float(value):.4f}{suffix}"
+            return "-"
+        if invalid:
+            for var in self._mtf_summary_value_vars.values():
+                var.set("-")
+            self._mtf_summary_value_vars["calculation_validity"].set(str(mtf_result.get("calculation_validity", "invalid")))
+            self._mtf_summary_value_vars["iec_compliance"].set(str(mtf_result.get("iec_compliance", "-")))
+            self.analysis_results["mtf_validation_summary"].set(str(mtf_result.get("validation_summary") or mtf_result.get("rejection_reason") or "Rejected"))
+        else:
+            self._mtf_summary_value_vars["mtf50"].set(_fmt(key_metrics.get("mtf50")))
+            self._mtf_summary_value_vars["mtf10"].set(_fmt(key_metrics.get("mtf10")))
+            self._mtf_summary_value_vars["nyquist_mtf"].set(_fmt(key_metrics.get("nyquist_mtf")))
+            self._mtf_summary_value_vars["edge_angle"].set(_fmt(mtf_result.get("edge_angle_deg"), " deg"))
+            self._mtf_summary_value_vars["edge_snr"].set(_fmt(mtf_result.get("edge_snr")))
+            roi_size = mtf_result.get("roi_size_mm") or {}
+            self._mtf_summary_value_vars["roi_width"].set(_fmt(roi_size.get("width"), " mm"))
+            self._mtf_summary_value_vars["roi_height"].set(_fmt(roi_size.get("height"), " mm"))
+            self._mtf_summary_value_vars["calculation_validity"].set(str(mtf_result.get("calculation_validity", "-")))
+            self._mtf_summary_value_vars["iec_compliance"].set(str(mtf_result.get("iec_compliance", "-")))
+            self._mtf_summary_value_vars["qa_grade"].set(str(mtf_result.get("qa_grade", "-")))
+            self.analysis_results["mtf_validation_summary"].set(str(mtf_result.get("validation_summary", "Validation: -")))
+        warnings = mtf_result.get("warnings") or []
+        reason_codes = mtf_result.get("reason_codes") or []
+        warning_summary = self._summarize_mtf_warnings_korean(reason_codes, warnings)
+        self.analysis_results["mtf_warning_summary"].set(f"경고 요약: {warning_summary}")
+        self.analysis_results["mtf_reason_codes"].set(f"Reason Codes: {', '.join(str(item) for item in reason_codes) if reason_codes else '-'}")
+        self._last_mtf_curve_payload = dict(mtf_result.get("mtf_curve") or {})
+        self._last_esf_curve_payload = dict(mtf_result.get("esf_curve") or {})
+        self._last_lsf_curve_payload = dict(mtf_result.get("lsf_curve") or {})
+        self._render_mtf_curve(self._last_mtf_curve_payload)
+        self._render_xy_curve(self._mtf_esf_canvas, self._last_esf_curve_payload, "ESF", "x")
+        self._render_xy_curve(self._mtf_lsf_canvas, self._last_lsf_curve_payload, "LSF", "x")
+        self._update_mtf_esf_lsf_summary(self._last_esf_curve_payload, self._last_lsf_curve_payload)
+        self._schedule_mtf_graph_redraw()
+
+    def _summarize_mtf_warnings_korean(self, reason_codes: list[Any], warnings: list[Any]) -> str:
+        reason_to_ko = {
+            "NONMONOTONIC_TAIL": "고주파 MTF 곡선이 단조 감소하지 않아 aliasing/sharpening/noise 영향 가능성이 있습니다.",
+            "POSSIBLE_ALIASING": "aliasing 가능성이 있습니다. edge 각도 또는 샘플링 조건을 확인하세요.",
+            "HIGH_FREQUENCY_NOISE_BIAS_RISK": "고주파 MTF가 noise floor의 영향을 받을 수 있습니다.",
+            "EDGE_SNR_LOW": "Edge SNR이 낮아 MTF 결과 신뢰도가 떨어질 수 있습니다.",
+            "EDGE_SNR_BORDERLINE": "Edge SNR이 경계 수준입니다. 고주파 해석에 주의하세요.",
+            "RESULT_QUESTIONABLE": "결과 해석에 주의가 필요합니다.",
+            "MTF_PEAK_GT_ONE": "MTF peak가 1.0을 초과했습니다. sharpening 영향 가능성이 있습니다.",
+            "POSSIBLE_SHARPENING": "샤프닝(에지 강화) 영향 가능성이 있습니다.",
+            "EDGE_CLIPPING_DETECTED": "에지 클리핑이 감지되어 MTF 해석이 왜곡될 수 있습니다.",
+            "PHASE1_REJECT": "MTF 1차 계산이 거부되어 결과가 유효하지 않습니다.",
+            "IEC_EDGE_GEOMETRY_NONCOMPLIANT": "IEC 기준에서 에지 기하 조건이 충족되지 않습니다.",
+            "IEC_ROI_NONCOMPLIANT": "ROI 크기가 IEC 기준보다 작습니다.",
+            "IEC_ROI_UNVERIFIABLE": "ROI mm 크기를 검증할 수 없습니다(Pixel Spacing 또는 입력값 부족).",
+            "IEC_AVERAGING_METHOD_NONCOMPLIANT": "IEC 보고 허용 averaging 방식이 아닙니다.",
+            "IEC_AVERAGING_METHOD_UNVERIFIABLE": "averaging 방식을 확인할 수 없습니다.",
+            "IEC_SCOPE_NOT_DECLARED": "IEC scope 선언이 없어 완전한 검증이 어렵습니다.",
+            "IEC_EXPLORATORY_MODE_NOT_REPORTABLE": "Exploratory 모드 결과는 IEC 보고용으로 제한됩니다.",
+            "EDGE_SNR_NOT_ASSESSED": "Edge SNR을 평가하지 못했습니다.",
+        }
+        if reason_codes:
+            translated = []
+            for code in reason_codes:
+                text = reason_to_ko.get(str(code))
+                if text:
+                    translated.append(text)
+            if translated:
+                return " / ".join(dict.fromkeys(translated))
+        fallback = [str(item) for item in warnings if str(item).strip()]
+        return ", ".join(fallback) if fallback else "-"
+
+    def _update_mtf_esf_lsf_summary(self, esf_curve: dict[str, Any], lsf_curve: dict[str, Any]) -> None:
+        self._mtf_esf_status_var.set(self._format_curve_summary("ESF", esf_curve))
+        self._mtf_lsf_status_var.set(self._format_curve_summary("LSF", lsf_curve))
+
+    @staticmethod
+    def _format_curve_summary(label: str, curve: dict[str, Any]) -> str:
+        y = np.asarray(curve.get("y", []), dtype=np.float64)
+        if y.size == 0:
+            return f"{label}: 결과 없음"
+        finite = y[np.isfinite(y)]
+        if finite.size == 0:
+            return f"{label}: 결과 없음"
+        return f"{label}: {finite.size} points, range {np.min(finite):.2f} ~ {np.max(finite):.2f}"
+
+    def _render_mtf_curve(self, mtf_curve: dict[str, Any]) -> None:
+        canvas = self._mtf_graph_canvas
+        if canvas is None:
+            return
+        canvas.delete("all")
+        width = int(canvas.winfo_width() or 360)
+        height = int(canvas.winfo_height() or 180)
+        pad_l, pad_r, pad_t, pad_b = 34, 10, 10, 26
+        plot_w = max(width - pad_l - pad_r, 20)
+        plot_h = max(height - pad_t - pad_b, 20)
+        canvas.create_rectangle(pad_l, pad_t, pad_l + plot_w, pad_t + plot_h, outline="#CBD5E1")
+        canvas.create_line(pad_l, pad_t + plot_h, pad_l + plot_w, pad_t + plot_h, fill="#64748B")
+        canvas.create_line(pad_l, pad_t, pad_l, pad_t + plot_h, fill="#64748B")
+        freqs = np.asarray(mtf_curve.get("frequency_cy_per_pixel", []), dtype=np.float64)
+        mtf = np.asarray(mtf_curve.get("mtf", []), dtype=np.float64)
+        if freqs.size < 2 or mtf.size < 2 or freqs.size != mtf.size:
+            self._mtf_graph_status_var.set("MTF Curve: unavailable")
+            return
+        finite = np.isfinite(freqs) & np.isfinite(mtf)
+        freqs = freqs[finite]
+        mtf = mtf[finite]
+        if freqs.size < 2:
+            self._mtf_graph_status_var.set("MTF Curve: unavailable")
+            return
+        xmax = float(np.max(freqs))
+        xmax = xmax if xmax > 0 else 1.0
+        mtf = np.clip(mtf, 0.0, 1.2)
+        points: list[float] = []
+        for x, y in zip(freqs, mtf):
+            px = pad_l + (float(x) / xmax) * plot_w
+            py = pad_t + plot_h - (float(y) / 1.2) * plot_h
+            points.extend([px, py])
+        if len(points) >= 4:
+            canvas.create_line(*points, fill="#0A84FF", width=2, smooth=True)
+        canvas.create_text(pad_l + plot_w / 2, height - 10, text="Frequency (cy/pixel)", fill="#334155")
+        canvas.create_text(12, pad_t + plot_h / 2, text="MTF", fill="#334155", angle=90)
+        self._mtf_graph_status_var.set(f"MTF Curve: {freqs.size} points")
+
+    def _render_xy_curve(
+        self,
+        canvas: tk.Canvas | None,
+        curve: dict[str, Any],
+        curve_name: str,
+        x_label: str,
+    ) -> None:
+        if canvas is None:
+            return
+        canvas.delete("all")
+        width = int(canvas.winfo_width() or 360)
+        height = int(canvas.winfo_height() or 180)
+        pad_l, pad_r, pad_t, pad_b = 34, 10, 10, 26
+        plot_w = max(width - pad_l - pad_r, 20)
+        plot_h = max(height - pad_t - pad_b, 20)
+        canvas.create_rectangle(pad_l, pad_t, pad_l + plot_w, pad_t + plot_h, outline="#CBD5E1")
+        canvas.create_line(pad_l, pad_t + plot_h, pad_l + plot_w, pad_t + plot_h, fill="#64748B")
+        canvas.create_line(pad_l, pad_t, pad_l, pad_t + plot_h, fill="#64748B")
+        xs = np.asarray(curve.get("x", []), dtype=np.float64)
+        ys = np.asarray(curve.get("y", []), dtype=np.float64)
+        if xs.size < 2 or ys.size < 2 or xs.size != ys.size:
+            canvas.create_text(width / 2, height / 2, text="No curve data", fill="#64748B")
+            return
+        valid = np.isfinite(xs) & np.isfinite(ys)
+        xs = xs[valid]
+        ys = ys[valid]
+        if xs.size < 2:
+            canvas.create_text(width / 2, height / 2, text="No curve data", fill="#64748B")
+            return
+        x_min = float(np.min(xs))
+        x_max = float(np.max(xs))
+        y_min = float(np.min(ys))
+        y_max = float(np.max(ys))
+        x_span = (x_max - x_min) if x_max > x_min else 1.0
+        y_span = (y_max - y_min) if y_max > y_min else 1.0
+        points: list[float] = []
+        for x_val, y_val in zip(xs, ys):
+            px = pad_l + ((float(x_val) - x_min) / x_span) * plot_w
+            py = pad_t + plot_h - ((float(y_val) - y_min) / y_span) * plot_h
+            points.extend([px, py])
+        if len(points) >= 4:
+            canvas.create_line(*points, fill="#0A84FF", width=2, smooth=True)
+        canvas.create_text(pad_l + plot_w / 2, height - 10, text=x_label, fill="#334155")
+        canvas.create_text(12, pad_t + plot_h / 2, text=curve_name, fill="#334155", angle=90)
+
+    def _show_mtf_details(self) -> None:
+        mtf_payload = (self._select_analysis_last_run("mtf") or {}).get("result")
+        if not mtf_payload:
+            messagebox.showinfo("MTF Analysis", "MTF 실행 결과가 없습니다.")
+            return
+        messagebox.showinfo("MTF Details", json.dumps(mtf_payload, indent=2, ensure_ascii=False))
+
+    def _sanitize_ui_text(self, text: str) -> str:
+        if not text:
+            return ""
+        cleaned = self._UUID_PATTERN.sub("", text)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned)
+        cleaned = cleaned.replace(" |  | ", " | ").replace(" | | ", " | ")
+        cleaned = cleaned.strip(" |,")
+        return cleaned if cleaned else "-"
 
     def _is_analysis_compatible_measurement(self, measurement: Measurement) -> bool:
         current_geometry = self._get_current_geometry_key()
@@ -1295,7 +3719,7 @@ class DicomViewer:
     def _build_roi_stats_result_rows(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         current_geometry = self._get_current_geometry_key()
-        for measurement in self.persistent_measurements:
+        for measurement in self._selector_measurements_for_current_frame(kind="roi"):
             if measurement.kind != "roi":
                 continue
             if measurement.frame_index != self.current_frame:
@@ -1315,12 +3739,14 @@ class DicomViewer:
             rows.append(
                 {
                     "metric_name": "ROI_STATS",
-                    "formula_mode": "single_roi_summary",
+                    "formula_mode": "ROI_STATS | single_roi_summary",
                     "roi_ids": [measurement.id],
                     "roles": [] if role is None else [role],
                     "stats": stats,
                     "result_value": float(stats["mean"]),
-                    "result_text": f"mean={stats['mean']:.4f}",
+                    "item_name": self._display_name_for_roi_id(measurement.id),
+                    "note_text": "Current frame ROI statistics",
+                    "result_text": f"Mean: {stats['mean']:.2f}, SD: {stats['std']:.2f}",
                     "developer_meta": {
                         "source": "roi_stats_snapshot",
                         "measurement_id": measurement.id,
@@ -1331,34 +3757,73 @@ class DicomViewer:
 
     def _build_analysis_last_run_rows(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
-        snr = self.analysis_last_run.get("snr")
+        snr = self._select_analysis_last_run("snr")
         if snr is not None:
             factors = snr.get("factors") or {}
+            status = str(snr.get("status", "success"))
+            reason = str(snr.get("reason", ""))
+            result_raw = snr.get("result")
+            result_value = float(result_raw) if isinstance(result_raw, (int, float)) else None
+            preview_text = str(snr.get("preview_text", snr.get("preview", "")))
+            result_text = str(snr.get("result_text", ""))
+            if not result_text:
+                if result_value is not None:
+                    result_text = f"{result_value:.4f}"
+                elif reason:
+                    result_text = f"{status}: {reason}"
+                else:
+                    result_text = status
             roles = []
             for key in ("signal", "noise"):
                 role = (factors.get(key) or {}).get("roi_role")
                 if role:
                     roles.append(str(role))
+            stats: dict[str, Any] = {
+                "status": status,
+                "preview": preview_text,
+            }
+            signal_mean = snr.get("mean_signal")
+            noise_std = snr.get("std_noise")
+            if isinstance(signal_mean, (int, float)):
+                stats["mean_signal"] = float(signal_mean)
+            if isinstance(noise_std, (int, float)):
+                stats["std_noise"] = float(noise_std)
+            if reason:
+                stats["reason"] = reason
             rows.append(
                 {
                     "metric_name": "SNR",
-                    "formula_mode": str(snr.get("formula", "mean(Signal ROI) / std(Noise ROI)")),
+                    "formula_mode": f"{str(snr.get('formula', 'mean(Signal ROI) / std(Noise ROI)'))} [{status}]",
                     "roi_ids": [
-                        str((snr.get("inputs") or {}).get("signal_roi_id", "")),
-                        str((snr.get("inputs") or {}).get("noise_roi_id", "")),
+                        str(snr.get("signal_roi_id", (snr.get("inputs") or {}).get("signal_roi_id", ""))),
+                        str(snr.get("noise_roi_id", (snr.get("inputs") or {}).get("noise_roi_id", ""))),
                     ],
                     "roles": roles,
-                    "stats": {"preview": str(snr.get("preview", ""))},
-                    "result_value": float(snr.get("result", 0.0)),
-                    "result_text": f"{float(snr.get('result', 0.0)):.4f}",
+                    "stats": stats,
+                    "result_value": result_value,
+                    "item_name": "SNR",
+                    "note_text": "Calculated from signal mean and noise SD",
+                    "result_text": (f"{result_value:.2f}" if isinstance(result_value, (int, float)) else result_text),
                     "developer_meta": snr,
                 }
             )
 
-        cnr = self.analysis_last_run.get("cnr")
+        cnr = self._select_analysis_last_run("cnr")
         if cnr is not None:
             inputs = cnr.get("inputs") or {}
             factors = cnr.get("factors") or {}
+            status = str(cnr.get("status", "success"))
+            reason = str(cnr.get("reason", ""))
+            result_raw = cnr.get("result")
+            result_value = float(result_raw) if isinstance(result_raw, (int, float)) else None
+            result_text = str(cnr.get("result_text", ""))
+            if not result_text:
+                if result_value is not None:
+                    result_text = f"{result_value:.4f}"
+                elif reason:
+                    result_text = f"{status}: {reason}"
+                else:
+                    result_text = status
             roles = []
             for key in ("region_a", "region_b", "noise"):
                 role = (factors.get(key) or {}).get("roi_role")
@@ -1371,43 +3836,98 @@ class DicomViewer:
             noise_id = inputs.get("noise_roi_id")
             if noise_id:
                 roi_ids.append(str(noise_id))
+            stats: dict[str, Any] = {
+                "status": status,
+            }
+            for stat_key in ("numerator", "denominator", "target_mean", "reference_mean", "noise_std", "target_std", "reference_std"):
+                stat_value = cnr.get(stat_key)
+                if isinstance(stat_value, (int, float)):
+                    stats[stat_key] = float(stat_value)
+            preview_text = str(cnr.get("preview_text", ""))
+            if preview_text:
+                stats["preview"] = preview_text
+            if reason:
+                stats["reason"] = reason
             rows.append(
                 {
                     "metric_name": "CNR",
-                    "formula_mode": str(inputs.get("formula", "standard_noise")),
+                    "formula_mode": f"{str(inputs.get('formula', 'standard_noise'))} [{status}]",
                     "roi_ids": roi_ids,
                     "roles": roles,
-                    "stats": {},
-                    "result_value": float(cnr.get("result", 0.0)),
-                    "result_text": f"{float(cnr.get('result', 0.0)):.4f}",
+                    "stats": stats,
+                    "result_value": result_value,
+                    "item_name": "CNR",
+                    "note_text": "Contrast difference divided by noise term",
+                    "result_text": (f"{result_value:.2f}" if isinstance(result_value, (int, float)) else result_text),
                     "developer_meta": cnr,
                 }
             )
 
-        uniformity = self.analysis_last_run.get("uniformity")
+        uniformity = self._select_analysis_last_run("uniformity")
         if uniformity is not None:
             inputs = uniformity.get("inputs") or {}
             result = uniformity.get("result") or {}
+            status = str(uniformity.get("status", "success"))
+            reason = str(uniformity.get("reason", ""))
+            result_value_raw = result.get("value")
+            result_value = float(result_value_raw) if isinstance(result_value_raw, (int, float)) else None
+            result_text = str(uniformity.get("result_text", ""))
+            if not result_text:
+                if result_value is not None:
+                    result_text = f"{result_value:.4f}"
+                elif reason:
+                    result_text = f"{status}: {reason}"
+                else:
+                    result_text = status
+            stats = dict(uniformity.get("stats") or {})
+            stats["status"] = status
+            preview_text = str(uniformity.get("preview_text", ""))
+            if preview_text:
+                stats["preview"] = preview_text
+            if reason:
+                stats["reason"] = reason
             rows.append(
                 {
                     "metric_name": "UNIFORMITY",
-                    "formula_mode": str(result.get("formula_label", inputs.get("formula", ""))),
+                    "formula_mode": f"{str(result.get('formula_label', inputs.get('formula', '')))} [{status}]",
                     "roi_ids": [str(item) for item in inputs.get("roi_ids", [])],
                     "roles": [],
-                    "stats": dict(uniformity.get("stats") or {}),
-                    "result_value": float(result.get("value", 0.0)),
-                    "result_text": f"{float(result.get('value', 0.0)):.4f}",
+                    "stats": stats,
+                    "result_value": result_value,
+                    "item_name": "Uniformity",
+                    "note_text": "Uniformity score in percent",
+                    "result_text": (f"{result_value:.2f}" if isinstance(result_value, (int, float)) else result_text),
                     "developer_meta": uniformity,
                 }
             )
 
-        line = self.analysis_last_run.get("line_profile")
+        line = self._select_analysis_last_run("line_profile")
         if line is not None:
             result = line.get("result") or {}
             line_stats = {
                 "length_px": float(result.get("length_px", 0.0)),
                 "sample_count": int(result.get("sample_count", 0)),
+                "length_mm": result.get("length_mm"),
+                "min_intensity": float(result.get("min_intensity", 0.0)),
+                "max_intensity": float(result.get("max_intensity", 0.0)),
+                "mean_intensity": float(result.get("mean_intensity", 0.0)),
+                "std_intensity": float(result.get("std_intensity", 0.0)),
+                "peak_count": int(result.get("peak_count", 0)),
+                "valley_count": int(result.get("valley_count", 0)),
+                "peak_value": result.get("peak_value"),
+                "peak_position": result.get("peak_position"),
+                "fwhm": result.get("fwhm"),
+                "distance_unit": result.get("distance_unit", "px"),
             }
+            if isinstance(line_stats.get("fwhm"), (int, float)):
+                fwhm_display = f"{float(line_stats['fwhm']):.2f}{line_stats['distance_unit']}"
+            else:
+                fwhm_display = "N/A"
+            line_note = (
+                f"Samples: {line_stats['sample_count']} | Length: {line_stats['length_px']:.2f} px | "
+                f"Mean: {line_stats['mean_intensity']:.2f} | Std: {line_stats['std_intensity']:.2f} | "
+                f"FWHM: {fwhm_display}"
+            )
             rows.append(
                 {
                     "metric_name": "LINE_PROFILE_SUMMARY",
@@ -1415,9 +3935,38 @@ class DicomViewer:
                     "roi_ids": [str((line.get("inputs") or {}).get("line_id", ""))],
                     "roles": [],
                     "stats": line_stats,
-                    "result_value": float(line_stats["length_px"]),
-                    "result_text": f"length={line_stats['length_px']:.1f}px, samples={line_stats['sample_count']}",
+                    "result_value": float(line_stats["mean_intensity"]),
+                    "item_name": "Line Profile",
+                    "note_text": line_note,
+                    "result_text": f"{line_stats['mean_intensity']:.2f}",
                     "developer_meta": line,
+                }
+            )
+        mtf = self._select_analysis_last_run("mtf")
+        if mtf is not None:
+            result = dict(mtf.get("result") or {})
+            key_metrics = dict(result.get("key_mtf_metrics") or {})
+            metric_value = key_metrics.get("mtf50")
+            status_text = str(result.get("calculation_validity", result.get("calculation_status", "")))
+            reason_codes = ", ".join(str(item) for item in (result.get("reason_codes") or []))
+            rows.append(
+                {
+                    "metric_name": "MTF",
+                    "formula_mode": f"slanted_edge [{status_text}]",
+                    "roi_ids": [str((mtf.get('context') or {}).get("roi_id", ""))],
+                    "roles": [],
+                    "stats": {
+                        "mtf50": key_metrics.get("mtf50"),
+                        "mtf10": key_metrics.get("mtf10"),
+                        "nyquist_mtf": key_metrics.get("nyquist_mtf"),
+                        "edge_angle_deg": result.get("edge_angle_deg"),
+                        "edge_snr": result.get("edge_snr"),
+                    },
+                    "result_value": float(metric_value) if isinstance(metric_value, (int, float)) else None,
+                    "item_name": "MTF",
+                    "note_text": f"Validity={status_text}; reason_codes=[{reason_codes}]",
+                    "result_text": f"{float(metric_value):.4f}" if isinstance(metric_value, (int, float)) else status_text,
+                    "developer_meta": mtf,
                 }
             )
         return rows
@@ -1435,30 +3984,390 @@ class DicomViewer:
                     "stats": dict(row.get("stats") or {}),
                     "result_value": row.get("result_value"),
                     "result_text": str(row.get("result_text", "")),
+                    "item_name": str(row.get("item_name", row.get("metric_name", ""))),
+                    "note_text": str(row.get("note_text", "")),
                     "developer_meta": dict(row.get("developer_meta") or {}),
                 }
             )
         return normalized_rows
 
-    def _refresh_analysis_results_panel(self) -> None:
-        table = getattr(self, "analysis_results_table", None)
-        if table is None:
+    @staticmethod
+    def _analysis_result_formula_map() -> dict[str, dict[str, Any]]:
+        return {
+            "SNR": {
+                "formula": "SNR = μ_ROI / σ_noise",
+                "symbols": [
+                    "μ_ROI: ROI 평균 신호",
+                    "σ_noise: 잡음 표준편차",
+                ],
+                "meaning": [
+                    "영상 선명도 지표",
+                    "SNR이 높을수록 → 노이즈 감소, 영상 품질 향상",
+                ],
+            },
+            "CNR": {
+                "formula": "CNR = |μ1 - μ2| / σ_noise",
+                "symbols": [
+                    "μ1, μ2: 비교 대상 ROI 평균 신호",
+                    "σ_noise: 잡음 표준편차",
+                ],
+                "meaning": [
+                    "조직 구분 능력 지표",
+                    "CNR이 높을수록 → 병변 식별이 용이",
+                    "(Rose Criterion: 약 3~5 이상에서 시각적 검출 가능)",
+                ],
+            },
+            "UNIFORMITY": {
+                "formula": "Uniformity(%) = (1 - (max - min) / (max + min)) × 100",
+                "symbols": [
+                    "max, min: ROI 최대/최소 평균값",
+                ],
+                "meaning": [
+                    "영상 균일도 지표",
+                    "값이 높을수록 → 균일성 양호",
+                ],
+            },
+        }
+
+    @staticmethod
+    def _format_numeric_for_note(value: Any) -> str:
+        return f"{float(value):.2f}" if isinstance(value, (int, float)) else "N/A"
+
+    def _build_analysis_note_text(self, row: dict[str, Any]) -> str:
+        metric_name = str(row.get("metric_name", "")).upper()
+        formulas = self._analysis_result_formula_map()
+        stats = dict(row.get("stats") or {})
+        result_value = row.get("result_value")
+
+        if metric_name == "SNR":
+            signal_mean = stats.get("mean_signal")
+            noise_std = stats.get("std_noise")
+            if isinstance(signal_mean, (int, float)) and isinstance(noise_std, (int, float)) and isinstance(result_value, (int, float)):
+                config = formulas["SNR"]
+                return (
+                    f"{config['formula']}\n"
+                    f"= {self._format_numeric_for_note(signal_mean)} / {self._format_numeric_for_note(noise_std)}\n"
+                    f"= {self._format_numeric_for_note(result_value)}\n\n"
+                    f"{config['symbols'][0]}\n"
+                    f"{config['symbols'][1]}\n\n"
+                    f"{config['meaning'][0]}\n"
+                    f"{config['meaning'][1]}"
+                )
+        elif metric_name == "CNR":
+            target_mean = stats.get("target_mean")
+            reference_mean = stats.get("reference_mean")
+            noise_std = stats.get("noise_std")
+            if (
+                isinstance(target_mean, (int, float))
+                and isinstance(reference_mean, (int, float))
+                and isinstance(noise_std, (int, float))
+                and isinstance(result_value, (int, float))
+            ):
+                config = formulas["CNR"]
+                return (
+                    f"{config['formula']}\n"
+                    f"= |{self._format_numeric_for_note(target_mean)} - {self._format_numeric_for_note(reference_mean)}| / {self._format_numeric_for_note(noise_std)}\n"
+                    f"= {self._format_numeric_for_note(result_value)}\n\n"
+                    f"{config['symbols'][0]}\n"
+                    f"{config['symbols'][1]}\n\n"
+                    f"{config['meaning'][0]}\n"
+                    f"{config['meaning'][1]}\n\n"
+                    f"{config['meaning'][2]}"
+                )
+        elif metric_name == "UNIFORMITY":
+            max_value = stats.get("max")
+            min_value = stats.get("min")
+            if isinstance(max_value, (int, float)) and isinstance(min_value, (int, float)) and isinstance(result_value, (int, float)):
+                config = formulas["UNIFORMITY"]
+                return (
+                    f"{config['formula']}\n"
+                    f"= (1 - ({self._format_numeric_for_note(max_value)} - {self._format_numeric_for_note(min_value)}) / "
+                    f"({self._format_numeric_for_note(max_value)} + {self._format_numeric_for_note(min_value)})) × 100\n"
+                    f"= {self._format_numeric_for_note(result_value)} %\n\n"
+                    f"{config['symbols'][0]}\n\n"
+                    f"{config['meaning'][0]}\n"
+                    f"{config['meaning'][1]}"
+                )
+
+        return f"Derived metric\n= {self._format_numeric_for_note(result_value)}"
+
+    def _format_analysis_value_text(self, row: dict[str, Any]) -> str:
+        result_value = row.get("result_value")
+        if isinstance(result_value, (int, float)):
+            return f"{float(result_value):.2f}"
+        return "-"
+
+    def _append_analysis_history_row(self, row: dict[str, Any], unit: str, related_target_ids: list[str] | None = None) -> None:
+        result_value = row.get("result_value")
+        if not isinstance(result_value, (int, float)):
             return
-        for item_id in table.get_children():
-            table.delete(item_id)
-        for row in self._build_analysis_result_rows():
-            table.insert(
-                "",
-                "end",
-                values=(
-                    row["metric_name"],
-                    row["formula_mode"],
-                    ",".join(row["roi_ids"]),
-                    ",".join(row["roles"]),
-                    self._format_analysis_stats(row["stats"]),
-                    row["result_text"] if row["result_text"] else row["result_value"],
-                ),
+        self._append_history_entry(
+            measurement_type="Analysis",
+            target_name=str(row.get("item_name", row.get("metric_name", "Analysis"))),
+            metric=str(row.get("metric_name", "Analysis")),
+            value=float(result_value),
+            unit=unit,
+            note=self._build_analysis_note_text(row),
+            measurement_mode="analysis",
+            related_target_ids=related_target_ids,
+        )
+
+    @staticmethod
+    def _build_mtf_summary_note(mtf_result: dict[str, Any]) -> str:
+        parts: list[str] = []
+        validity = mtf_result.get("calculation_validity")
+        if validity is not None:
+            parts.append(str(validity))
+        iec = mtf_result.get("iec_compliance")
+        if iec is not None:
+            parts.append(f"IEC={iec}")
+        qa_grade = mtf_result.get("qa_grade")
+        if qa_grade:
+            parts.append(f"QA={qa_grade}")
+        warnings = mtf_result.get("warnings")
+        if isinstance(warnings, list) and warnings:
+            compact_warnings = [str(item) for item in warnings if item]
+            if compact_warnings:
+                parts.append(f"warnings={','.join(compact_warnings)}")
+        return " | ".join(parts)
+
+    @staticmethod
+    def _resolve_mtf_frequency_unit(mtf_result: dict[str, Any]) -> str:
+        key_metrics = mtf_result.get("key_mtf_metrics") or {}
+        for key in ("unit", "frequency_unit"):
+            value = key_metrics.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for key in ("frequency_unit", "unit"):
+            value = mtf_result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return "lp/mm"
+
+    @staticmethod
+    def _extract_mtf_roi_size_mm(mtf_result: dict[str, Any]) -> tuple[float | None, float | None]:
+        roi_size = mtf_result.get("roi_size_mm")
+        if isinstance(roi_size, dict):
+            width = roi_size.get("width") if isinstance(roi_size.get("width"), (int, float)) else roi_size.get("w")
+            height = roi_size.get("height") if isinstance(roi_size.get("height"), (int, float)) else roi_size.get("h")
+            return (
+                float(width) if isinstance(width, (int, float)) else None,
+                float(height) if isinstance(height, (int, float)) else None,
             )
+        if isinstance(roi_size, (list, tuple)) and len(roi_size) >= 2:
+            width = roi_size[0]
+            height = roi_size[1]
+            return (
+                float(width) if isinstance(width, (int, float)) else None,
+                float(height) if isinstance(height, (int, float)) else None,
+            )
+        return None, None
+
+    @staticmethod
+    def _is_mtf_result_invalid(mtf_result: dict[str, Any]) -> bool:
+        validity = str(mtf_result.get("calculation_validity", "")).strip().lower()
+        status = str(mtf_result.get("calculation_status", "")).strip().lower()
+        return validity == "invalid" or status == "reject"
+
+    def append_mtf_result_to_history(self, mtf_result: dict[str, Any], context: dict[str, Any]) -> None:
+        payload = dict(mtf_result or {})
+        run_context = dict(context or {})
+        reason_codes = [str(code) for code in (payload.get("reason_codes") or []) if code]
+        summary_note = self._build_mtf_summary_note(payload)
+        roi_width_mm, roi_height_mm = self._extract_mtf_roi_size_mm(payload)
+        if isinstance(roi_width_mm, (int, float)) and isinstance(roi_height_mm, (int, float)):
+            summary_note = f"{summary_note} | ROI={roi_width_mm:g}x{roi_height_mm:g}mm" if summary_note else f"ROI={roi_width_mm:g}x{roi_height_mm:g}mm"
+        target_name = str(run_context.get("image_id") or "MTF")
+        related_target_ids = [str(run_context.get("roi_id"))] if run_context.get("roi_id") else []
+
+        if self._is_mtf_result_invalid(payload):
+            invalid_note = (
+                f"MTF rejected: calculation_validity={payload.get('calculation_validity', '')}; "
+                f"reason_codes=[{', '.join(reason_codes)}]"
+            )
+            self._append_history_entry(
+                measurement_type="MTF",
+                target_name=target_name,
+                metric=MTF_METRIC_INVALID,
+                value=None,
+                unit="",
+                note=invalid_note,
+                measurement_mode="analysis",
+                target_id=str(run_context.get("roi_id", "")),
+                related_target_ids=related_target_ids,
+                extra_payload=payload,
+                reason_codes=reason_codes,
+                group_id=str(run_context.get("group_id", "")),
+                study_id=str(run_context.get("study_id", "")),
+            )
+            return
+
+        frequency_unit = self._resolve_mtf_frequency_unit(payload)
+        key_metrics = payload.get("key_mtf_metrics") or {}
+        metric_rows = [
+            (MTF_METRIC_MTF50, key_metrics.get("mtf50"), frequency_unit),
+            (MTF_METRIC_MTF10, key_metrics.get("mtf10"), frequency_unit),
+            (MTF_METRIC_NYQUIST_MTF, key_metrics.get("nyquist_mtf"), frequency_unit),
+            (MTF_METRIC_EDGE_ANGLE_DEG, payload.get("edge_angle_deg"), "deg"),
+            (MTF_METRIC_EDGE_SNR, payload.get("edge_snr"), ""),
+            (MTF_METRIC_ROI_WIDTH_MM, roi_width_mm, "mm"),
+            (MTF_METRIC_ROI_HEIGHT_MM, roi_height_mm, "mm"),
+        ]
+        for metric, metric_value, unit in metric_rows:
+            if not isinstance(metric_value, (int, float)):
+                continue
+            self._append_history_entry(
+                measurement_type="MTF",
+                target_name=target_name,
+                metric=metric,
+                value=float(metric_value),
+                unit=unit,
+                note=summary_note,
+                measurement_mode="analysis",
+                target_id=str(run_context.get("roi_id", "")),
+                related_target_ids=related_target_ids,
+                extra_payload=payload,
+                reason_codes=reason_codes,
+                group_id=str(run_context.get("group_id", "")),
+                study_id=str(run_context.get("study_id", "")),
+            )
+
+    def complete_mtf_analysis(self, mtf_result: dict[str, Any], context: dict[str, Any]) -> None:
+        self._action_set_analysis_last_run("mtf", {"result": dict(mtf_result or {}), "context": dict(context or {})})
+        self.append_mtf_result_to_history(mtf_result, context)
+        self._update_mtf_analysis_ui(dict(mtf_result or {}))
+        self._refresh_analysis_results_panel()
+
+    @staticmethod
+    def _group_analysis_rows_for_panel(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        metric_rows: list[dict[str, Any]] = []
+        snapshot_rows: list[dict[str, Any]] = []
+        for row in rows:
+            metric_name = str(row.get("metric_name", "")).upper()
+            if metric_name == "ROI_STATS":
+                snapshot_rows.append(row)
+            else:
+                metric_rows.append(row)
+
+        ordered: list[dict[str, Any]] = []
+        if metric_rows:
+            ordered.append(
+                {
+                    "category": "SECTION",
+                    "metric_name": "Results",
+                    "formula_mode": "",
+                    "roi_ids": [],
+                    "roles": [],
+                    "stats": {},
+                    "result_value": None,
+                    "result_text": "",
+                }
+            )
+            for row in metric_rows:
+                merged = dict(row)
+                merged["category"] = "METRIC"
+                ordered.append(merged)
+        if snapshot_rows:
+            ordered.append(
+                {
+                    "category": "SECTION",
+                    "metric_name": "ROI Stats",
+                    "formula_mode": "",
+                    "roi_ids": [],
+                    "roles": [],
+                    "stats": {},
+                    "result_value": None,
+                    "result_text": "",
+                }
+            )
+            for row in snapshot_rows:
+                merged = dict(row)
+                merged["category"] = "ROI_SNAPSHOT"
+                ordered.append(merged)
+        return ordered
+
+    def _refresh_analysis_results_panel(self) -> None:
+        rows_container = getattr(self, "analysis_results_rows_container", None)
+        if rows_container is None:
+            return
+        for child in rows_container.winfo_children():
+            child.destroy()
+        self._analysis_results_row_widgets = []
+        self._analysis_results_selected_index = None
+        grouped_rows = self._group_analysis_rows_for_panel(self._build_analysis_result_rows())
+        data_row_index = 0
+        for row_index, row in enumerate(grouped_rows):
+            category = str(row.get("category", "METRIC"))
+            item_text = row["metric_name"] if category == "SECTION" else row.get("item_name", row["metric_name"])
+            note_text = self._build_analysis_note_text(row) if category != "SECTION" else ""
+            value_text = self._format_analysis_value_text(row) if category != "SECTION" else ""
+            if category == "SECTION":
+                item_text = f"[{item_text}]"
+            item_value = self._sanitize_ui_text(str(item_text))
+            value_value = self._sanitize_ui_text("" if value_text is None else str(value_text))
+            note_value = note_text
+            if category == "SECTION":
+                background = "#F8FAFC"
+                font = ("TkDefaultFont", 10, "bold")
+            else:
+                background = "#FFFFFF" if data_row_index % 2 == 0 else "#F6F7F9"
+                font = ("TkDefaultFont", 10)
+                data_row_index += 1
+            row_frame = tk.Frame(rows_container, bg=background, highlightthickness=0, bd=0)
+            row_frame.grid(row=row_index, column=0, sticky="ew")
+            row_frame.grid_columnconfigure(0, weight=0, minsize=220)
+            row_frame.grid_columnconfigure(1, weight=0, minsize=180)
+            row_frame.grid_columnconfigure(2, weight=1, minsize=300)
+
+            item_label = tk.Label(row_frame, text=item_value, anchor="w", justify="left", bg=background, fg=self.ui_colors["text_primary"], font=font, padx=8, pady=4)
+            value_label = tk.Label(row_frame, text=value_value, anchor="w", justify="left", bg=background, fg=self.ui_colors["text_primary"], font=font, padx=6, pady=4)
+            note_label = tk.Label(row_frame, text=note_value, anchor="w", justify="left", bg=background, fg=self.ui_colors["text_primary"], font=("TkDefaultFont", 9), padx=6, pady=4)
+            item_label.grid(row=0, column=0, sticky="nsew")
+            value_label.grid(row=0, column=1, sticky="nsew")
+            note_label.grid(row=0, column=2, sticky="nsew")
+
+            separator = tk.Frame(rows_container, height=1, bg=self.ui_colors["border"])
+            separator.grid(row=(row_index * 2) + 1, column=0, sticky="ew")
+            row_frame.grid_configure(row=row_index * 2)
+
+            row_widgets = {
+                "frame": row_frame,
+                "labels": (item_label, value_label, note_label),
+                "base_bg": background,
+                "is_section": category == "SECTION",
+            }
+            self._analysis_results_row_widgets.append(row_widgets)
+            for widget in (row_frame, item_label, value_label, note_label):
+                widget.bind("<Button-1>", lambda _event, idx=row_index: self._select_analysis_results_row(idx))
+
+        rows_container.grid_columnconfigure(0, weight=1)
+        self._relayout_analysis_result_rows()
+
+    def _select_analysis_results_row(self, row_index: int) -> None:
+        self._analysis_results_selected_index = row_index
+        selected_bg = "#DCEAFE"
+        for index, row in enumerate(self._analysis_results_row_widgets):
+            background = selected_bg if index == row_index else str(row["base_bg"])
+            frame = row["frame"]
+            labels = row["labels"]
+            frame.configure(bg=background)
+            for label in labels:
+                label.configure(bg=background)
+
+    def _relayout_analysis_result_rows(self) -> None:
+        container = self.analysis_results_rows_container
+        if container is None:
+            return
+        container.update_idletasks()
+        width = max(int(container.winfo_width()), 400)
+        item_width = 220
+        value_width = 180
+        note_width = max(240, width - item_width - value_width - 40)
+        for row in self._analysis_results_row_widgets:
+            labels = row["labels"]
+            labels[0].configure(wraplength=item_width - 16)
+            labels[1].configure(wraplength=value_width - 12)
+            labels[2].configure(wraplength=note_width - 12)
 
     def _build_analysis_export_payload(self) -> dict[str, Any]:
         rows = self._build_analysis_result_rows()
@@ -1481,7 +4390,7 @@ class DicomViewer:
                 "rows": user_rows,
             },
             "developer_meta": {
-                "analysis_last_run": copy.deepcopy(self.analysis_last_run),
+                "analysis_last_run": self.domain_store.select_all_analysis_last_run(),
                 "internal_rows": rows,
             },
         }
@@ -1565,6 +4474,30 @@ class DicomViewer:
                 self._analysis_comboboxes[combobox_key].set("")
             elif combobox_key in self._image_analysis_comboboxes:
                 self._image_analysis_comboboxes[combobox_key].set("")
+            return None
+        return selected
+
+    def _read_analysis_selected_id(self, kind: str, input_key: str, combobox_key: str) -> str:
+        input_store = self.analysis_inputs if input_key in self.analysis_inputs else self.image_analysis_inputs
+        selected_id = input_store[input_key].get()
+        if combobox_key in self._analysis_comboboxes:
+            selected_label = self._analysis_comboboxes[combobox_key].get()
+            option_map = self._analysis_option_maps.get(kind, {})
+        else:
+            selected_label = self._image_analysis_comboboxes.get(combobox_key).get() if combobox_key in self._image_analysis_comboboxes else ""
+            option_map = self._image_analysis_option_maps.get(kind, {})
+        if selected_label:
+            mapped_id = option_map.get(selected_label, "")
+            if mapped_id:
+                selected_id = mapped_id
+        return selected_id
+
+    def _peek_selected_measurement_from_analysis(self, kind: str, input_key: str, combobox_key: str) -> Measurement | None:
+        selected_id = self._read_analysis_selected_id(kind, input_key, combobox_key)
+        selected = self._find_measurement_by_id(selected_id, expected_kind=kind)
+        if selected is None:
+            return None
+        if not self._is_analysis_compatible_measurement(selected):
             return None
         return selected
 
@@ -3154,7 +6087,12 @@ class DicomViewer:
             canvas.itemconfig(shadow_id, state="disabled")
             canvas.tag_lower(f"{tag_prefix}_shadow_{index}", text_id)
 
-    def _build_measurement_label_parts(self, kind: str, metrics: dict[str, Any]) -> tuple[str, str]:
+    def _build_measurement_label_parts(
+        self,
+        kind: str,
+        metrics: dict[str, Any],
+        measurement: Measurement | None = None,
+    ) -> tuple[str, str]:
         if kind == "line":
             primary = f"{self._format_mm_value(metrics['length_mm'])} mm"
             secondary = f"{metrics['length_px']:.1f} px"
@@ -3167,7 +6105,11 @@ class DicomViewer:
         width_px = int(round(metrics["width_px"]))
         height_px = int(round(metrics["height_px"]))
         area_px = int(round(metrics["area_px"]))
+        roi_label = self._format_roi_label(0)
+        if measurement is not None:
+            roi_label = self._display_name_for_roi_id(measurement.id)
         primary = (
+            f"{roi_label} | "
             f"W {self._format_mm_value(metrics['width_mm'])}mm  "
             f"H {self._format_mm_value(metrics['height_mm'])}mm  "
             f"A {self._format_mm_value(metrics['area_mm2'])}mm²"
@@ -3234,23 +6176,66 @@ class DicomViewer:
         )
         padding = 4
         offsets = [(8, -8), (8, 12), (-8, -8), (-8, 12), (14, -22), (-14, -22), (14, 24), (-14, 24)]
+        canvas_width = max(float(self.canvas.winfo_width()), 1.0)
+        canvas_height = max(float(self.canvas.winfo_height()), 1.0)
+
+        def adjust_candidate(tx: float, ty: float, anchor_name: str) -> tuple[float, float, tuple[float, float, float, float]]:
+            if anchor_name == "sw":
+                box = (tx, ty - label_height - padding, tx + label_width + padding, ty + padding)
+                shift_x = 0.0
+                if box[0] < 1:
+                    shift_x = 1 - box[0]
+                elif box[2] > canvas_width - 1:
+                    shift_x = (canvas_width - 1) - box[2]
+                shift_y = 0.0
+                if box[1] < 1:
+                    shift_y = 1 - box[1]
+                elif box[3] > canvas_height - 1:
+                    shift_y = (canvas_height - 1) - box[3]
+                adjusted_tx = tx + shift_x
+                adjusted_ty = ty + shift_y
+                adjusted_box = (
+                    adjusted_tx,
+                    adjusted_ty - label_height - padding,
+                    adjusted_tx + label_width + padding,
+                    adjusted_ty + padding,
+                )
+                return adjusted_tx, adjusted_ty, adjusted_box
+            box = (tx - label_width - padding, ty - label_height - padding, tx, ty + padding)
+            shift_x = 0.0
+            if box[0] < 1:
+                shift_x = 1 - box[0]
+            elif box[2] > canvas_width - 1:
+                shift_x = (canvas_width - 1) - box[2]
+            shift_y = 0.0
+            if box[1] < 1:
+                shift_y = 1 - box[1]
+            elif box[3] > canvas_height - 1:
+                shift_y = (canvas_height - 1) - box[3]
+            adjusted_tx = tx + shift_x
+            adjusted_ty = ty + shift_y
+            adjusted_box = (
+                adjusted_tx - label_width - padding,
+                adjusted_ty - label_height - padding,
+                adjusted_tx,
+                adjusted_ty + padding,
+            )
+            return adjusted_tx, adjusted_ty, adjusted_box
+
         chosen = (x + 8, y - 8, "sw")
-        chosen_box = (chosen[0], chosen[1] - label_height - padding, chosen[0] + label_width + padding, chosen[1] + padding)
+        chosen_x, chosen_y, chosen_box = adjust_candidate(chosen[0], chosen[1], chosen[2])
         for dx, dy in offsets:
             anchor = "sw" if dx >= 0 else "se"
             tx = x + dx
             ty = y + dy
-            if anchor == "sw":
-                bbox = (tx, ty - label_height - padding, tx + label_width + padding, ty + padding)
-            else:
-                bbox = (tx - label_width - padding, ty - label_height - padding, tx, ty + padding)
+            tx, ty, bbox = adjust_candidate(tx, ty, anchor)
             overlaps = any(
                 not (bbox[2] < ox0 or bbox[0] > ox1 or bbox[3] < oy0 or bbox[1] > oy1)
                 for ox0, oy0, ox1, oy1 in occupied_boxes
             )
             if not overlaps:
                 return tx, ty, anchor, bbox
-        return chosen[0], chosen[1], chosen[2], chosen_box
+        return chosen_x, chosen_y, chosen[2], chosen_box
 
     def _truncate_text_to_width(self, text: str, max_width: int, font: tkfont.Font) -> str:
         if font.measure(text) <= max_width:
@@ -4557,6 +7542,8 @@ class DicomViewer:
         self.frames = frames
         self.current_file_index = index
         self.current_frame = 0
+        self._action_update_image_context(path, Path(path).name)
+        self._action_commit_frame_change(self.current_frame)
         self._update_grid_cell_size_label()
         self.clear_preview_overlay()
         self._initialize_window_level(dataset, frames)
@@ -4816,7 +7803,7 @@ class DicomViewer:
         self.apply_crop(x0, y0, x1, y1)
 
     def _confirm_measurement_reset_for_transform(self, action_name: str) -> bool:
-        if not self.persistent_measurements:
+        if not self._selector_measurements_for_image():
             return True
         keep_going = messagebox.askyesno(
             "측정 초기화 확인",
@@ -4942,7 +7929,7 @@ class DicomViewer:
             meta={},
         )
         metrics = self.compute_measurement(preview_measurement, self._get_frame_pixel_array(self.current_frame))
-        primary_label, secondary_label = self._build_measurement_label_parts("line", metrics)
+        primary_label, secondary_label = self._build_measurement_label_parts("line", metrics, preview_measurement)
         self._draw_measurement_label(
             self.canvas,
             ex + 6,
@@ -5378,7 +8365,7 @@ class DicomViewer:
         current_geometry = self._get_current_geometry_key()
         return [
             item
-            for item in self.persistent_measurements
+            for item in self._selector_measurements_for_current_frame(kind="roi")
             if item.kind == "roi"
             and item.meta.get("grid_cell") is not None
             and item.frame_index == self.current_frame
@@ -5743,7 +8730,7 @@ class DicomViewer:
                 meta={},
             )
             metrics = self.compute_measurement(preview_measurement, self._get_frame_pixel_array(self.current_frame))
-            primary_label, secondary_label = self._build_measurement_label_parts("roi", metrics)
+            primary_label, secondary_label = self._build_measurement_label_parts("roi", metrics, preview_measurement)
         else:
             self.canvas.create_line(
                 start_x,
@@ -5767,7 +8754,7 @@ class DicomViewer:
                 meta={},
             )
             metrics = self.compute_measurement(preview_measurement, self._get_frame_pixel_array(self.current_frame))
-            primary_label, secondary_label = self._build_measurement_label_parts("line", metrics)
+            primary_label, secondary_label = self._build_measurement_label_parts("line", metrics, preview_measurement)
         self._draw_measurement_label(
             self.canvas,
             end_x + 6,
@@ -5785,44 +8772,68 @@ class DicomViewer:
         self._active_crop_item_id = None
 
     def clear_persistent_measurements(self) -> None:
-        self.persistent_measurements = []
+        self._ensure_domain_store()
+        measurement_ids = self.domain_store.select_measurement_ids_for_image(self._store_image_id)
+        for measurement_id in measurement_ids:
+            if measurement_id in self.domain_store.state.measurements:
+                self.domain_store.delete_measurement(measurement_id)
         self.selected_persistent_measurement_id = None
+        self.domain_store.set_selection(self._store_image_id, [])
         self._persistent_canvas_item_to_measurement_id = {}
         self._cancel_guided_snr_workflow()
         self.canvas.delete("persistent_measurement")
         self.canvas.delete("temp_measurement")
+        self._refresh_analysis_selectors()
+        self._update_analysis_action_button_state()
         if self.view_mode == "single":
             self._draw_single_view_overlays()
 
     def undo_last_measurement(self) -> None:
-        if not self.persistent_measurements:
+        self._ensure_domain_store()
+        visible_measurements = self.domain_store.select_measurements_for_image(self._store_image_id)
+        if not visible_measurements:
             return
-        removed = self.persistent_measurements.pop()
+        removed_row = visible_measurements[-1]
+        removed = Measurement(
+            id=removed_row.measurement_id,
+            kind=removed_row.kind,
+            start=(float(removed_row.start[0]), float(removed_row.start[1])),
+            end=(float(removed_row.end[0]), float(removed_row.end[1])),
+            frame_index=int(removed_row.frame_index),
+            geometry_key=removed_row.geometry_key,
+            summary_text=removed_row.summary_text,
+            meta=dict(removed_row.meta or {}),
+        )
+        if removed.id in self.domain_store.state.measurements:
+            self.domain_store.delete_measurement(removed.id)
         state = self.guided_snr_state
         if state is not None and removed.id in {state.get("signal_id"), state.get("noise_id")}:
             self._cancel_guided_snr_workflow()
         if self.selected_persistent_measurement_id == removed.id:
             self.selected_persistent_measurement_id = None
+            self.domain_store.set_selection(self._store_image_id, [])
         self._draw_preview_measurements()
         self._draw_persistent_measurements()
         if self.view_mode == "single":
             self._draw_single_view_overlays()
 
     def clear_selected_measurement(self) -> None:
-        selected_id = self.selected_persistent_measurement_id
+        self._ensure_domain_store()
+        selected_id = self.domain_store.state.selected_measurement_ids[0] if self.domain_store.state.selected_measurement_ids else None
         if selected_id is None:
             messagebox.showinfo("안내", "삭제할 측정을 먼저 선택하세요.")
             return
-        remaining = [item for item in self.persistent_measurements if item.id != selected_id]
-        if len(remaining) == len(self.persistent_measurements):
+        if selected_id not in self.domain_store.state.measurements:
             self.selected_persistent_measurement_id = None
             self._draw_persistent_measurements()
             return
         state = self.guided_snr_state
         if state is not None and selected_id in {state.get("signal_id"), state.get("noise_id")}:
             self._cancel_guided_snr_workflow()
-        self.persistent_measurements = remaining
+        if selected_id in self.domain_store.state.measurements:
+            self.domain_store.delete_measurement(selected_id)
         self.selected_persistent_measurement_id = None
+        self.domain_store.set_selection(self._store_image_id, [])
         self._draw_preview_measurements()
         self._draw_persistent_measurements()
         if self.view_mode == "single":
@@ -5846,11 +8857,255 @@ class DicomViewer:
     def _apply_measurement_selection(self, measurement_id: str, toggle: bool = False) -> None:
         if toggle and self.selected_persistent_measurement_id == measurement_id:
             self.selected_persistent_measurement_id = None
+            self.domain_store.set_selection(self._store_image_id, [])
             return
         self.selected_persistent_measurement_id = measurement_id
+        self.domain_store.set_selection(self._store_image_id, [measurement_id])
 
     def register_measurement_hit_target(self, item_id: int, measurement_id: str) -> None:
         self._persistent_canvas_item_to_measurement_id[item_id] = measurement_id
+
+    def _selector_measurements_for_current_frame(self, kind: str | None = None) -> list[Measurement]:
+        return self._selector_measurements_for_image(frame_index=int(self.current_frame), kind=kind)
+
+    def _selector_measurements_for_image(
+        self,
+        frame_index: int | None = None,
+        kind: str | None = None,
+    ) -> list[Measurement]:
+        self._ensure_domain_store()
+        store_measurements = self.domain_store.select_measurements_for_image(
+            self._store_image_id,
+            frame_index=frame_index,
+        )
+        filtered = [
+            Measurement(
+                id=item.measurement_id,
+                kind=item.kind,
+                start=(float(item.start[0]), float(item.start[1])),
+                end=(float(item.end[0]), float(item.end[1])),
+                frame_index=int(item.frame_index),
+                geometry_key=item.geometry_key,
+                summary_text=item.summary_text,
+                meta=dict(item.meta or {}),
+            )
+            for item in store_measurements
+        ]
+        if kind is not None:
+            filtered = [item for item in filtered if item.kind == kind]
+        return filtered
+
+    def _select_measurement_draw_projections(self) -> list[MeasurementDrawProjection]:
+        self._ensure_domain_store()
+        current_geometry = self._get_current_geometry_key()
+        selected_ids = set(self.domain_store.state.selected_measurement_ids)
+        rows: list[MeasurementDrawProjection] = []
+        for item in self.domain_store.select_measurements_for_image(
+            self._store_image_id,
+            frame_index=int(self.current_frame),
+        ):
+            if not self._geometry_matches(current_geometry, item.geometry_key):
+                continue
+            rows.append(
+                MeasurementDrawProjection(
+                    measurement_id=item.measurement_id,
+                    kind=item.kind,
+                    start=(float(item.start[0]), float(item.start[1])),
+                    end=(float(item.end[0]), float(item.end[1])),
+                    frame_index=int(item.frame_index),
+                    geometry_key=item.geometry_key,
+                    role=item.role,
+                    meta=dict(item.meta or {}),
+                    summary_text=item.summary_text,
+                    selected=item.measurement_id in selected_ids,
+                )
+            )
+        return rows
+
+    @staticmethod
+    def _runtime_measurement_from_projection(projection: MeasurementDrawProjection) -> Measurement:
+        return Measurement(
+            id=projection.measurement_id,
+            kind=projection.kind,
+            start=(float(projection.start[0]), float(projection.start[1])),
+            end=(float(projection.end[0]), float(projection.end[1])),
+            frame_index=int(projection.frame_index),
+            geometry_key=projection.geometry_key,
+            summary_text=projection.summary_text,
+            meta=dict(projection.meta or {}),
+        )
+
+    def _action_add_measurement_to_store(self, measurement: Measurement) -> None:
+        self._ensure_domain_store()
+        role = self._get_measurement_roi_role(measurement)
+        self.domain_store.add_measurement(
+            image_id=self._store_image_id,
+            kind=measurement.kind,
+            start=(float(measurement.start[0]), float(measurement.start[1])),
+            end=(float(measurement.end[0]), float(measurement.end[1])),
+            frame_index=int(measurement.frame_index),
+            geometry_key=measurement.geometry_key,
+            summary_text=measurement.summary_text,
+            role=role,
+            meta=dict(measurement.meta or {}),
+            measurement_id=measurement.id,
+        )
+
+    def _action_update_measurement_in_store(self, measurement: Measurement) -> None:
+        self._ensure_domain_store()
+        role = self._get_measurement_roi_role(measurement)
+        self.domain_store.update_measurement(
+            measurement.id,
+            summary_text=measurement.summary_text,
+            role=role,
+            meta=dict(measurement.meta or {}),
+        )
+
+    def _action_commit_frame_change(self, frame_index: int) -> None:
+        self._ensure_domain_store()
+        self.domain_store.set_frame(self._store_image_id, int(frame_index))
+
+    def _action_update_image_context(self, source_image_path: str, image_name: str) -> None:
+        self._ensure_domain_store()
+        image_ctx = self.domain_store.state.images.get(self._store_image_id)
+        if image_ctx is None:
+            self._store_image_id = self.domain_store.add_image_context(source_image_path, image_name)
+            return
+        image_ctx.source_image_path = source_image_path
+        image_ctx.image_name = image_name
+
+    def _ensure_domain_store(self) -> None:
+        if not hasattr(self, "domain_store") or self.domain_store is None:
+            self.domain_store = DomainStore()
+        if not hasattr(self, "_store_image_id") or not self._store_image_id:
+            self._store_image_id = self.domain_store.add_image_context(self._get_current_image_path(), "current")
+
+    def _ensure_window_b_services(self) -> None:
+        if not hasattr(self, "analysis_result_controller") or self.analysis_result_controller is None:
+            self.analysis_result_controller = AnalysisResultController()
+        if not hasattr(self, "history_controller") or self.history_controller is None:
+            self.history_controller = HistoryController()
+        if not hasattr(self, "session_controller") or self.session_controller is None:
+            self.session_controller = SessionController()
+        if not hasattr(self, "report_export_controller") or self.report_export_controller is None:
+            self.report_export_controller = ReportExportController()
+
+    def open_window_b(self) -> None:
+        if not hasattr(self, "window_b_manager") or self.window_b_manager is None:
+            self.window_b_manager = WindowBManager(self.root, self)
+            self.window_b_manager.bind_store_events()
+        self.window_b_manager.open()
+
+    def _open_window_b_and_refresh_all(self) -> None:
+        self.open_window_b()
+        if hasattr(self, "window_b_manager") and self.window_b_manager is not None:
+            self.window_b_manager.refresh_all()
+
+    def _open_window_b_and_refresh_history(self) -> None:
+        self.open_window_b()
+        if hasattr(self, "window_b_manager") and self.window_b_manager is not None:
+            self.window_b_manager.refresh_history()
+
+    def save_analysis_session_via_window_b(self) -> None:
+        self._open_window_b_and_refresh_all()
+        self.save_analysis_session()
+
+    def load_analysis_session_via_window_b(self) -> None:
+        self._open_window_b_and_refresh_all()
+        self.load_analysis_session()
+
+    def export_result_history_csv_via_window_b(self) -> None:
+        self._open_window_b_and_refresh_history()
+        self.export_result_history_csv()
+
+    def export_selected_result_history_csv_via_window_b(self) -> None:
+        self._open_window_b_and_refresh_history()
+        self.export_selected_result_history_csv()
+
+    def _select_analysis_groups_map(self) -> dict[str, ImageAnalysisGroup]:
+        self._ensure_domain_store()
+        return self.domain_store.state.analysis_groups
+
+    def _select_study_sessions_map(self) -> dict[str, StudySession]:
+        self._ensure_domain_store()
+        return self.domain_store.state.sessions
+
+    def _action_replace_analysis_groups(self, groups: list[ImageAnalysisGroup]) -> None:
+        group_map = self._select_analysis_groups_map()
+        group_map.clear()
+        group_map.update({group.group_id: group for group in groups})
+
+    def _action_replace_study_sessions(self, sessions: list[StudySession]) -> None:
+        session_map = self._select_study_sessions_map()
+        session_map.clear()
+        session_map.update({study.study_id: study for study in sessions})
+
+    def _action_set_analysis_last_run(self, key: str, payload: dict[str, Any]) -> None:
+        self._ensure_domain_store()
+        self.domain_store.set_analysis_last_run(key, dict(payload))
+        # LEGACY_BRIDGE: 결과 패널 read 경로 완전 selector화 전까지만 캐시 유지.
+        self.analysis_last_run[key] = dict(payload)
+        if hasattr(self, "window_b_manager") and self.window_b_manager is not None:
+            self.window_b_manager.refresh_all()
+
+    def _action_clear_analysis_last_run(self) -> None:
+        self._ensure_domain_store()
+        self.domain_store.clear_analysis_last_run()
+        # LEGACY_BRIDGE: 결과 패널 read 경로 완전 selector화 전까지만 캐시 유지.
+        self.analysis_last_run = {}
+        self._last_mtf_curve_payload = {}
+        self._last_esf_curve_payload = {}
+        self._last_lsf_curve_payload = {}
+        self._render_mtf_curve({})
+        self._render_xy_curve(self._mtf_esf_canvas, {}, "ESF", "x")
+        self._render_xy_curve(self._mtf_lsf_canvas, {}, "LSF", "x")
+
+    def _action_history_append_entry(self, entry: ResultHistoryEntry) -> None:
+        self._ensure_domain_store()
+        self.domain_store.append_history_payload(self._serialize_history_entry(entry))
+        # LEGACY_BRIDGE: history panel read 경로 완전 selector화 전까지만 캐시 유지.
+        self.result_history_store.append(entry)
+        if hasattr(self, "window_b_manager") and self.window_b_manager is not None:
+            self.window_b_manager.refresh_history()
+
+    def _action_history_clear(self) -> None:
+        self._ensure_domain_store()
+        self.domain_store.clear_history_payloads()
+        # LEGACY_BRIDGE: history panel read 경로 완전 selector화 전까지만 캐시 유지.
+        self.result_history_store.clear()
+
+    def _action_history_remove_indices(self, indices: list[int]) -> None:
+        self._ensure_domain_store()
+        self.domain_store.remove_history_payload_indices(indices)
+        # LEGACY_BRIDGE: history panel read 경로 완전 selector화 전까지만 캐시 유지.
+        self.result_history_store.remove_indices(indices)
+
+    def _select_analysis_last_run(self, key: str) -> dict[str, Any]:
+        self._ensure_domain_store()
+        return self.domain_store.select_analysis_last_run(key)
+
+    def _select_result_history_entries(self) -> list[ResultHistoryEntry]:
+        self._ensure_domain_store()
+        payloads = self.domain_store.select_history_payloads()
+        return [self._deserialize_history_entry(item) for item in payloads]
+
+    def _select_filtered_history_entries(
+        self,
+        measurement_type: str = "All",
+        search_text: str = "",
+    ) -> list[tuple[int, ResultHistoryEntry]]:
+        query = search_text.strip().lower()
+        selected_type = measurement_type.strip()
+        rows: list[tuple[int, ResultHistoryEntry]] = []
+        for index, entry in enumerate(self._select_result_history_entries()):
+            if selected_type and selected_type != "All" and entry.measurement_type != selected_type:
+                continue
+            if query:
+                haystack = f"{entry.image_name} {entry.target_name} {entry.metric}".lower()
+                if query not in haystack:
+                    continue
+            rows.append((index, entry))
+        return rows
 
     def _get_current_geometry_key(self) -> str | None:
         return self._get_geometry_key_for_frame(self.current_frame)
@@ -5916,11 +9171,45 @@ class DicomViewer:
             summary_text="",
             meta={**(extra_meta or {})},
         )
+        if measurement.kind == "roi":
+            measurement.meta.setdefault("roi_source", "manual")
         metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
         measurement.summary_text = metrics["summary"]
         measurement.meta = self._canonicalize_measurement_meta(measurement, metrics)
-        self.persistent_measurements.append(measurement)
+        self._action_add_measurement_to_store(measurement)
+        self._append_measurement_history_entries(measurement, metrics)
         return measurement
+
+    def _append_measurement_history_entries(self, measurement: Measurement, metrics: dict[str, Any]) -> None:
+        if measurement.kind == "roi":
+            target = self._display_name_for_roi_id(measurement.id)
+            signal_stats = dict(metrics.get("signal_stats") or {})
+            self._append_history_entry("ROI", target, "Mean", float(signal_stats.get("mean", 0.0)), "a.u.", "ROI 평균 신호", target_id=measurement.id)
+            self._append_history_entry("ROI", target, "Std", float(signal_stats.get("std", 0.0)), "a.u.", "ROI 신호 표준편차", target_id=measurement.id)
+            self._append_history_entry("ROI", target, "Min", float(signal_stats.get("min", 0.0)), "a.u.", "ROI 최소 신호", target_id=measurement.id)
+            self._append_history_entry("ROI", target, "Max", float(signal_stats.get("max", 0.0)), "a.u.", "ROI 최대 신호", target_id=measurement.id)
+            self._append_history_entry("ROI", target, "Area", float(metrics.get("area_px", 0.0)), "px²", "ROI 면적", target_id=measurement.id)
+            return
+        if measurement.kind == "line":
+            line_index = self._line_index_for_measurement_id(measurement.id)
+            target = f"Line {line_index}" if line_index is not None else "Line"
+            self._append_history_entry("Line Profile", target, "Length(px)", float(metrics.get("length_px", 0.0)), "px", "선 길이", target_id=measurement.id)
+            length_mm = metrics.get("length_mm")
+            if isinstance(length_mm, (int, float)):
+                self._append_history_entry("Line Profile", target, "Length(mm)", float(length_mm), "mm", "물리 길이", target_id=measurement.id)
+
+    def _line_index_for_measurement_id(self, measurement_id: str) -> int | None:
+        current_geometry = self._get_current_geometry_key()
+        line_index = 0
+        for measurement in self._selector_measurements_for_current_frame(kind="line"):
+            if measurement.kind != "line":
+                continue
+            if not self._geometry_matches(measurement.geometry_key, current_geometry):
+                continue
+            line_index += 1
+            if measurement.id == measurement_id:
+                return line_index
+        return None
 
     def _propagate_rois_from_geometry(
         self,
@@ -5941,7 +9230,7 @@ class DicomViewer:
 
         source_rois = [
             measurement
-            for measurement in self.persistent_measurements
+            for measurement in self._selector_measurements_for_image(frame_index=source_frame_index, kind="roi")
             if measurement.kind == "roi"
             and measurement.frame_index == source_frame_index
             and self._geometry_matches(measurement.geometry_key, source_geometry_key)
@@ -5969,10 +9258,12 @@ class DicomViewer:
                 meta=dict(source.meta or {}),
             )
             propagated.meta["propagated_from"] = source.id
+            propagated.meta["roi_source"] = "propagated"
+            propagated.meta["propagated_from_group_id"] = str(getattr(self, "active_group_id", ""))
             metrics = self.compute_measurement(propagated, self._get_frame_pixel_array(propagated.frame_index))
             propagated.summary_text = metrics["summary"]
             propagated.meta = self._canonicalize_measurement_meta(propagated, metrics)
-            self.persistent_measurements.append(propagated)
+            self._action_add_measurement_to_store(propagated)
 
     @staticmethod
     def _roi_fits_target_frame(source: Measurement, target_width: int, target_height: int) -> bool:
@@ -6000,7 +9291,7 @@ class DicomViewer:
         target_geometry_key: str,
         target_frame_index: int,
     ) -> bool:
-        for measurement in self.persistent_measurements:
+        for measurement in self._selector_measurements_for_image(frame_index=target_frame_index, kind="roi"):
             if measurement.kind != "roi":
                 continue
             if measurement.frame_index != target_frame_index:
@@ -6014,12 +9305,11 @@ class DicomViewer:
     def _draw_persistent_measurements(self) -> None:
         self.canvas.delete("persistent_measurement")
         self._persistent_canvas_item_to_measurement_id = {}
-        current_geometry = self._get_current_geometry_key()
+        draw_projections = self._select_measurement_draw_projections()
         grid_roi_measurements: list[Measurement] = []
         occupied_label_boxes: list[tuple[float, float, float, float]] = []
-        for measurement in self.persistent_measurements:
-            if not self._geometry_matches(current_geometry, measurement.geometry_key):
-                continue
+        for projection in draw_projections:
+            measurement = self._runtime_measurement_from_projection(projection)
             start = self._image_coords_to_canvas(*measurement.start)
             end = self._image_coords_to_canvas(*measurement.end)
             if start is None or end is None:
@@ -6030,7 +9320,8 @@ class DicomViewer:
             metrics = self.compute_measurement(measurement, frame_array)
             measurement.summary_text = metrics["summary"]
             measurement.meta = self._canonicalize_measurement_meta(measurement, metrics)
-            selected = measurement.id == self.selected_persistent_measurement_id
+            self._action_update_measurement_in_store(measurement)
+            selected = projection.selected
             if measurement.kind == "roi":
                 outline = "#ffdc5e" if selected else "#ff7f50"
                 item_id = self.canvas.create_rectangle(
@@ -6068,7 +9359,7 @@ class DicomViewer:
                 if measurement.meta.get("grid_cell") is not None:
                     grid_roi_measurements.append(measurement)
                     continue
-                primary_label, secondary_label = self._build_measurement_label_parts("roi", metrics)
+                primary_label, secondary_label = self._build_measurement_label_parts("roi", metrics, measurement)
                 rect_box = (min(sx, ex), min(sy, ey), max(sx, ex), max(sy, ey))
                 occupied_label_boxes.append(rect_box)
             elif measurement.kind == "line":
@@ -6077,7 +9368,7 @@ class DicomViewer:
                     sx, sy, ex, ey, fill=color, width=3 if selected else 2, tags=("persistent_measurement",)
                 )
                 self.register_measurement_hit_target(item_id, measurement.id)
-                primary_label, secondary_label = self._build_measurement_label_parts("line", metrics)
+                primary_label, secondary_label = self._build_measurement_label_parts("line", metrics, measurement)
             else:
                 raw_points = measurement.meta.get("points", [])
                 polygon_canvas: list[float] = []
@@ -6163,7 +9454,7 @@ class DicomViewer:
         self._refresh_analysis_selectors()
 
     def export_measurements_csv(self) -> None:
-        if not self.persistent_measurements:
+        if not self._selector_measurements_for_image():
             messagebox.showinfo("안내", "내보낼 영구 측정값이 없습니다.")
             return
         path = filedialog.asksaveasfilename(
@@ -6197,7 +9488,7 @@ class DicomViewer:
                     "meta",
                 ]
             )
-            for item in self.persistent_measurements:
+            for item in self._selector_measurements_for_image():
                 metrics = self.compute_measurement(item, self._get_frame_pixel_array(item.frame_index))
                 item.summary_text = metrics["summary"]
                 item.meta = self._canonicalize_measurement_meta(item, metrics)
@@ -6276,7 +9567,7 @@ class DicomViewer:
         )
 
     def save_measurement_set(self) -> None:
-        if not self.persistent_measurements:
+        if not self._selector_measurements_for_image():
             messagebox.showinfo("안내", "저장할 영구 측정값이 없습니다.")
             return
         geometry_key = self._get_current_geometry_key()
@@ -6285,7 +9576,7 @@ class DicomViewer:
         name = simple_prompt(self.root, "세트 이름", "측정 세트 이름을 입력하세요:")
         if not name:
             return
-        selected = [m for m in self.persistent_measurements if self._geometry_matches(m.geometry_key, geometry_key)]
+        selected = [m for m in self._selector_measurements_for_image() if self._geometry_matches(m.geometry_key, geometry_key)]
         measurement_set = MeasurementSet(
             id=str(uuid.uuid4()),
             name=name,
@@ -6311,7 +9602,8 @@ class DicomViewer:
         copied = copy.deepcopy(selected.measurements)
         for item in copied:
             item.id = str(uuid.uuid4())
-        self.persistent_measurements.extend(copied)
+        for item in copied:
+            self._action_add_measurement_to_store(item)
         self._draw_persistent_measurements()
         messagebox.showinfo("적용 완료", f"{selected.name} 세트를 추가 적용했습니다.")
 
@@ -6344,6 +9636,463 @@ class DicomViewer:
             imported += 1
         messagebox.showinfo("불러오기 완료", f"{imported}개 세트를 가져왔습니다.")
 
+    @staticmethod
+    def _serialize_measurement_for_session(measurement: Measurement) -> dict[str, Any]:
+        return {
+            "id": measurement.id,
+            "type": measurement.kind,
+            "frame_index": int(measurement.frame_index),
+            "start": [float(measurement.start[0]), float(measurement.start[1])],
+            "end": [float(measurement.end[0]), float(measurement.end[1])],
+            "geometry_key": measurement.geometry_key,
+            "label": measurement.summary_text,
+            "meta": copy.deepcopy(measurement.meta),
+            "role": str((measurement.meta or {}).get("role", "")),
+            "points": copy.deepcopy((measurement.meta or {}).get("points", [])),
+        }
+
+    @staticmethod
+    def _serialize_analysis_group(group: ImageAnalysisGroup) -> dict[str, Any]:
+        return {
+            "group_id": group.group_id,
+            "study_id": group.study_id,
+            "source_image_path": group.source_image_path,
+            "image_name": group.image_name,
+            "created_at": group.created_at,
+            "entry_ids": list(group.entry_ids),
+            "frame_indices": [int(item) for item in group.frame_indices],
+            "roi_source_type": group.roi_source_type,
+            "propagated_from_group_id": group.propagated_from_group_id,
+            "propagated_from_measurement_ids": list(group.propagated_from_measurement_ids),
+        }
+
+    @staticmethod
+    def _deserialize_analysis_group(payload: dict[str, Any]) -> ImageAnalysisGroup:
+        return ImageAnalysisGroup(
+            group_id=str(payload.get("group_id") or uuid.uuid4()),
+            study_id=str(payload.get("study_id", "")),
+            source_image_path=str(payload.get("source_image_path", "")),
+            image_name=str(payload.get("image_name", "N/A")),
+            created_at=str(payload.get("created_at", datetime.utcnow().isoformat())),
+            entry_ids=[str(item) for item in (payload.get("entry_ids") or [])],
+            frame_indices=[int(item) for item in (payload.get("frame_indices") or [])],
+            roi_source_type=str(payload.get("roi_source_type", "manual")),
+            propagated_from_group_id=str(payload.get("propagated_from_group_id", "")),
+            propagated_from_measurement_ids=[str(item) for item in (payload.get("propagated_from_measurement_ids") or [])],
+        )
+
+    @staticmethod
+    def _serialize_study_session(study: StudySession) -> dict[str, Any]:
+        return {
+            "study_id": study.study_id,
+            "name": study.name,
+            "created_at": study.created_at,
+            "group_ids": list(study.group_ids),
+        }
+
+    @staticmethod
+    def _deserialize_study_session(payload: dict[str, Any]) -> StudySession:
+        return StudySession(
+            study_id=str(payload.get("study_id") or uuid.uuid4()),
+            name=str(payload.get("name", "Imported Study")),
+            created_at=str(payload.get("created_at", datetime.utcnow().isoformat())),
+            group_ids=[str(item) for item in (payload.get("group_ids") or [])],
+        )
+
+    @staticmethod
+    def _deserialize_measurement_for_session(payload: dict[str, Any]) -> Measurement:
+        start = payload.get("start") or [0.0, 0.0]
+        end = payload.get("end") or [0.0, 0.0]
+        return Measurement(
+            id=str(payload.get("id") or uuid.uuid4()),
+            kind=str(payload.get("type", "line")),
+            start=(float(start[0]), float(start[1])),
+            end=(float(end[0]), float(end[1])),
+            frame_index=int(payload.get("frame_index", 0)),
+            geometry_key=str(payload.get("geometry_key", "")),
+            summary_text=str(payload.get("label", "")),
+            meta=dict(payload.get("meta") or {}),
+        )
+
+    def serialize_session(self) -> dict[str, Any]:
+        self._ensure_window_b_services()
+        current_path = self._get_current_image_path()
+        all_measurements = self._selector_measurements_for_image()
+        roi_items = [item for item in all_measurements if item.kind == "roi"]
+        line_items = [item for item in all_measurements if item.kind == "line"]
+        store_snapshot = self.domain_store.snapshot()
+        analysis_groups = self._select_analysis_groups_map()
+        study_sessions = self._select_study_sessions_map()
+        return self.session_controller.build_serialize_payload(
+            {
+                "schema_version": SESSION_SCHEMA_VERSION,
+                "source_image_path": current_path,
+                "frame_index": int(self.current_frame),
+                "display": {
+                "window_width": self.window_width_value,
+                "window_level": self.window_level_value,
+                "invert": bool(self.invert_display.get()),
+                "zoom_scale": float(self.zoom_scale),
+                "show_grid_overlay": bool(self.show_grid_overlay.get()),
+            },
+                "roi_list": [self._serialize_measurement_for_session(item) for item in roi_items],
+                "line_list": [self._serialize_measurement_for_session(item) for item in line_items],
+                "analysis_options": {key: var.get() for key, var in self.analysis_inputs.items()},
+                "results_history": [self._serialize_history_entry(item) for item in self._select_result_history_entries()],
+                "analysis_groups": [self._serialize_analysis_group(item) for item in analysis_groups.values()],
+                "study_sessions": [self._serialize_study_session(item) for item in study_sessions.values()],
+                "active_study_id": self.active_study_id,
+                "active_group_id": self.active_group_id,
+                "compare_state": {
+                "selected_history_row_ids": list(self._session_compare_state.get("selected_entry_ids", [])),
+                "baseline_index": int(self._session_compare_state.get("baseline_index", 0)),
+            },
+                "store_snapshot": store_snapshot,
+            }
+        )
+
+    def deserialize_session(self, payload: dict[str, Any]) -> dict[str, Any]:
+        version = str(payload.get("version", "0"))
+        display = dict(payload.get("display") or {})
+        history_rows = [self._deserialize_history_entry(item) for item in (payload.get("results_history") or [])]
+        roi_list = [self._deserialize_measurement_for_session(item) for item in (payload.get("roi_list") or [])]
+        line_list = [self._deserialize_measurement_for_session(item) for item in (payload.get("line_list") or [])]
+        analysis_groups = [self._deserialize_analysis_group(item) for item in (payload.get("analysis_groups") or [])]
+        study_sessions = [self._deserialize_study_session(item) for item in (payload.get("study_sessions") or [])]
+        return {
+            "version": version,
+            "source_image_path": str(payload.get("source_image_path", "")),
+            "frame_index": int(payload.get("frame_index", 0)),
+            "display": display,
+            "analysis_options": dict(payload.get("analysis_options") or {}),
+            "roi_list": roi_list,
+            "line_list": line_list,
+            "results_history": history_rows,
+            "analysis_groups": analysis_groups,
+            "study_sessions": study_sessions,
+            "active_study_id": str(payload.get("active_study_id", "")),
+            "active_group_id": str(payload.get("active_group_id", "")),
+            "compare_state": dict(payload.get("compare_state") or {}),
+            "store_snapshot": dict(payload.get("store_snapshot") or {}),
+        }
+
+    def _migrate_legacy_session_to_store_snapshot(self, session_data: dict[str, Any]) -> dict[str, Any]:
+        migrated = DomainStore()
+        image_path = str(session_data.get("source_image_path", ""))
+        image_name = Path(image_path).name if image_path else "current"
+        frame_index = int(session_data.get("frame_index", 0))
+        image_id = migrated.add_image_context(image_path, image_name, frame_index=frame_index)
+        migrated.state.selected_image_id = image_id
+
+        for measurement in list(session_data.get("roi_list") or []) + list(session_data.get("line_list") or []):
+            migrated.add_measurement(
+                image_id=image_id,
+                kind=measurement.kind,
+                start=(float(measurement.start[0]), float(measurement.start[1])),
+                end=(float(measurement.end[0]), float(measurement.end[1])),
+                frame_index=int(measurement.frame_index),
+                geometry_key=measurement.geometry_key,
+                summary_text=measurement.summary_text,
+                role=self._get_measurement_roi_role(measurement),
+                meta=dict(measurement.meta or {}),
+                measurement_id=measurement.id,
+            )
+
+        history_payloads = [self._serialize_history_entry(item) for item in (session_data.get("results_history") or [])]
+        migrated.replace_history_payloads(history_payloads)
+        migrated.state.analysis_groups = {
+            group.group_id: group
+            for group in (session_data.get("analysis_groups") or [])
+        }
+        migrated.state.sessions = {
+            study.study_id: study
+            for study in (session_data.get("study_sessions") or [])
+        }
+        return migrated.snapshot()
+
+    def _reset_analysis_session_state(self) -> None:
+        self.selected_persistent_measurement_id = None
+        self._persistent_canvas_item_to_measurement_id.clear()
+        self.domain_store = DomainStore()
+        self._store_image_id = self.domain_store.add_image_context(self._get_current_image_path(), "current")
+        self._action_history_clear()
+        self._select_analysis_groups_map().clear()
+        self._select_study_sessions_map().clear()
+        self.active_study_id = ""
+        self.active_group_id = ""
+        self._session_compare_state = {"selected_entry_ids": [], "baseline_index": 0}
+        self.line_profile_series_cache.clear()
+        self._action_clear_analysis_last_run()
+        self._ensure_default_study_session()
+        self._refresh_analysis_selectors()
+        self._refresh_result_history_table()
+
+    def _resolve_session_image_path(self, source_image_path: str) -> str:
+        if source_image_path and Path(source_image_path).exists():
+            return source_image_path
+        if source_image_path:
+            replacement = filedialog.askopenfilename(
+                title="Session image not found - DICOM 파일 재지정",
+                filetypes=[("DICOM 파일", "*.dcm *.DCM"), ("모든 파일", "*.*")],
+            )
+            if replacement:
+                return replacement
+        return ""
+
+    def apply_session(self, session_data: dict[str, Any]) -> None:
+        source_image_path = self._resolve_session_image_path(session_data.get("source_image_path", ""))
+        self._reset_analysis_session_state()
+        if source_image_path:
+            self._reset_file_list_state()
+            self._set_loaded_paths([source_image_path], folder=None)
+            self._load_file(0, preserve_view_state=False)
+        else:
+            messagebox.showwarning("Session Load", "image not found: 이미지 경로를 확인하세요.")
+
+        if self.frames:
+            requested_frame = int(session_data.get("frame_index", 0))
+            if 0 <= requested_frame < len(self.frames):
+                self.current_frame = requested_frame
+
+        store_snapshot = dict(session_data.get("store_snapshot") or {})
+        if not (store_snapshot.get("state") is not None and store_snapshot.get("snapshot_timestamp")):
+            # LEGACY_BRIDGE: 구세션 payload를 최신 store snapshot 구조로 1회 변환한다.
+            store_snapshot = self._migrate_legacy_session_to_store_snapshot(session_data)
+        self.domain_store.load_session({**store_snapshot, "session_id": str(session_data.get("active_study_id", ""))})
+        self._store_image_id = self.domain_store.state.selected_image_id or self._store_image_id
+        self.result_history_store.clear()
+        for payload in self.domain_store.select_history_payloads():
+            self.result_history_store.append(self._deserialize_history_entry(payload))
+        image_ctx = self.domain_store.state.images.get(self._store_image_id)
+        if image_ctx is not None:
+            self.current_frame = int(image_ctx.frame_index)
+
+        display = session_data.get("display") or {}
+        self.window_width_value = display.get("window_width")
+        self.window_level_value = display.get("window_level")
+        self.invert_display.set(bool(display.get("invert", False)))
+        self.show_grid_overlay.set(bool(display.get("show_grid_overlay", False)))
+        try:
+            self.zoom_scale = float(display.get("zoom_scale", self.zoom_scale))
+        except (TypeError, ValueError):
+            pass
+        if self.frames:
+            self._show_frame()
+
+        self.domain_store.set_frame(self._store_image_id, int(self.current_frame))
+        self.domain_store.set_selection(self._store_image_id, [])
+        self._draw_persistent_measurements()
+
+        for key, value in (session_data.get("analysis_options") or {}).items():
+            if key in self.analysis_inputs:
+                self.analysis_inputs[key].set(str(value))
+        self._refresh_analysis_selectors()
+        self._sync_analysis_selector_inputs()
+        self._toggle_cnr_noise_widgets()
+
+        analysis_groups = self._select_analysis_groups_map()
+        study_sessions = self._select_study_sessions_map()
+        analysis_groups.clear()
+        analysis_groups.update({group.group_id: group for group in self.domain_store.select_analysis_groups()})
+        study_sessions.clear()
+        study_sessions.update({study.study_id: study for study in self.domain_store.select_study_sessions()})
+        self.active_study_id = str(session_data.get("active_study_id", ""))
+        self.active_group_id = str(session_data.get("active_group_id", ""))
+        self._ensure_default_study_session()
+        for entry in self._select_result_history_entries():
+            if not entry.group_id:
+                continue
+            group = analysis_groups.get(entry.group_id)
+            if group is None:
+                continue
+            if entry.entry_id not in group.entry_ids:
+                group.entry_ids.append(entry.entry_id)
+            if entry.frame_index not in group.frame_indices:
+                group.frame_indices.append(int(entry.frame_index))
+        if not analysis_groups:
+            default_study = self._ensure_default_study_session()
+            image_to_group: dict[str, ImageAnalysisGroup] = {}
+            for entry in self._select_result_history_entries():
+                image_key = entry.source_image_path or entry.image_name
+                if image_key not in image_to_group:
+                    group_id = str(uuid.uuid4())
+                    group = ImageAnalysisGroup(
+                        group_id=group_id,
+                        study_id=default_study.study_id,
+                        source_image_path=entry.source_image_path,
+                        image_name=entry.image_name,
+                        created_at=datetime.utcnow().isoformat(),
+                        entry_ids=[],
+                        frame_indices=[],
+                        roi_source_type="manual",
+                    )
+                    analysis_groups[group_id] = group
+                    default_study.group_ids.append(group_id)
+                    image_to_group[image_key] = group
+                group = image_to_group[image_key]
+                entry.group_id = group.group_id
+                entry.study_id = default_study.study_id
+                group.entry_ids.append(entry.entry_id)
+                if int(entry.frame_index) not in group.frame_indices:
+                    group.frame_indices.append(int(entry.frame_index))
+            if image_to_group:
+                self.active_group_id = next(iter(image_to_group.values())).group_id
+        compare_state = dict(session_data.get("compare_state") or {})
+        self._session_compare_state = {
+            "selected_entry_ids": list(compare_state.get("selected_history_row_ids") or []),
+            "baseline_index": int(compare_state.get("baseline_index", 0)),
+        }
+        self._refresh_result_history_table()
+        self._restore_history_selection(self._session_compare_state.get("selected_entry_ids", []))
+
+    def save_analysis_session(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="세션 저장",
+            defaultextension=".moduba.json",
+            filetypes=[("Moduba Session", "*.moduba.json"), ("JSON", "*.json"), ("All Files", "*.*")],
+        )
+        if not path:
+            return
+        payload = self.serialize_session()
+        Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        messagebox.showinfo("Session Save", f"세션 저장 완료:\n{path}")
+
+    def load_analysis_session(self) -> None:
+        path = filedialog.askopenfilename(
+            title="세션 불러오기",
+            filetypes=[("Moduba Session", "*.moduba.json"), ("JSON", "*.json"), ("All Files", "*.*")],
+        )
+        if not path:
+            return
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        session_data = self.deserialize_session(payload)
+        if session_data["version"] != SESSION_SCHEMA_VERSION:
+            messagebox.showwarning(
+                "Session Version",
+                f"세션 버전 불일치: file={session_data['version']}, app={SESSION_SCHEMA_VERSION}\n가능한 항목만 복원합니다.",
+            )
+        self.apply_session(session_data)
+
+    @staticmethod
+    def _preset_analysis_option_keys() -> tuple[str, ...]:
+        return (
+            "cnr_formula",
+            "uniformity_formula",
+            "uniformity_input_mode",
+            "uniformity_role_filter",
+        )
+
+    def _collect_roi_role_template(self) -> dict[str, str]:
+        role_map: dict[str, str] = {}
+        display_map = self._build_roi_display_name_map()
+        for measurement in self._selector_measurements_for_current_frame(kind="roi"):
+            if measurement.kind != "roi":
+                continue
+            role = self._get_measurement_roi_role(measurement)
+            if role is None:
+                continue
+            label = display_map.get(measurement.id)
+            if label:
+                role_map[role] = label
+        return role_map
+
+    def serialize_preset(self) -> dict[str, Any]:
+        analysis_options = {
+            key: self.analysis_inputs[key].get()
+            for key in self._preset_analysis_option_keys()
+            if key in self.analysis_inputs
+        }
+        return {
+            "version": PRESET_SCHEMA_VERSION,
+            "created_at": datetime.utcnow().isoformat(),
+            "app": "moduba",
+            "kind": "measurement_preset",
+            "analysis_options": analysis_options,
+            "measurement_roles": self._collect_roi_role_template(),
+            "ui_defaults": {
+                "show_grid_overlay": bool(self.show_grid_overlay.get()),
+                "show_basic_overlay": bool(self.show_basic_overlay.get()),
+                "show_acquisition_overlay": bool(self.show_acquisition_overlay.get()),
+            },
+            "repeat_rules": {
+                "uniformity_role_filter": self.analysis_inputs["uniformity_role_filter"].get(),
+                "line_profile_mode": "summary_only",
+            },
+        }
+
+    def deserialize_preset(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "version": str(payload.get("version", "0")),
+            "analysis_options": dict(payload.get("analysis_options") or {}),
+            "measurement_roles": {str(k): str(v) for k, v in dict(payload.get("measurement_roles") or {}).items()},
+            "ui_defaults": dict(payload.get("ui_defaults") or {}),
+            "repeat_rules": dict(payload.get("repeat_rules") or {}),
+        }
+
+    def apply_preset(self, preset_data: dict[str, Any]) -> None:
+        for key, value in preset_data.get("analysis_options", {}).items():
+            if key in self.analysis_inputs:
+                self.analysis_inputs[key].set(str(value))
+
+        for key, value in preset_data.get("ui_defaults", {}).items():
+            if key == "show_grid_overlay":
+                self.show_grid_overlay.set(bool(value))
+            elif key == "show_basic_overlay":
+                self.show_basic_overlay.set(bool(value))
+            elif key == "show_acquisition_overlay":
+                self.show_acquisition_overlay.set(bool(value))
+
+        role_templates = dict(preset_data.get("measurement_roles") or {})
+        if role_templates:
+            label_to_id = {label: measurement_id for measurement_id, label in self._build_roi_display_name_map().items()}
+            for role, label in role_templates.items():
+                measurement_id = label_to_id.get(label)
+                measurement = self._find_measurement_by_id(measurement_id, expected_kind="roi")
+                normalized = self._normalize_roi_role(role)
+                if measurement is None or normalized is None:
+                    continue
+                measurement.meta = dict(measurement.meta or {})
+                measurement.meta["role"] = normalized
+                metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
+                measurement.summary_text = metrics["summary"]
+                measurement.meta = self._canonicalize_measurement_meta(measurement, metrics)
+
+        self._refresh_grid_overlay()
+        self._refresh_analysis_selectors()
+        self._sync_analysis_selector_inputs()
+        self._toggle_cnr_noise_widgets()
+        self._auto_bind_analysis_inputs_from_roles(overwrite_existing=True)
+        self._update_analysis_action_button_state()
+        self._draw_persistent_measurements()
+
+    def save_measurement_preset(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Preset 저장",
+            defaultextension=".moduba.preset.json",
+            filetypes=[("Moduba Preset", "*.moduba.preset.json"), ("JSON", "*.json"), ("All Files", "*.*")],
+        )
+        if not path:
+            return
+        payload = self.serialize_preset()
+        Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        messagebox.showinfo("Preset Save", f"Preset 저장 완료:\n{path}")
+
+    def load_measurement_preset(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Preset 불러오기",
+            filetypes=[("Moduba Preset", "*.moduba.preset.json"), ("JSON", "*.json"), ("All Files", "*.*")],
+        )
+        if not path:
+            return
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        preset_data = self.deserialize_preset(payload)
+        if preset_data["version"] != PRESET_SCHEMA_VERSION:
+            messagebox.showwarning(
+                "Preset Version",
+                f"Preset 버전 불일치: file={preset_data['version']}, app={PRESET_SCHEMA_VERSION}\n가능한 항목만 적용합니다.",
+            )
+        self.apply_preset(preset_data)
+
     def _get_frame_pixel_array(self, frame_index: int) -> np.ndarray | None:
         if not self.frames or not (0 <= frame_index < len(self.frames)):
             return None
@@ -6354,64 +10103,317 @@ class DicomViewer:
             return None
         return frame
 
-    def _sample_line_profile(self, measurement: Measurement) -> tuple[np.ndarray, np.ndarray] | None:
+    def extract_line_profile(self, measurement: Measurement) -> dict[str, Any] | None:
         frame = self._get_frame_pixel_array(measurement.frame_index)
         if frame is None:
             return None
         x0, y0 = measurement.start
         x1, y1 = measurement.end
-        length = int(max(np.hypot(x1 - x0, y1 - y0), 1))
-        xs = np.linspace(x0, x1, num=length)
-        ys = np.linspace(y0, y1, num=length)
+        sample_count = int(max(np.ceil(np.hypot(x1 - x0, y1 - y0)) + 1, 2))
+        xs = np.linspace(x0, x1, num=sample_count, dtype=np.float64)
+        ys = np.linspace(y0, y1, num=sample_count, dtype=np.float64)
         xi = np.clip(np.round(xs).astype(int), 0, frame.shape[1] - 1)
         yi = np.clip(np.round(ys).astype(int), 0, frame.shape[0] - 1)
-        intensity = frame[yi, xi]
-        distance = np.linspace(0.0, float(np.hypot(x1 - x0, y1 - y0)), num=length)
-        return distance, intensity
+        intensity = frame[yi, xi].astype(np.float64)
+        distance_px = np.zeros(sample_count, dtype=np.float64)
+        if sample_count > 1:
+            step_px = np.hypot(np.diff(xs), np.diff(ys))
+            distance_px[1:] = np.cumsum(step_px)
+        spacing = self._get_pixel_spacing_mm()
+        distance_mm: np.ndarray | None = None
+        if spacing is not None:
+            row_mm, col_mm = float(spacing[0]), float(spacing[1])
+            distance_mm = np.zeros(sample_count, dtype=np.float64)
+            if sample_count > 1:
+                step_mm = np.hypot(np.diff(xs) * col_mm, np.diff(ys) * row_mm)
+                distance_mm[1:] = np.cumsum(step_mm)
+        return {
+            "distance_px": distance_px,
+            "distance_mm": distance_mm,
+            "intensity": intensity,
+            "sample_count": int(sample_count),
+            "start": (float(x0), float(y0)),
+            "end": (float(x1), float(y1)),
+        }
+
+    def summarize_line_profile(self, profile: dict[str, Any]) -> dict[str, Any]:
+        intensity = np.asarray(profile.get("intensity", []), dtype=np.float64)
+        if intensity.size == 0:
+            return {
+                "sample_count": 0,
+                "min_intensity": 0.0,
+                "max_intensity": 0.0,
+                "mean_intensity": 0.0,
+                "std_intensity": 0.0,
+                "length_px": 0.0,
+                "length_mm": None,
+                "peak_count": 0,
+                "valley_count": 0,
+            }
+        distance_px = np.asarray(profile.get("distance_px", []), dtype=np.float64)
+        distance_mm_raw = profile.get("distance_mm")
+        distance_mm = None if distance_mm_raw is None else np.asarray(distance_mm_raw, dtype=np.float64)
+        peaks = np.where((intensity[1:-1] > intensity[:-2]) & (intensity[1:-1] > intensity[2:]))[0] + 1
+        valleys = np.where((intensity[1:-1] < intensity[:-2]) & (intensity[1:-1] < intensity[2:]))[0] + 1
+        features = self.compute_profile_features(profile)
+        return {
+            "sample_count": int(intensity.size),
+            "min_intensity": float(np.min(intensity)),
+            "max_intensity": float(np.max(intensity)),
+            "mean_intensity": float(np.mean(intensity)),
+            "std_intensity": float(np.std(intensity)),
+            "length_px": float(distance_px[-1]) if distance_px.size else 0.0,
+            "length_mm": None if distance_mm is None or distance_mm.size == 0 else float(distance_mm[-1]),
+            "peak_count": int(peaks.size),
+            "valley_count": int(valleys.size),
+            "peak_value": features.get("peak_value"),
+            "peak_position": features.get("peak_position"),
+            "valley_value": features.get("valley_value"),
+            "valley_position": features.get("valley_position"),
+            "fwhm": features.get("fwhm"),
+            "distance_unit": features.get("distance_unit", "px"),
+        }
+
+    def render_line_profile_chart(self, measurement: Measurement, profile: dict[str, Any], summary: dict[str, Any]) -> None:
+        distance_px = np.asarray(profile.get("distance_px", []), dtype=np.float64)
+        distance_mm_raw = profile.get("distance_mm")
+        distance_mm = None if distance_mm_raw is None else np.asarray(distance_mm_raw, dtype=np.float64)
+        intensity = np.asarray(profile.get("intensity", []), dtype=np.float64)
+        if intensity.size == 0:
+            return
+        line_index = self._line_index_for_measurement_id(measurement.id)
+        line_label = f"Line {line_index}" if line_index is not None else measurement.id[:8]
+        use_mm_axis = distance_mm is not None and distance_mm.size == intensity.size
+        x_values = distance_mm if use_mm_axis else distance_px
+        x_label = "Distance (mm)" if use_mm_axis else "Distance (px)"
+        plt.figure(figsize=(7, 4))
+        plt.plot(x_values, intensity, color="#0a84ff")
+        plt.xlabel(x_label)
+        plt.ylabel("Intensity")
+        plt.title(f"{line_label} | n={summary['sample_count']} | L={summary['length_px']:.2f}px")
+        plt.tight_layout()
+        plt.show(block=False)
 
     def show_line_profile_for_selected_line(self) -> None:
-        measurement = self._get_selected_measurement_from_analysis("line", "line_profile_line_id", "line_profile")
-        if measurement is None:
-            self.analysis_results["line_info"].set("Line: Select Profile Line")
-            messagebox.showinfo("안내", "Profile Line을 선택하세요.")
+        context = self._prepare_selected_line_profile_context(show_warning=True)
+        if context is None:
             return
-        profile = self._sample_line_profile(measurement)
-        if profile is None:
-            return
-        distance, intensity = profile
-        metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
+        measurement = context["measurement"]
+        profile = context["profile"]
+        summary = context["summary"]
+        metrics = context["metrics"]
+        line_label = context["line_label"]
+        fwhm_text = "N/A" if summary["fwhm"] is None else f"{summary['fwhm']:.2f}{summary['distance_unit']}"
         self.analysis_results["line_info"].set(
-            f"Line {measurement.id[:8]} | length {metrics['length_px']:.1f} px | samples {len(distance)}"
+            f"{line_label} | mean {summary['mean_intensity']:.2f} | peak {summary['peak_value']:.2f} | FWHM {fwhm_text}"
         )
-        self.analysis_last_run["line_profile"] = {
+        self._action_set_analysis_last_run("line_profile", {
             "inputs": {
                 "line_id": measurement.id,
             },
             "factors": self._collect_analysis_factors(measurement),
             "result": {
                 "length_px": float(metrics["length_px"]),
-                "sample_count": int(len(distance)),
+                "length_mm": summary["length_mm"],
+                "sample_count": int(summary["sample_count"]),
+                "min_intensity": float(summary["min_intensity"]),
+                "max_intensity": float(summary["max_intensity"]),
+                "mean_intensity": float(summary["mean_intensity"]),
+                "std_intensity": float(summary["std_intensity"]),
+                "peak_count": int(summary["peak_count"]),
+                "valley_count": int(summary["valley_count"]),
+                "peak_value": summary["peak_value"],
+                "peak_position": summary["peak_position"],
+                "valley_value": summary["valley_value"],
+                "valley_position": summary["valley_position"],
+                "fwhm": summary["fwhm"],
+                "distance_unit": summary["distance_unit"],
+                "distance_px": np.asarray(profile["distance_px"], dtype=np.float64).tolist(),
+                "distance_mm": None
+                if profile.get("distance_mm") is None
+                else np.asarray(profile["distance_mm"], dtype=np.float64).tolist(),
+                "intensity": np.asarray(profile["intensity"], dtype=np.float64).tolist(),
             },
+        })
+        cache_key = self._line_profile_cache_key(self._get_current_image_path(), self.current_frame, measurement.id)
+        self.line_profile_series_cache[cache_key] = {
+            "distance_px": np.asarray(profile.get("distance_px", []), dtype=np.float64).tolist(),
+            "distance_mm": None
+            if profile.get("distance_mm") is None
+            else np.asarray(profile.get("distance_mm", []), dtype=np.float64).tolist(),
+            "intensity": np.asarray(profile.get("intensity", []), dtype=np.float64).tolist(),
         }
         self._refresh_analysis_results_panel()
-        plt.figure(figsize=(7, 4))
-        plt.plot(distance, intensity, color="#0a84ff")
-        plt.xlabel("Distance (px)")
-        plt.ylabel("Intensity")
-        plt.title("Line Profile")
-        plt.tight_layout()
-        plt.show(block=False)
-        save_path = filedialog.asksaveasfilename(
+        fwhm_summary = "N/A" if summary["fwhm"] is None else f"{summary['fwhm']:.2f}{summary['distance_unit']}"
+        mean_note = (
+            f"samples={summary['sample_count']}, peak={summary['peak_value']:.2f}, "
+            f"fwhm={fwhm_summary}"
+        )
+        self._append_history_entry(
+            measurement_type="Line Profile",
+            target_name=line_label,
+            metric="ProfileMean",
+            value=float(summary["mean_intensity"]),
+            unit="a.u.",
+            note=mean_note,
+            measurement_mode="analysis",
+            target_id=measurement.id,
+        )
+        self._append_history_entry(
+            measurement_type="Line Profile",
+            target_name=line_label,
+            metric="ProfileStd",
+            value=float(summary["std_intensity"]),
+            unit="a.u.",
+            note=f"samples={summary['sample_count']}, peaks={summary['peak_count']}, valleys={summary['valley_count']}",
+            measurement_mode="analysis",
+            target_id=measurement.id,
+        )
+        self._append_history_entry(
+            measurement_type="Line Profile",
+            target_name=line_label,
+            metric="Length(px)",
+            value=float(summary["length_px"]),
+            unit="px",
+            note="Profile axis length",
+            measurement_mode="analysis",
+            target_id=measurement.id,
+        )
+        if isinstance(summary["length_mm"], (int, float)):
+            self._append_history_entry(
+                measurement_type="Line Profile",
+                target_name=line_label,
+                metric="Length(mm)",
+                value=float(summary["length_mm"]),
+                unit="mm",
+                note="Pixel spacing 반영 길이",
+                measurement_mode="analysis",
+                target_id=measurement.id,
+            )
+        self._append_history_entry(
+            measurement_type="Line Profile",
+            target_name=line_label,
+            metric="ProfileMin",
+            value=float(summary["min_intensity"]),
+            unit="a.u.",
+            note="Profile minimum intensity",
+            measurement_mode="analysis",
+            target_id=measurement.id,
+        )
+        self._append_history_entry(
+            measurement_type="Line Profile",
+            target_name=line_label,
+            metric="ProfileMax",
+            value=float(summary["max_intensity"]),
+            unit="a.u.",
+            note="Profile maximum intensity",
+            measurement_mode="analysis",
+            target_id=measurement.id,
+        )
+        if isinstance(summary.get("peak_value"), (int, float)):
+            self._append_history_entry(
+                measurement_type="Line Profile",
+                target_name=line_label,
+                metric="PeakValue",
+                value=float(summary["peak_value"]),
+                unit="a.u.",
+                note=f"peak_position={summary['peak_position']:.2f} {summary['distance_unit']}",
+                measurement_mode="analysis",
+                target_id=measurement.id,
+            )
+        if isinstance(summary.get("fwhm"), (int, float)):
+            self._append_history_entry(
+                measurement_type="Line Profile",
+                target_name=line_label,
+                metric="FWHM",
+                value=float(summary["fwhm"]),
+                unit=str(summary["distance_unit"]),
+                note="Full Width at Half Maximum",
+                measurement_mode="analysis",
+                target_id=measurement.id,
+            )
+        self.render_line_profile_chart(measurement, profile, summary)
+
+    def _prepare_selected_line_profile_context(self, show_warning: bool = False) -> dict[str, Any] | None:
+        measurement = self._get_selected_measurement_from_analysis("line", "line_profile_line_id", "line_profile")
+        if measurement is None:
+            self.analysis_results["line_info"].set("Line: Select Profile Line")
+            if show_warning:
+                messagebox.showinfo("안내", "Profile Line을 선택하세요.")
+            return None
+        profile = self.extract_line_profile(measurement)
+        if profile is None:
+            if show_warning:
+                messagebox.showwarning("Line Profile", "선택한 라인에서 프로파일을 계산할 수 없습니다.")
+            return None
+        summary = self.summarize_line_profile(profile)
+        metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
+        line_index = self._line_index_for_measurement_id(measurement.id)
+        line_label = f"Line {line_index}" if line_index is not None else measurement.id[:8]
+        return {
+            "measurement": measurement,
+            "profile": profile,
+            "summary": summary,
+            "metrics": metrics,
+            "line_label": line_label,
+        }
+
+    def show_line_profile_feature_details(self) -> None:
+        context = self._prepare_selected_line_profile_context(show_warning=True)
+        if context is None:
+            return
+        summary = context["summary"]
+        line_label = context["line_label"]
+        peak_text = (
+            "N/A"
+            if not isinstance(summary.get("peak_value"), (int, float))
+            else f"{float(summary['peak_value']):.2f} @ {float(summary['peak_position']):.2f} {summary['distance_unit']}"
+        )
+        valley_text = (
+            "N/A"
+            if not isinstance(summary.get("valley_value"), (int, float))
+            else f"{float(summary['valley_value']):.2f} @ {float(summary['valley_position']):.2f} {summary['distance_unit']}"
+        )
+        fwhm_text = "N/A" if not isinstance(summary.get("fwhm"), (int, float)) else f"{float(summary['fwhm']):.2f} {summary['distance_unit']}"
+        messagebox.showinfo(
+            "Line Profile Details",
+            (
+                f"{line_label}\n"
+                f"Samples: {summary['sample_count']}\n"
+                f"Length: {summary['length_px']:.2f} px"
+                + ("" if summary["length_mm"] is None else f" ({float(summary['length_mm']):.2f} mm)")
+                + "\n"
+                f"Mean/Std: {summary['mean_intensity']:.2f} / {summary['std_intensity']:.2f}\n"
+                f"Peak: {peak_text}\n"
+                f"Valley: {valley_text}\n"
+                f"FWHM: {fwhm_text}"
+            ),
+        )
+
+    def export_selected_line_profile_csv(self) -> None:
+        context = self._prepare_selected_line_profile_context(show_warning=True)
+        if context is None:
+            return
+        profile = context["profile"]
+        line_label = str(context["line_label"]).replace(" ", "_")
+        path = filedialog.asksaveasfilename(
             title="라인 프로파일 CSV 저장",
             defaultextension=".csv",
+            initialfile=f"{line_label}_profile.csv",
             filetypes=[("CSV", "*.csv"), ("All Files", "*.*")],
         )
-        if save_path:
-            with open(save_path, "w", newline="", encoding="utf-8-sig") as handle:
-                writer = csv.writer(handle)
-                writer.writerow(["distance_px", "intensity"])
-                for d, v in zip(distance, intensity):
-                    writer.writerow([f"{float(d):.6f}", f"{float(v):.6f}"])
+        if not path:
+            return
+        distance_px = np.asarray(profile.get("distance_px", []), dtype=np.float64)
+        distance_mm = None if profile.get("distance_mm") is None else np.asarray(profile.get("distance_mm", []), dtype=np.float64)
+        intensity = np.asarray(profile.get("intensity", []), dtype=np.float64)
+        with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["distance_px", "distance_mm", "intensity"])
+            for index, value in enumerate(intensity):
+                mm_value = "" if distance_mm is None else f"{float(distance_mm[index]):.6f}"
+                writer.writerow([f"{float(distance_px[index]):.6f}", mm_value, f"{float(value):.6f}"])
+        messagebox.showinfo("Line Profile Export", f"CSV 저장 완료:\n{path}")
 
     def _parse_uniformity_role_filter(self) -> set[str]:
         raw = self.analysis_inputs["uniformity_role_filter"].get()
@@ -6428,7 +10430,7 @@ class DicomViewer:
                 return [], "role_group(empty role filter)"
             candidates = [
                 measurement
-                for measurement in self.persistent_measurements
+                for measurement in self._selector_measurements_for_image()
                 if measurement.kind == "roi"
                 and measurement.frame_index == self.current_frame
                 and self._geometry_matches(measurement.geometry_key, current_geometry)
@@ -6454,7 +10456,7 @@ class DicomViewer:
         selected_lookup = set(selected_ids)
         candidates = [
             measurement
-            for measurement in self.persistent_measurements
+            for measurement in self._selector_measurements_for_image()
             if measurement.kind == "roi"
             and measurement.id in selected_lookup
             and measurement.frame_index == self.current_frame
@@ -6479,108 +10481,131 @@ class DicomViewer:
         }
 
     def calculate_uniformity_from_inputs(self) -> None:
+        self._ensure_window_b_services()
         roi_set, source = self._collect_uniformity_roi_set()
-        if not roi_set:
-            self.analysis_results["uniformity_preview"].set(f"Preview: No ROI set ({source})")
-            self.analysis_results["uniformity_result"].set("Result: -")
-            messagebox.showinfo("Uniformity", "Uniformity 계산에 사용할 ROI 집합이 비어 있습니다.")
-            return
-        samples: list[np.ndarray] = []
-        for measurement in roi_set:
-            frame = self._get_frame_pixel_array(measurement.frame_index)
-            roi_pixels, _bounds = self._extract_roi_pixels(frame, measurement.start, measurement.end, ensure_non_empty=False)
-            if roi_pixels.size > 0:
-                samples.append(roi_pixels.reshape(-1))
-        if not samples:
-            self.analysis_results["uniformity_preview"].set("Preview: ROI pixels unavailable")
-            self.analysis_results["uniformity_result"].set("Result: -")
-            messagebox.showinfo("Uniformity", "선택된 ROI에서 유효한 픽셀을 찾지 못했습니다.")
-            return
-        values = np.concatenate(samples)
-        aggregate_stats = {
-            "max": float(np.max(values)),
-            "min": float(np.min(values)),
-            "mean": float(np.mean(values)),
-            "std": float(np.std(values)),
-            "pixel_count": int(values.size),
-        }
         formula_key = self.analysis_inputs["uniformity_formula"].get()
         formulas = self._uniformity_formula_definitions()
-        selected_formula = formulas.get(formula_key, formulas["max_min"])
-        uniformity_value = selected_formula["calculator"](aggregate_stats)
-        if uniformity_value is None:
-            self.analysis_results["uniformity_preview"].set(
-                f"Preview: max={aggregate_stats['max']:.4f}, min={aggregate_stats['min']:.4f}, "
-                f"mean={aggregate_stats['mean']:.4f}, std={aggregate_stats['std']:.4f}"
-            )
-            self.analysis_results["uniformity_result"].set("Result: Invalid denominator")
-            messagebox.showwarning("Uniformity", "선택한 공식에서 분모가 0 또는 음수입니다.")
-            return
-        self.analysis_results["uniformity_preview"].set(
-            f"Preview: n={len(roi_set)}, px={aggregate_stats['pixel_count']}, "
-            f"max={aggregate_stats['max']:.4f}, min={aggregate_stats['min']:.4f}, "
-            f"mean={aggregate_stats['mean']:.4f}, std={aggregate_stats['std']:.4f}"
+        uniformity_result = self.analysis_result_controller.evaluate_uniformity(
+            roi_set=roi_set,
+            source=source,
+            formula_key=formula_key,
+            formulas=formulas,
+            collect_factors=self._collect_analysis_factors,
+            get_frame_array=self._get_frame_pixel_array,
+            extract_roi_pixels=self._extract_roi_pixels,
         )
-        self.analysis_results["uniformity_result"].set(
-            f"Result: Uniformity={uniformity_value:.4f} ({formula_key})"
-        )
-        self.analysis_last_run["uniformity"] = {
-            "metric": "uniformity",
-            "inputs": {
-                "source": source,
-                "roi_count": int(len(roi_set)),
-                "roi_ids": [measurement.id for measurement in roi_set],
-                "formula": formula_key,
-                "formula_label": selected_formula["label"],
-            },
-            "stats": aggregate_stats,
-            "result": {
-                "value": float(uniformity_value),
-                "formula": formula_key,
-                "formula_label": selected_formula["label"],
-            },
-        }
+        self.analysis_results["uniformity_preview"].set(uniformity_result.preview_text)
+        self.analysis_results["uniformity_result"].set(uniformity_result.result_text)
+        self._action_set_analysis_last_run("uniformity", uniformity_result.payload)
         self._refresh_analysis_results_panel()
+        if uniformity_result.history_row is not None:
+            self._append_analysis_history_row(
+                uniformity_result.history_row,
+                unit="%",
+                related_target_ids=list(uniformity_result.payload.get("inputs", {}).get("roi_ids", [])),
+            )
+        if uniformity_result.message_level == "info":
+            messagebox.showinfo("Uniformity", uniformity_result.message_text)
+        elif uniformity_result.message_level == "warning":
+            messagebox.showwarning("Uniformity", uniformity_result.message_text)
 
     def calculate_snr_from_inputs(self) -> None:
         self._auto_bind_analysis_inputs_from_roles(overwrite_existing=False)
         signal_roi = self._get_selected_measurement_from_analysis("roi", "snr_signal_roi_id", "snr_signal")
         noise_roi = self._get_selected_measurement_from_analysis("roi", "snr_background_roi_id", "snr_noise")
+        signal_roi_id = signal_roi.id if signal_roi is not None else self._read_analysis_selected_id("roi", "snr_signal_roi_id", "snr_signal")
+        noise_roi_id = noise_roi.id if noise_roi is not None else self._read_analysis_selected_id("roi", "snr_background_roi_id", "snr_noise")
+        snr_payload: dict[str, Any] = {
+            "status": "missing",
+            "reason": "",
+            "signal_roi_id": signal_roi_id,
+            "noise_roi_id": noise_roi_id,
+            "mean_signal": None,
+            "std_noise": None,
+            "inputs": {
+                "signal_roi_id": signal_roi_id,
+                "noise_roi_id": noise_roi_id,
+            },
+            "factors": {
+                "signal": {} if signal_roi is None else self._collect_analysis_factors(signal_roi),
+                "noise": {} if noise_roi is None else self._collect_analysis_factors(noise_roi),
+            },
+            "formula": "mean(Signal ROI) / std(Noise ROI)",
+            "preview": "",
+            "preview_text": "",
+            "result": None,
+            "result_text": "",
+        }
         if signal_roi is None or noise_roi is None:
             missing: list[str] = []
             if signal_roi is None:
                 missing.append("signal role(또는 Signal ROI 수동 선택)")
             if noise_roi is None:
                 missing.append("background/noise role(또는 Noise ROI 수동 선택)")
-            self.analysis_results["snr_preview"].set(f"Preview: Missing {' + '.join(missing)}")
-            self.analysis_results["snr_result"].set("Result: -")
+            reason = " + ".join(missing)
+            preview_text = "ROI selection required"
+            result_text = "SNR unavailable"
+            self.analysis_results["snr_preview"].set(preview_text)
+            self.analysis_results["snr_result"].set(result_text)
+            snr_payload["status"] = "missing"
+            snr_payload["reason"] = reason
+            snr_payload["preview"] = preview_text
+            snr_payload["preview_text"] = f"Preview: {preview_text}"
+            snr_payload["result_text"] = result_text
+            self._action_set_analysis_last_run("snr", snr_payload)
+            self._refresh_analysis_results_panel()
             messagebox.showinfo("SNR", "SNR 계산에 필요한 ROI가 부족합니다.\nrole 지정 또는 수동 선택을 확인하세요.")
             return
         signal_metrics = self.compute_measurement(signal_roi, self._get_frame_pixel_array(signal_roi.frame_index))
         noise_metrics = self.compute_measurement(noise_roi, self._get_frame_pixel_array(noise_roi.frame_index))
         signal_mean = float((signal_metrics.get("signal_stats") or {}).get("mean", 0.0))
         noise_std = float((noise_metrics.get("signal_stats") or {}).get("std", 0.0))
-        self.analysis_results["snr_preview"].set(f"Preview: {signal_mean:.4f} / {noise_std:.4f}")
+        preview_text = "Signal ROI selected / Noise ROI selected"
+        self.analysis_results["snr_preview"].set(preview_text)
+        snr_payload["signal_roi_id"] = signal_roi.id
+        snr_payload["noise_roi_id"] = noise_roi.id
+        snr_payload["inputs"] = {
+            "signal_roi_id": signal_roi.id,
+            "noise_roi_id": noise_roi.id,
+        }
+        snr_payload["factors"] = {
+            "signal": self._collect_analysis_factors(signal_roi),
+            "noise": self._collect_analysis_factors(noise_roi),
+        }
+        snr_payload["mean_signal"] = float(signal_mean)
+        snr_payload["std_noise"] = float(noise_std)
+        snr_payload["preview"] = f"{signal_mean:.4f} / {noise_std:.4f}"
+        snr_payload["preview_text"] = f"Preview: {preview_text}"
         if noise_std <= 0:
-            self.analysis_results["snr_result"].set("Result: Invalid (noise std = 0)")
+            result_text = "SNR unavailable"
+            self.analysis_results["snr_result"].set(result_text)
+            snr_payload["status"] = "invalid"
+            snr_payload["reason"] = "noise std <= 0"
+            snr_payload["result"] = None
+            snr_payload["result_text"] = result_text
+            self._action_set_analysis_last_run("snr", snr_payload)
+            self._refresh_analysis_results_panel()
             messagebox.showwarning("SNR", "Noise ROI 표준편차가 0입니다.")
             return
         snr = signal_mean / noise_std
-        self.analysis_results["snr_result"].set(f"Result: SNR = {snr:.4f}")
-        self.analysis_last_run["snr"] = {
-            "inputs": {
-                "signal_roi_id": signal_roi.id,
-                "noise_roi_id": noise_roi.id,
-            },
-            "factors": {
-                "signal": self._collect_analysis_factors(signal_roi),
-                "noise": self._collect_analysis_factors(noise_roi),
-            },
-            "formula": "mean(Signal ROI) / std(Noise ROI)",
-            "preview": f"{signal_mean:.4f} / {noise_std:.4f}",
-            "result": float(snr),
-        }
+        result_text = f"Signal Mean: {signal_mean:.2f} | Noise SD: {noise_std:.2f} | SNR: {snr:.2f}"
+        self.analysis_results["snr_result"].set(result_text)
+        snr_payload["status"] = "success"
+        snr_payload["reason"] = ""
+        snr_payload["result"] = float(snr)
+        snr_payload["result_text"] = result_text
+        self._action_set_analysis_last_run("snr", snr_payload)
         self._refresh_analysis_results_panel()
+        self._append_analysis_history_row(
+            {
+                "metric_name": "SNR",
+                "item_name": "SNR",
+                "stats": {"mean_signal": signal_mean, "std_noise": noise_std},
+                "result_value": float(snr),
+            },
+            unit="ratio",
+            related_target_ids=[signal_roi.id, noise_roi.id],
+        )
 
     def calculate_cnr_from_inputs(self) -> None:
         self._auto_bind_analysis_inputs_from_roles(overwrite_existing=False)
@@ -6590,6 +10615,37 @@ class DicomViewer:
         noise_roi = None
         if formula == "standard_noise":
             noise_roi = self._get_selected_measurement_from_analysis("roi", "cnr_noise_roi_id", "cnr_noise")
+        target_roi_id = target_roi.id if target_roi is not None else self._read_analysis_selected_id("roi", "cnr_target_roi_id", "cnr_target")
+        reference_roi_id = reference_roi.id if reference_roi is not None else self._read_analysis_selected_id("roi", "cnr_reference_roi_id", "cnr_reference")
+        noise_roi_id = ""
+        if formula == "standard_noise":
+            noise_roi_id = noise_roi.id if noise_roi is not None else self._read_analysis_selected_id("roi", "cnr_noise_roi_id", "cnr_noise")
+        cnr_payload: dict[str, Any] = {
+            "status": "missing",
+            "reason": "",
+            "formula": formula,
+            "preview_text": "",
+            "result_text": "",
+            "inputs": {
+                "formula": formula,
+                "region_a_roi_id": target_roi_id,
+                "region_b_roi_id": reference_roi_id,
+                "noise_roi_id": None if formula != "standard_noise" else noise_roi_id,
+            },
+            "factors": {
+                "region_a": {} if target_roi is None else self._collect_analysis_factors(target_roi),
+                "region_b": {} if reference_roi is None else self._collect_analysis_factors(reference_roi),
+                "noise": None if noise_roi is None else self._collect_analysis_factors(noise_roi),
+            },
+            "numerator": None,
+            "denominator": None,
+            "target_mean": None,
+            "reference_mean": None,
+            "noise_std": None,
+            "target_std": None,
+            "reference_std": None,
+            "result": None,
+        }
         if target_roi is None or reference_roi is None or (formula == "standard_noise" and noise_roi is None):
             missing: list[str] = []
             if target_roi is None:
@@ -6598,8 +10654,17 @@ class DicomViewer:
                 missing.append("reference role(또는 Region B ROI 수동 선택)")
             if formula == "standard_noise" and noise_roi is None:
                 missing.append("noise role(또는 Noise ROI 수동 선택)")
-            self.analysis_results["cnr_preview"].set(f"Formula: Missing {' + '.join(missing)}")
-            self.analysis_results["cnr_result"].set("Result: -")
+            reason = " + ".join(missing)
+            preview_text = "ROI selection required"
+            result_text = "CNR unavailable"
+            self.analysis_results["cnr_preview"].set(preview_text)
+            self.analysis_results["cnr_result"].set(result_text)
+            cnr_payload["status"] = "missing"
+            cnr_payload["reason"] = reason
+            cnr_payload["preview_text"] = f"Preview: {preview_text}"
+            cnr_payload["result_text"] = result_text
+            self._action_set_analysis_last_run("cnr", cnr_payload)
+            self._refresh_analysis_results_panel()
             messagebox.showinfo("CNR", "CNR 계산에 필요한 ROI가 부족합니다.\nrole 지정 또는 수동 선택을 확인하세요.")
             return
         target_metrics = self.compute_measurement(target_roi, self._get_frame_pixel_array(target_roi.frame_index))
@@ -6607,46 +10672,75 @@ class DicomViewer:
         target_mean = float((target_metrics.get("signal_stats") or {}).get("mean", 0.0))
         reference_mean = float((reference_metrics.get("signal_stats") or {}).get("mean", 0.0))
         numerator = abs(target_mean - reference_mean)
+        cnr_payload["inputs"] = {
+            "formula": formula,
+            "region_a_roi_id": target_roi.id,
+            "region_b_roi_id": reference_roi.id,
+            "noise_roi_id": None if noise_roi is None else noise_roi.id,
+        }
+        cnr_payload["factors"] = {
+            "region_a": self._collect_analysis_factors(target_roi),
+            "region_b": self._collect_analysis_factors(reference_roi),
+            "noise": None if noise_roi is None else self._collect_analysis_factors(noise_roi),
+        }
+        cnr_payload["target_mean"] = float(target_mean)
+        cnr_payload["reference_mean"] = float(reference_mean)
+        cnr_payload["numerator"] = float(numerator)
         if formula == "standard_noise":
             assert noise_roi is not None
             noise_metrics = self.compute_measurement(noise_roi, self._get_frame_pixel_array(noise_roi.frame_index))
             noise_std = float((noise_metrics.get("signal_stats") or {}).get("std", 0.0))
-            self.analysis_results["cnr_preview"].set(
-                "Formula: |S_A - S_B| / sigma_o\n"
-                f"Preview: |{target_mean:.4f} - {reference_mean:.4f}| / {noise_std:.4f}"
-            )
+            preview_text = "Target ROI selected / Reference ROI selected / Noise ROI selected"
+            self.analysis_results["cnr_preview"].set(preview_text)
             denominator = noise_std
             invalid_msg = "Noise ROI 표준편차가 0입니다."
+            cnr_payload["noise_std"] = float(noise_std)
         else:
             target_std = float((target_metrics.get("signal_stats") or {}).get("std", 0.0))
             reference_std = float((reference_metrics.get("signal_stats") or {}).get("std", 0.0))
             denominator = float(np.sqrt(target_std * target_std + reference_std * reference_std))
-            self.analysis_results["cnr_preview"].set(
-                "Formula: |S_A - S_B| / sqrt(sigma_A^2 + sigma_B^2)\n"
-                f"Preview: |{target_mean:.4f} - {reference_mean:.4f}| / sqrt({target_std:.4f}² + {reference_std:.4f}²)"
-            )
+            preview_text = "Target ROI selected / Reference ROI selected"
+            self.analysis_results["cnr_preview"].set(preview_text)
             invalid_msg = "Region A/Region B 분산 기반 분모가 0입니다."
+            cnr_payload["target_std"] = float(target_std)
+            cnr_payload["reference_std"] = float(reference_std)
+        cnr_payload["preview_text"] = f"Preview: {preview_text}"
+        cnr_payload["denominator"] = float(denominator)
         if denominator <= 0:
-            self.analysis_results["cnr_result"].set("Result: Invalid (denominator = 0)")
+            result_text = "CNR unavailable"
+            self.analysis_results["cnr_result"].set(result_text)
+            cnr_payload["status"] = "invalid"
+            cnr_payload["reason"] = "denominator <= 0"
+            cnr_payload["result"] = None
+            cnr_payload["result_text"] = result_text
+            self._action_set_analysis_last_run("cnr", cnr_payload)
+            self._refresh_analysis_results_panel()
             messagebox.showwarning("CNR", invalid_msg)
             return
         cnr = numerator / denominator
-        self.analysis_results["cnr_result"].set(f"Result: CNR = {cnr:.4f}")
-        self.analysis_last_run["cnr"] = {
-            "inputs": {
-                "formula": formula,
-                "region_a_roi_id": target_roi.id,
-                "region_b_roi_id": reference_roi.id,
-                "noise_roi_id": None if noise_roi is None else noise_roi.id,
-            },
-            "factors": {
-                "region_a": self._collect_analysis_factors(target_roi),
-                "region_b": self._collect_analysis_factors(reference_roi),
-                "noise": None if noise_roi is None else self._collect_analysis_factors(noise_roi),
-            },
-            "result": float(cnr),
-        }
+        result_text = f"Target Mean: {target_mean:.2f} | Reference Mean: {reference_mean:.2f} | CNR: {cnr:.2f}"
+        self.analysis_results["cnr_result"].set(result_text)
+        cnr_payload["status"] = "success"
+        cnr_payload["reason"] = ""
+        cnr_payload["result"] = float(cnr)
+        cnr_payload["result_text"] = result_text
+        self._action_set_analysis_last_run("cnr", cnr_payload)
         self._refresh_analysis_results_panel()
+        history_stats = {"target_mean": target_mean, "reference_mean": reference_mean}
+        if formula == "standard_noise":
+            history_stats["noise_std"] = cnr_payload.get("noise_std")
+        else:
+            history_stats["noise_std"] = denominator
+        self._append_analysis_history_row(
+            {
+                "metric_name": "CNR",
+                "item_name": "CNR",
+                "stats": history_stats,
+                "result_value": float(cnr),
+            },
+            unit="ratio",
+            related_target_ids=[target_roi.id, reference_roi.id] + ([] if noise_roi is None else [noise_roi.id]),
+        )
 
     def _set_current_image_as_reference(self) -> None:
         path = self._get_current_image_path()
@@ -6663,9 +10757,16 @@ class DicomViewer:
         self._sync_image_analysis_display_value("image", "target_image", "target_image_id")
 
     def _get_current_image_path(self) -> str:
-        if self.file_paths and 0 <= self.current_file_index < len(self.file_paths):
-            return self.file_paths[self.current_file_index]
-        return self.path_var.get().strip()
+        file_paths = getattr(self, "file_paths", [])
+        current_file_index = int(getattr(self, "current_file_index", -1))
+        if file_paths and 0 <= current_file_index < len(file_paths):
+            return file_paths[current_file_index]
+        if hasattr(self, "path_var") and self.path_var is not None:
+            try:
+                return self.path_var.get().strip()
+            except Exception:
+                return ""
+        return ""
 
     def _resolve_image_analysis_selection(self, input_key: str, combobox_key: str, kind: str) -> str:
         label = self._image_analysis_comboboxes.get(combobox_key).get() if combobox_key in self._image_analysis_comboboxes else ""
@@ -6775,7 +10876,8 @@ class DicomViewer:
         metrics = self.compute_measurement(selected, self._get_frame_pixel_array(selected.frame_index))
         selected.summary_text = metrics["summary"]
         selected.meta = self._canonicalize_measurement_meta(selected, metrics)
-        self.analysis_last_run = {}
+        self._action_update_measurement_in_store(selected)
+        self._action_clear_analysis_last_run()
         self._reset_signal_analysis_results()
         self._refresh_analysis_selectors()
         self._auto_bind_analysis_inputs_from_roles(overwrite_existing=True)
@@ -6805,7 +10907,7 @@ class DicomViewer:
     def _find_measurement_by_id(self, measurement_id: str | None, expected_kind: str | None = None) -> Measurement | None:
         if measurement_id is None:
             return None
-        for measurement in self.persistent_measurements:
+        for measurement in self._selector_measurements_for_current_frame(kind="roi"):
             if measurement.id == measurement_id:
                 if expected_kind is not None and measurement.kind != expected_kind:
                     return None
@@ -6902,7 +11004,7 @@ class DicomViewer:
         frame = np.asarray(self.frames[frame_index])
         source_h, source_w = frame.shape[:2]
         current_geometry = self._get_geometry_key_for_frame(frame_index)
-        for measurement in self.persistent_measurements:
+        for measurement in self._selector_measurements_for_current_frame(kind="roi"):
             if not self._geometry_matches(current_geometry, measurement.geometry_key):
                 continue
             if measurement.frame_index != frame_index:
@@ -6911,14 +11013,16 @@ class DicomViewer:
             sy = measurement.start[1] / max(source_h, 1) * height
             ex = measurement.end[0] / max(source_w, 1) * width
             ey = measurement.end[1] / max(source_h, 1) * height
-            label_summary = self.compute_measurement(
+            metrics = self.compute_measurement(
                 measurement,
                 self._get_frame_pixel_array(frame_index),
-            )["summary"]
+            )
+            label_summary = metrics["summary"]
             if measurement.kind == "roi":
                 draw.rectangle((sx, sy, ex, ey), outline="#ff7f50", width=2)
                 if include_labels:
-                    draw.text((ex + 4, ey - 14), label_summary, fill="white")
+                    roi_label = self._display_name_for_roi_id(measurement.id)
+                    draw.text((ex + 4, ey - 14), f"{roi_label}\n{label_summary}", fill="white")
             elif measurement.kind == "line":
                 draw.line((sx, sy, ex, ey), fill="#00ffaa", width=2)
                 if include_labels:
@@ -7255,6 +11359,7 @@ class DicomViewer:
         if not 0 <= new_index < len(self.frames):
             return
         self.current_frame = new_index
+        self._action_commit_frame_change(self.current_frame)
         self._propagate_rois_from_geometry(source_geometry_key, source_frame_index, navigation_step=delta)
         self.clear_preview_overlay()
         self._show_frame()
