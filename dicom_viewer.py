@@ -21,6 +21,9 @@ from mtf_engine import calculate_slanted_edge_mtf
 from mtf_iec_reporting import evaluate_iec_reporting
 from mtf_integrity import evaluate_mtf_integrity
 from mtf_qa_grading import grade_mtf_for_internal_qa
+from domain_store import DomainStore
+from window_b_services import AnalysisResultController, HistoryController, SessionController, ReportExportController
+from window_b_manager import WindowBManager
 
 
 @dataclass
@@ -68,6 +71,20 @@ class RectRoi:
     stats: Optional[RoiStats] = None
     selected: bool = False
     visible: bool = True
+
+
+@dataclass
+class MeasurementDrawProjection:
+    measurement_id: str
+    kind: str
+    start: tuple[float, float]
+    end: tuple[float, float]
+    frame_index: int
+    geometry_key: str
+    role: str | None
+    meta: dict[str, Any]
+    summary_text: str
+    selected: bool = False
 
 
 @dataclass
@@ -229,7 +246,14 @@ class DicomViewer:
         self._active_crop_start: tuple[float, float] | None = None
         self._active_crop_end: tuple[float, float] | None = None
         self._active_crop_item_id: int | None = None
-        self.persistent_measurements: list[Measurement] = []
+        self.domain_store = DomainStore()
+        self._store_image_id = self.domain_store.add_image_context("", "current")
+        self.analysis_result_controller = AnalysisResultController()
+        self.history_controller = HistoryController()
+        self.session_controller = SessionController()
+        self.report_export_controller = ReportExportController()
+        self.window_b_manager = WindowBManager(self.root, self)
+        self.window_b_manager.bind_store_events()
         self.selected_persistent_measurement_id: str | None = None
         self._persistent_canvas_item_to_measurement_id: dict[int, str] = {}
         self.measurement_sets: dict[str, MeasurementSet] = {}
@@ -379,8 +403,6 @@ class DicomViewer:
         self._analysis_results_selected_index: int | None = None
         self.result_history_store = ResultHistoryStore()
         self.result_history_table: ttk.Treeview | None = None
-        self.analysis_groups: dict[str, ImageAnalysisGroup] = {}
-        self.study_sessions: dict[str, StudySession] = {}
         self.active_study_id: str = ""
         self.active_group_id: str = ""
         self._history_row_meta_by_item_id: dict[str, dict[str, Any]] = {}
@@ -815,6 +837,7 @@ class DicomViewer:
         ttk.Button(sections["Output"], text="현재 이미지 저장", command=self.export_current_image).pack(side="left", padx=(8, 0))
         ttk.Button(sections["Output"], text="측정 CSV 저장", command=self.export_measurements_csv).pack(side="left", padx=(8, 0))
         ttk.Button(sections["Output"], text="프레임 일괄 저장", command=self.export_all_frames).pack(side="left", padx=(8, 0))
+        ttk.Button(sections["Output"], text="Open Window B", command=self.open_window_b).pack(side="left", padx=(12, 0))
 
     def _build_image_toolbar(self, tab: ttk.Frame) -> None:
         sections = self._build_subtoolbar_sections(tab, ["File", "Navigate", "Display", "Transform"])
@@ -823,8 +846,8 @@ class DicomViewer:
         self.open_file_button.pack(side="left")
         self.open_folder_button = ttk.Button(sections["File"], text="폴더 열기", command=self.open_folder)
         self.open_folder_button.pack(side="left", padx=(8, 0))
-        ttk.Button(sections["File"], text="Save Session", command=self.save_analysis_session).pack(side="left", padx=(12, 0))
-        ttk.Button(sections["File"], text="Load Session", command=self.load_analysis_session).pack(side="left", padx=(8, 0))
+        ttk.Button(sections["File"], text="Save Session", command=self.save_analysis_session_via_window_b).pack(side="left", padx=(12, 0))
+        ttk.Button(sections["File"], text="Load Session", command=self.load_analysis_session_via_window_b).pack(side="left", padx=(8, 0))
         ttk.Button(sections["File"], text="Save Preset", command=self.save_measurement_preset).pack(side="left", padx=(12, 0))
         ttk.Button(sections["File"], text="Load Preset", command=self.load_measurement_preset).pack(side="left", padx=(8, 0))
 
@@ -988,7 +1011,23 @@ class DicomViewer:
         signal_strip = self._build_grouped_toolbar_strip(signal_tab)
         self._build_signal_analysis_toolbar(signal_strip)
         self._build_image_analysis_toolbar(image_tab)
-        self._build_results_history_panel(history_tab)
+        history_info = ttk.Frame(history_tab, padding=(12, 12))
+        history_info.pack(fill="both", expand=True)
+        ttk.Label(
+            history_info,
+            text="Results/History/Session/Report 주 작업 공간은 Window B 입니다.",
+        ).pack(anchor="w")
+        ttk.Button(history_info, text="Open Window B", command=self.open_window_b).pack(anchor="w", pady=(8, 0))
+        ttk.Button(
+            history_info,
+            text="Open History in Window B",
+            command=self._open_window_b_and_refresh_history,
+        ).pack(anchor="w", pady=(6, 0))
+        ttk.Button(
+            history_info,
+            text="Open Session/Report in Window B",
+            command=self._open_window_b_and_refresh_all,
+        ).pack(anchor="w", pady=(6, 0))
         self.analysis_inputs["cnr_formula"].trace_add("write", self._update_cnr_formula_ui)
         self.analysis_inputs["uniformity_input_mode"].trace_add("write", self._update_uniformity_input_ui)
         self.image_analysis_inputs["scope_type"].trace_add("write", self._update_image_scope_ui)
@@ -1323,6 +1362,15 @@ class DicomViewer:
         self.analysis_results_rows_container = rows_container
 
     def _build_results_history_panel(self, tab: ttk.Frame) -> None:
+        """
+        [DEPRECATED]
+        Window B panel factory 분리 이후 창 B에서는 더 이상 이 legacy builder를 호출하지 않는다.
+        현재는 제거 전 호출 경로 검증 단계로 유지된다.
+        삭제 전 조건:
+        - 창 A 호출 없음
+        - 창 B 호출 없음
+        - 테스트/동적 호출 없음
+        """
         panel = ttk.LabelFrame(tab, text="Measurement History", padding=(8, 6))
         panel.pack(fill="both", expand=True)
         toolbar = ttk.Frame(panel)
@@ -1458,16 +1506,16 @@ class DicomViewer:
         }
 
     def _ensure_default_study_session(self) -> StudySession:
-        if not hasattr(self, "study_sessions") or self.study_sessions is None:
-            self.study_sessions = {}
+        self._ensure_domain_store()
+        study_sessions = self._select_study_sessions_map()
         if not hasattr(self, "active_study_id"):
             self.active_study_id = ""
         if not hasattr(self, "active_group_id"):
             self.active_group_id = ""
-        if self.active_study_id and self.active_study_id in self.study_sessions:
-            return self.study_sessions[self.active_study_id]
-        if self.study_sessions:
-            first_study = next(iter(self.study_sessions.values()))
+        if self.active_study_id and self.active_study_id in study_sessions:
+            return study_sessions[self.active_study_id]
+        if study_sessions:
+            first_study = next(iter(study_sessions.values()))
             self.active_study_id = first_study.study_id
             return first_study
         study_id = str(uuid.uuid4())
@@ -1477,18 +1525,18 @@ class DicomViewer:
             created_at=datetime.utcnow().isoformat(),
             group_ids=[],
         )
-        self.study_sessions[study_id] = study
+        study_sessions[study_id] = study
         self.active_study_id = study_id
         return study
 
     def _get_or_create_active_analysis_group(self, context: dict[str, Any]) -> ImageAnalysisGroup:
-        if not hasattr(self, "analysis_groups") or self.analysis_groups is None:
-            self.analysis_groups = {}
+        self._ensure_domain_store()
+        analysis_groups = self._select_analysis_groups_map()
         study = self._ensure_default_study_session()
         current_path = str(context.get("image_path", "") or "")
         current_image_name = str(context.get("image_name", "N/A"))
         current_frame_index = int(context.get("frame_index", 0))
-        active_group = self.analysis_groups.get(self.active_group_id)
+        active_group = analysis_groups.get(self.active_group_id)
         if active_group is not None:
             same_image = active_group.source_image_path == current_path
             if not current_path:
@@ -1509,7 +1557,7 @@ class DicomViewer:
             propagated_from_group_id=str(roi_source.get("propagated_from_group_id", "")),
             propagated_from_measurement_ids=[str(item) for item in roi_source.get("propagated_from_measurement_ids", [])],
         )
-        self.analysis_groups[group_id] = group
+        analysis_groups[group_id] = group
         if group_id not in study.group_ids:
             study.group_ids.append(group_id)
         self.active_group_id = group_id
@@ -1522,7 +1570,7 @@ class DicomViewer:
         frame_index = int(getattr(self, "current_frame", 0))
         rois = [
             measurement
-            for measurement in getattr(self, "persistent_measurements", [])
+            for measurement in self._selector_measurements_for_current_frame(kind="roi")
             if measurement.kind == "roi"
             and measurement.frame_index == frame_index
             and self._geometry_matches(measurement.geometry_key, current_geometry)
@@ -1558,8 +1606,10 @@ class DicomViewer:
             self.result_history_store = ResultHistoryStore()
         context = self._current_history_context()
         requested_group_id = str(group_id or "").strip()
-        if requested_group_id and requested_group_id in getattr(self, "analysis_groups", {}):
-            group = self.analysis_groups[requested_group_id]
+        analysis_groups = self._select_analysis_groups_map()
+        study_sessions = self._select_study_sessions_map()
+        if requested_group_id and requested_group_id in analysis_groups:
+            group = analysis_groups[requested_group_id]
         else:
             group = self._get_or_create_active_analysis_group(context)
             if requested_group_id and requested_group_id != group.group_id:
@@ -1571,10 +1621,8 @@ class DicomViewer:
                     created_at=str(context.get("timestamp", datetime.utcnow().isoformat())),
                     frame_indices=[int(context.get("frame_index", 0))],
                 )
-                self.analysis_groups[group.group_id] = group
-                if not hasattr(self, "study_sessions") or self.study_sessions is None:
-                    self.study_sessions = {}
-                study = self.study_sessions.get(group.study_id)
+                analysis_groups[group.group_id] = group
+                study = study_sessions.get(group.study_id)
                 if study is not None and group.group_id not in study.group_ids:
                     study.group_ids.append(group.group_id)
                 self.active_group_id = group.group_id
@@ -1598,7 +1646,7 @@ class DicomViewer:
             extra_payload=dict(extra_payload) if isinstance(extra_payload, dict) else None,
             reason_codes=[str(code) for code in (reason_codes or [])],
         )
-        self.result_history_store.append(entry)
+        self._action_history_append_entry(entry)
         group.entry_ids.append(entry.entry_id)
         frame_index = int(context.get("frame_index", 0))
         if frame_index not in group.frame_indices:
@@ -1758,29 +1806,10 @@ class DicomViewer:
         )
 
     def build_flat_history_view(self, measurement_type: str = "All", search_text: str = "") -> list[dict[str, Any]]:
-        raw_rows = self.result_history_store.filtered_entries(measurement_type, "")
+        self._ensure_window_b_services()
+        raw_rows = self._select_filtered_history_entries(measurement_type, "")
         grouped_rows = self.group_history_entries(raw_rows)
-        query = search_text.strip().lower()
-        filtered_rows: list[dict[str, Any]] = []
-        for row in grouped_rows:
-            haystack = " ".join(
-                [
-                    str(row.get("image_name", "")),
-                    str(row.get("target_name", "")),
-                    str(row.get("measurement_type", "")),
-                    str(row.get("metric", "")),
-                    str(row.get("note", "")),
-                ]
-            ).lower()
-            if (not query) or (query in haystack):
-                enriched = dict(row)
-                enriched["row_type"] = "result"
-                primary_entry = enriched.get("primary_entry")
-                if isinstance(primary_entry, ResultHistoryEntry):
-                    enriched["study_id"] = str(primary_entry.study_id or "")
-                    enriched["group_id"] = str(primary_entry.group_id or "")
-                filtered_rows.append(enriched)
-        return filtered_rows
+        return self.history_controller.build_flat_history_view(grouped_rows, search_text=search_text)
 
     def render_flat_history_table(self, history_rows: list[dict[str, Any]]) -> None:
         table = getattr(self, "result_history_table", None)
@@ -1857,7 +1886,7 @@ class DicomViewer:
         if table is None:
             return []
         selected: list[tuple[int, ResultHistoryEntry]] = []
-        all_entries = self.result_history_store.entries()
+        all_entries = self._select_result_history_entries()
         seen_indices: set[int] = set()
         for item_id in table.selection():
             for store_index in self._history_item_to_store_indices.get(item_id, []):
@@ -1878,11 +1907,11 @@ class DicomViewer:
             messagebox.showinfo("Results History", "삭제할 행을 선택하세요.")
             return
         indices = [index for index, _entry in selected_rows]
-        self.result_history_store.remove_indices(indices)
+        self._action_history_remove_indices(indices)
         self._refresh_result_history_table()
 
     def clear_result_history(self) -> None:
-        self.result_history_store.clear()
+        self._action_history_clear()
         self._refresh_result_history_table()
 
     def _write_result_history_csv(self, path: str, entries: list[ResultHistoryEntry]) -> None:
@@ -1973,6 +2002,7 @@ class DicomViewer:
         messagebox.showinfo("저장 완료", f"Results History CSV 저장 완료:\n{path}")
 
     def export_selected_result_history_csv(self) -> None:
+        self._ensure_window_b_services()
         selected_rows = self._selected_history_entries()
         if not selected_rows:
             messagebox.showinfo("Results History", "내보낼 행을 선택하세요.")
@@ -1985,14 +2015,11 @@ class DicomViewer:
         if not path:
             return
         selected_indices = {index for index, _entry in selected_rows}
-        history_rows = [
-            row
-            for row in self.build_flat_history_view(
-                self.history_metric_filter_var.get().strip() if hasattr(self, "history_metric_filter_var") else "All",
-                self.history_search_var.get() if hasattr(self, "history_search_var") else "",
-            )
-            if selected_indices.intersection(set(row.get("store_indices", [])))
-        ]
+        history_rows = self.build_flat_history_view(
+            self.history_metric_filter_var.get().strip() if hasattr(self, "history_metric_filter_var") else "All",
+            self.history_search_var.get() if hasattr(self, "history_search_var") else "",
+        )
+        history_rows = self.report_export_controller.filter_selected_rows(history_rows, selected_indices)
         self._write_flat_result_history_csv(path, history_rows)
         messagebox.showinfo("저장 완료", f"선택 행 CSV 저장 완료:\n{path}")
 
@@ -2045,7 +2072,7 @@ class DicomViewer:
         selection = list(table.selection())
         if len(selection) != 1:
             return
-        all_entries = self.result_history_store.entries()
+        all_entries = self._select_result_history_entries()
         store_indices = self._history_item_to_store_indices.get(selection[0], [])
         if not store_indices:
             return
@@ -2062,7 +2089,7 @@ class DicomViewer:
         wanted_ids = list(selected_entry_ids or self._session_compare_state.get("selected_entry_ids", []))
         if not wanted_ids:
             return
-        all_entries = self.result_history_store.entries()
+        all_entries = self._select_result_history_entries()
         id_to_items: dict[str, set[str]] = {}
         for item_id, store_indices in self._history_item_to_store_indices.items():
             for store_index in store_indices:
@@ -2101,7 +2128,7 @@ class DicomViewer:
         cache_key = self._line_profile_cache_key(entry.source_image_path, entry.frame_index, entry.target_id)
         if cache_key in self.line_profile_series_cache:
             return self.line_profile_series_cache[cache_key]
-        latest_line_profile = self.analysis_last_run.get("line_profile", {})
+        latest_line_profile = self._select_analysis_last_run("line_profile")
         latest_inputs = latest_line_profile.get("inputs", {})
         latest_result = latest_line_profile.get("result", {})
         if latest_inputs.get("line_id") == entry.target_id and latest_result.get("distance_px"):
@@ -2664,11 +2691,12 @@ class DicomViewer:
         return "-" if value is None else f"{float(value):.2f}"
 
     def build_group_history_comparison(self, group_ids: list[str]) -> dict[str, Any]:
-        all_entries = self.result_history_store.entries()
+        all_entries = self._select_result_history_entries()
         groups: list[dict[str, Any]] = []
         line_overlay_entries: list[ResultHistoryEntry] = []
+        analysis_groups = self._select_analysis_groups_map()
         for index, group_id in enumerate(group_ids):
-            group = self.analysis_groups.get(group_id)
+            group = analysis_groups.get(group_id)
             if group is None:
                 continue
             group_entries = [entry for entry in all_entries if entry.group_id == group_id]
@@ -2819,7 +2847,7 @@ class DicomViewer:
                     measurement = self._find_measurement_by_id(measurement_id, expected_kind="roi")
                     break
         if measurement is None and entry.measurement_type == "Line Profile":
-            for candidate in self.persistent_measurements:
+            for candidate in self._selector_measurements_for_current_frame(kind="line"):
                 if candidate.kind != "line":
                     continue
                 line_index = self._line_index_for_measurement_id(candidate.id)
@@ -3058,14 +3086,8 @@ class DicomViewer:
         if normalized_role is None:
             return None
         current_geometry = self._get_current_geometry_key()
-        for measurement in reversed(self.persistent_measurements):
-            if measurement.kind != "roi":
-                continue
-            if not self._geometry_matches(measurement.geometry_key, current_geometry):
-                continue
-            if measurement.frame_index != self.current_frame:
-                continue
-            if self._get_measurement_roi_role(measurement) == normalized_role:
+        for measurement in reversed(self._selector_measurements_for_current_frame(kind="roi")):
+            if self._geometry_matches(measurement.geometry_key, current_geometry) and self._get_measurement_roi_role(measurement) == normalized_role:
                 return measurement
         return None
 
@@ -3195,9 +3217,8 @@ class DicomViewer:
         current_geometry = self._get_current_geometry_key()
         return [
             measurement
-            for measurement in self.persistent_measurements
-            if measurement.kind == "roi"
-            and self._geometry_matches(measurement.geometry_key, current_geometry)
+            for measurement in self._selector_measurements_for_current_frame(kind="roi")
+            if self._geometry_matches(measurement.geometry_key, current_geometry)
             and measurement.frame_index == self.current_frame
         ]
 
@@ -3217,12 +3238,8 @@ class DicomViewer:
         options: list[tuple[str, str]] = []
         current_geometry = self._get_current_geometry_key()
         line_index = 0
-        for measurement in self.persistent_measurements:
-            if measurement.kind != "line":
-                continue
+        for measurement in self._selector_measurements_for_current_frame(kind="line"):
             if not self._geometry_matches(measurement.geometry_key, current_geometry):
-                continue
-            if measurement.frame_index != self.current_frame:
                 continue
             line_index += 1
             metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
@@ -3460,7 +3477,7 @@ class DicomViewer:
         self._mtf_graph_status_var.set(f"MTF Curve: {freqs.size} points")
 
     def _show_mtf_details(self) -> None:
-        mtf_payload = (self.analysis_last_run.get("mtf") or {}).get("result")
+        mtf_payload = (self._select_analysis_last_run("mtf") or {}).get("result")
         if not mtf_payload:
             messagebox.showinfo("MTF Analysis", "MTF 실행 결과가 없습니다.")
             return
@@ -3510,7 +3527,7 @@ class DicomViewer:
     def _build_roi_stats_result_rows(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         current_geometry = self._get_current_geometry_key()
-        for measurement in self.persistent_measurements:
+        for measurement in self._selector_measurements_for_current_frame(kind="roi"):
             if measurement.kind != "roi":
                 continue
             if measurement.frame_index != self.current_frame:
@@ -3548,7 +3565,7 @@ class DicomViewer:
 
     def _build_analysis_last_run_rows(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
-        snr = self.analysis_last_run.get("snr")
+        snr = self._select_analysis_last_run("snr")
         if snr is not None:
             factors = snr.get("factors") or {}
             status = str(snr.get("status", "success"))
@@ -3599,7 +3616,7 @@ class DicomViewer:
                 }
             )
 
-        cnr = self.analysis_last_run.get("cnr")
+        cnr = self._select_analysis_last_run("cnr")
         if cnr is not None:
             inputs = cnr.get("inputs") or {}
             factors = cnr.get("factors") or {}
@@ -3654,7 +3671,7 @@ class DicomViewer:
                 }
             )
 
-        uniformity = self.analysis_last_run.get("uniformity")
+        uniformity = self._select_analysis_last_run("uniformity")
         if uniformity is not None:
             inputs = uniformity.get("inputs") or {}
             result = uniformity.get("result") or {}
@@ -3692,7 +3709,7 @@ class DicomViewer:
                 }
             )
 
-        line = self.analysis_last_run.get("line_profile")
+        line = self._select_analysis_last_run("line_profile")
         if line is not None:
             result = line.get("result") or {}
             line_stats = {
@@ -3733,7 +3750,7 @@ class DicomViewer:
                     "developer_meta": line,
                 }
             )
-        mtf = self.analysis_last_run.get("mtf")
+        mtf = self._select_analysis_last_run("mtf")
         if mtf is not None:
             result = dict(mtf.get("result") or {})
             key_metrics = dict(result.get("key_mtf_metrics") or {})
@@ -4024,7 +4041,7 @@ class DicomViewer:
             )
 
     def complete_mtf_analysis(self, mtf_result: dict[str, Any], context: dict[str, Any]) -> None:
-        self.analysis_last_run["mtf"] = {"result": dict(mtf_result or {}), "context": dict(context or {})}
+        self._action_set_analysis_last_run("mtf", {"result": dict(mtf_result or {}), "context": dict(context or {})})
         self.append_mtf_result_to_history(mtf_result, context)
         self._update_mtf_analysis_ui(dict(mtf_result or {}))
         self._refresh_analysis_results_panel()
@@ -4181,7 +4198,7 @@ class DicomViewer:
                 "rows": user_rows,
             },
             "developer_meta": {
-                "analysis_last_run": copy.deepcopy(self.analysis_last_run),
+                "analysis_last_run": self.domain_store.select_all_analysis_last_run(),
                 "internal_rows": rows,
             },
         }
@@ -7333,6 +7350,8 @@ class DicomViewer:
         self.frames = frames
         self.current_file_index = index
         self.current_frame = 0
+        self._action_update_image_context(path, Path(path).name)
+        self._action_commit_frame_change(self.current_frame)
         self._update_grid_cell_size_label()
         self.clear_preview_overlay()
         self._initialize_window_level(dataset, frames)
@@ -7592,7 +7611,7 @@ class DicomViewer:
         self.apply_crop(x0, y0, x1, y1)
 
     def _confirm_measurement_reset_for_transform(self, action_name: str) -> bool:
-        if not self.persistent_measurements:
+        if not self._selector_measurements_for_image():
             return True
         keep_going = messagebox.askyesno(
             "측정 초기화 확인",
@@ -8154,7 +8173,7 @@ class DicomViewer:
         current_geometry = self._get_current_geometry_key()
         return [
             item
-            for item in self.persistent_measurements
+            for item in self._selector_measurements_for_current_frame(kind="roi")
             if item.kind == "roi"
             and item.meta.get("grid_cell") is not None
             and item.frame_index == self.current_frame
@@ -8561,8 +8580,13 @@ class DicomViewer:
         self._active_crop_item_id = None
 
     def clear_persistent_measurements(self) -> None:
-        self.persistent_measurements = []
+        self._ensure_domain_store()
+        measurement_ids = self.domain_store.select_measurement_ids_for_image(self._store_image_id)
+        for measurement_id in measurement_ids:
+            if measurement_id in self.domain_store.state.measurements:
+                self.domain_store.delete_measurement(measurement_id)
         self.selected_persistent_measurement_id = None
+        self.domain_store.set_selection(self._store_image_id, [])
         self._persistent_canvas_item_to_measurement_id = {}
         self._cancel_guided_snr_workflow()
         self.canvas.delete("persistent_measurement")
@@ -8573,34 +8597,51 @@ class DicomViewer:
             self._draw_single_view_overlays()
 
     def undo_last_measurement(self) -> None:
-        if not self.persistent_measurements:
+        self._ensure_domain_store()
+        visible_measurements = self.domain_store.select_measurements_for_image(self._store_image_id)
+        if not visible_measurements:
             return
-        removed = self.persistent_measurements.pop()
+        removed_row = visible_measurements[-1]
+        removed = Measurement(
+            id=removed_row.measurement_id,
+            kind=removed_row.kind,
+            start=(float(removed_row.start[0]), float(removed_row.start[1])),
+            end=(float(removed_row.end[0]), float(removed_row.end[1])),
+            frame_index=int(removed_row.frame_index),
+            geometry_key=removed_row.geometry_key,
+            summary_text=removed_row.summary_text,
+            meta=dict(removed_row.meta or {}),
+        )
+        if removed.id in self.domain_store.state.measurements:
+            self.domain_store.delete_measurement(removed.id)
         state = self.guided_snr_state
         if state is not None and removed.id in {state.get("signal_id"), state.get("noise_id")}:
             self._cancel_guided_snr_workflow()
         if self.selected_persistent_measurement_id == removed.id:
             self.selected_persistent_measurement_id = None
+            self.domain_store.set_selection(self._store_image_id, [])
         self._draw_preview_measurements()
         self._draw_persistent_measurements()
         if self.view_mode == "single":
             self._draw_single_view_overlays()
 
     def clear_selected_measurement(self) -> None:
-        selected_id = self.selected_persistent_measurement_id
+        self._ensure_domain_store()
+        selected_id = self.domain_store.state.selected_measurement_ids[0] if self.domain_store.state.selected_measurement_ids else None
         if selected_id is None:
             messagebox.showinfo("안내", "삭제할 측정을 먼저 선택하세요.")
             return
-        remaining = [item for item in self.persistent_measurements if item.id != selected_id]
-        if len(remaining) == len(self.persistent_measurements):
+        if selected_id not in self.domain_store.state.measurements:
             self.selected_persistent_measurement_id = None
             self._draw_persistent_measurements()
             return
         state = self.guided_snr_state
         if state is not None and selected_id in {state.get("signal_id"), state.get("noise_id")}:
             self._cancel_guided_snr_workflow()
-        self.persistent_measurements = remaining
+        if selected_id in self.domain_store.state.measurements:
+            self.domain_store.delete_measurement(selected_id)
         self.selected_persistent_measurement_id = None
+        self.domain_store.set_selection(self._store_image_id, [])
         self._draw_preview_measurements()
         self._draw_persistent_measurements()
         if self.view_mode == "single":
@@ -8624,11 +8665,249 @@ class DicomViewer:
     def _apply_measurement_selection(self, measurement_id: str, toggle: bool = False) -> None:
         if toggle and self.selected_persistent_measurement_id == measurement_id:
             self.selected_persistent_measurement_id = None
+            self.domain_store.set_selection(self._store_image_id, [])
             return
         self.selected_persistent_measurement_id = measurement_id
+        self.domain_store.set_selection(self._store_image_id, [measurement_id])
 
     def register_measurement_hit_target(self, item_id: int, measurement_id: str) -> None:
         self._persistent_canvas_item_to_measurement_id[item_id] = measurement_id
+
+    def _selector_measurements_for_current_frame(self, kind: str | None = None) -> list[Measurement]:
+        return self._selector_measurements_for_image(frame_index=int(self.current_frame), kind=kind)
+
+    def _selector_measurements_for_image(
+        self,
+        frame_index: int | None = None,
+        kind: str | None = None,
+    ) -> list[Measurement]:
+        self._ensure_domain_store()
+        store_measurements = self.domain_store.select_measurements_for_image(
+            self._store_image_id,
+            frame_index=frame_index,
+        )
+        filtered = [
+            Measurement(
+                id=item.measurement_id,
+                kind=item.kind,
+                start=(float(item.start[0]), float(item.start[1])),
+                end=(float(item.end[0]), float(item.end[1])),
+                frame_index=int(item.frame_index),
+                geometry_key=item.geometry_key,
+                summary_text=item.summary_text,
+                meta=dict(item.meta or {}),
+            )
+            for item in store_measurements
+        ]
+        if kind is not None:
+            filtered = [item for item in filtered if item.kind == kind]
+        return filtered
+
+    def _select_measurement_draw_projections(self) -> list[MeasurementDrawProjection]:
+        self._ensure_domain_store()
+        current_geometry = self._get_current_geometry_key()
+        selected_ids = set(self.domain_store.state.selected_measurement_ids)
+        rows: list[MeasurementDrawProjection] = []
+        for item in self.domain_store.select_measurements_for_image(
+            self._store_image_id,
+            frame_index=int(self.current_frame),
+        ):
+            if not self._geometry_matches(current_geometry, item.geometry_key):
+                continue
+            rows.append(
+                MeasurementDrawProjection(
+                    measurement_id=item.measurement_id,
+                    kind=item.kind,
+                    start=(float(item.start[0]), float(item.start[1])),
+                    end=(float(item.end[0]), float(item.end[1])),
+                    frame_index=int(item.frame_index),
+                    geometry_key=item.geometry_key,
+                    role=item.role,
+                    meta=dict(item.meta or {}),
+                    summary_text=item.summary_text,
+                    selected=item.measurement_id in selected_ids,
+                )
+            )
+        return rows
+
+    @staticmethod
+    def _runtime_measurement_from_projection(projection: MeasurementDrawProjection) -> Measurement:
+        return Measurement(
+            id=projection.measurement_id,
+            kind=projection.kind,
+            start=(float(projection.start[0]), float(projection.start[1])),
+            end=(float(projection.end[0]), float(projection.end[1])),
+            frame_index=int(projection.frame_index),
+            geometry_key=projection.geometry_key,
+            summary_text=projection.summary_text,
+            meta=dict(projection.meta or {}),
+        )
+
+    def _action_add_measurement_to_store(self, measurement: Measurement) -> None:
+        self._ensure_domain_store()
+        role = self._get_measurement_roi_role(measurement)
+        self.domain_store.add_measurement(
+            image_id=self._store_image_id,
+            kind=measurement.kind,
+            start=(float(measurement.start[0]), float(measurement.start[1])),
+            end=(float(measurement.end[0]), float(measurement.end[1])),
+            frame_index=int(measurement.frame_index),
+            geometry_key=measurement.geometry_key,
+            summary_text=measurement.summary_text,
+            role=role,
+            meta=dict(measurement.meta or {}),
+            measurement_id=measurement.id,
+        )
+
+    def _action_update_measurement_in_store(self, measurement: Measurement) -> None:
+        self._ensure_domain_store()
+        role = self._get_measurement_roi_role(measurement)
+        self.domain_store.update_measurement(
+            measurement.id,
+            summary_text=measurement.summary_text,
+            role=role,
+            meta=dict(measurement.meta or {}),
+        )
+
+    def _action_commit_frame_change(self, frame_index: int) -> None:
+        self._ensure_domain_store()
+        self.domain_store.set_frame(self._store_image_id, int(frame_index))
+
+    def _action_update_image_context(self, source_image_path: str, image_name: str) -> None:
+        self._ensure_domain_store()
+        image_ctx = self.domain_store.state.images.get(self._store_image_id)
+        if image_ctx is None:
+            self._store_image_id = self.domain_store.add_image_context(source_image_path, image_name)
+            return
+        image_ctx.source_image_path = source_image_path
+        image_ctx.image_name = image_name
+
+    def _ensure_domain_store(self) -> None:
+        if not hasattr(self, "domain_store") or self.domain_store is None:
+            self.domain_store = DomainStore()
+        if not hasattr(self, "_store_image_id") or not self._store_image_id:
+            self._store_image_id = self.domain_store.add_image_context(self._get_current_image_path(), "current")
+
+    def _ensure_window_b_services(self) -> None:
+        if not hasattr(self, "analysis_result_controller") or self.analysis_result_controller is None:
+            self.analysis_result_controller = AnalysisResultController()
+        if not hasattr(self, "history_controller") or self.history_controller is None:
+            self.history_controller = HistoryController()
+        if not hasattr(self, "session_controller") or self.session_controller is None:
+            self.session_controller = SessionController()
+        if not hasattr(self, "report_export_controller") or self.report_export_controller is None:
+            self.report_export_controller = ReportExportController()
+
+    def open_window_b(self) -> None:
+        if not hasattr(self, "window_b_manager") or self.window_b_manager is None:
+            self.window_b_manager = WindowBManager(self.root, self)
+            self.window_b_manager.bind_store_events()
+        self.window_b_manager.open()
+
+    def _open_window_b_and_refresh_all(self) -> None:
+        self.open_window_b()
+        if hasattr(self, "window_b_manager") and self.window_b_manager is not None:
+            self.window_b_manager.refresh_all()
+
+    def _open_window_b_and_refresh_history(self) -> None:
+        self.open_window_b()
+        if hasattr(self, "window_b_manager") and self.window_b_manager is not None:
+            self.window_b_manager.refresh_history()
+
+    def save_analysis_session_via_window_b(self) -> None:
+        self._open_window_b_and_refresh_all()
+        self.save_analysis_session()
+
+    def load_analysis_session_via_window_b(self) -> None:
+        self._open_window_b_and_refresh_all()
+        self.load_analysis_session()
+
+    def export_result_history_csv_via_window_b(self) -> None:
+        self._open_window_b_and_refresh_history()
+        self.export_result_history_csv()
+
+    def export_selected_result_history_csv_via_window_b(self) -> None:
+        self._open_window_b_and_refresh_history()
+        self.export_selected_result_history_csv()
+
+    def _select_analysis_groups_map(self) -> dict[str, ImageAnalysisGroup]:
+        self._ensure_domain_store()
+        return self.domain_store.state.analysis_groups
+
+    def _select_study_sessions_map(self) -> dict[str, StudySession]:
+        self._ensure_domain_store()
+        return self.domain_store.state.sessions
+
+    def _action_replace_analysis_groups(self, groups: list[ImageAnalysisGroup]) -> None:
+        group_map = self._select_analysis_groups_map()
+        group_map.clear()
+        group_map.update({group.group_id: group for group in groups})
+
+    def _action_replace_study_sessions(self, sessions: list[StudySession]) -> None:
+        session_map = self._select_study_sessions_map()
+        session_map.clear()
+        session_map.update({study.study_id: study for study in sessions})
+
+    def _action_set_analysis_last_run(self, key: str, payload: dict[str, Any]) -> None:
+        self._ensure_domain_store()
+        self.domain_store.set_analysis_last_run(key, dict(payload))
+        # LEGACY_BRIDGE: 결과 패널 read 경로 완전 selector화 전까지만 캐시 유지.
+        self.analysis_last_run[key] = dict(payload)
+        if hasattr(self, "window_b_manager") and self.window_b_manager is not None:
+            self.window_b_manager.refresh_all()
+
+    def _action_clear_analysis_last_run(self) -> None:
+        self._ensure_domain_store()
+        self.domain_store.clear_analysis_last_run()
+        # LEGACY_BRIDGE: 결과 패널 read 경로 완전 selector화 전까지만 캐시 유지.
+        self.analysis_last_run = {}
+
+    def _action_history_append_entry(self, entry: ResultHistoryEntry) -> None:
+        self._ensure_domain_store()
+        self.domain_store.append_history_payload(self._serialize_history_entry(entry))
+        # LEGACY_BRIDGE: history panel read 경로 완전 selector화 전까지만 캐시 유지.
+        self.result_history_store.append(entry)
+        if hasattr(self, "window_b_manager") and self.window_b_manager is not None:
+            self.window_b_manager.refresh_history()
+
+    def _action_history_clear(self) -> None:
+        self._ensure_domain_store()
+        self.domain_store.clear_history_payloads()
+        # LEGACY_BRIDGE: history panel read 경로 완전 selector화 전까지만 캐시 유지.
+        self.result_history_store.clear()
+
+    def _action_history_remove_indices(self, indices: list[int]) -> None:
+        self._ensure_domain_store()
+        self.domain_store.remove_history_payload_indices(indices)
+        # LEGACY_BRIDGE: history panel read 경로 완전 selector화 전까지만 캐시 유지.
+        self.result_history_store.remove_indices(indices)
+
+    def _select_analysis_last_run(self, key: str) -> dict[str, Any]:
+        self._ensure_domain_store()
+        return self.domain_store.select_analysis_last_run(key)
+
+    def _select_result_history_entries(self) -> list[ResultHistoryEntry]:
+        self._ensure_domain_store()
+        payloads = self.domain_store.select_history_payloads()
+        return [self._deserialize_history_entry(item) for item in payloads]
+
+    def _select_filtered_history_entries(
+        self,
+        measurement_type: str = "All",
+        search_text: str = "",
+    ) -> list[tuple[int, ResultHistoryEntry]]:
+        query = search_text.strip().lower()
+        selected_type = measurement_type.strip()
+        rows: list[tuple[int, ResultHistoryEntry]] = []
+        for index, entry in enumerate(self._select_result_history_entries()):
+            if selected_type and selected_type != "All" and entry.measurement_type != selected_type:
+                continue
+            if query:
+                haystack = f"{entry.image_name} {entry.target_name} {entry.metric}".lower()
+                if query not in haystack:
+                    continue
+            rows.append((index, entry))
+        return rows
 
     def _get_current_geometry_key(self) -> str | None:
         return self._get_geometry_key_for_frame(self.current_frame)
@@ -8699,7 +8978,7 @@ class DicomViewer:
         metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
         measurement.summary_text = metrics["summary"]
         measurement.meta = self._canonicalize_measurement_meta(measurement, metrics)
-        self.persistent_measurements.append(measurement)
+        self._action_add_measurement_to_store(measurement)
         self._append_measurement_history_entries(measurement, metrics)
         return measurement
 
@@ -8724,12 +9003,10 @@ class DicomViewer:
     def _line_index_for_measurement_id(self, measurement_id: str) -> int | None:
         current_geometry = self._get_current_geometry_key()
         line_index = 0
-        for measurement in self.persistent_measurements:
+        for measurement in self._selector_measurements_for_current_frame(kind="line"):
             if measurement.kind != "line":
                 continue
             if not self._geometry_matches(measurement.geometry_key, current_geometry):
-                continue
-            if measurement.frame_index != self.current_frame:
                 continue
             line_index += 1
             if measurement.id == measurement_id:
@@ -8755,7 +9032,7 @@ class DicomViewer:
 
         source_rois = [
             measurement
-            for measurement in self.persistent_measurements
+            for measurement in self._selector_measurements_for_image(frame_index=source_frame_index, kind="roi")
             if measurement.kind == "roi"
             and measurement.frame_index == source_frame_index
             and self._geometry_matches(measurement.geometry_key, source_geometry_key)
@@ -8788,7 +9065,7 @@ class DicomViewer:
             metrics = self.compute_measurement(propagated, self._get_frame_pixel_array(propagated.frame_index))
             propagated.summary_text = metrics["summary"]
             propagated.meta = self._canonicalize_measurement_meta(propagated, metrics)
-            self.persistent_measurements.append(propagated)
+            self._action_add_measurement_to_store(propagated)
 
     @staticmethod
     def _roi_fits_target_frame(source: Measurement, target_width: int, target_height: int) -> bool:
@@ -8816,7 +9093,7 @@ class DicomViewer:
         target_geometry_key: str,
         target_frame_index: int,
     ) -> bool:
-        for measurement in self.persistent_measurements:
+        for measurement in self._selector_measurements_for_image(frame_index=target_frame_index, kind="roi"):
             if measurement.kind != "roi":
                 continue
             if measurement.frame_index != target_frame_index:
@@ -8830,12 +9107,11 @@ class DicomViewer:
     def _draw_persistent_measurements(self) -> None:
         self.canvas.delete("persistent_measurement")
         self._persistent_canvas_item_to_measurement_id = {}
-        current_geometry = self._get_current_geometry_key()
+        draw_projections = self._select_measurement_draw_projections()
         grid_roi_measurements: list[Measurement] = []
         occupied_label_boxes: list[tuple[float, float, float, float]] = []
-        for measurement in self.persistent_measurements:
-            if not self._geometry_matches(current_geometry, measurement.geometry_key):
-                continue
+        for projection in draw_projections:
+            measurement = self._runtime_measurement_from_projection(projection)
             start = self._image_coords_to_canvas(*measurement.start)
             end = self._image_coords_to_canvas(*measurement.end)
             if start is None or end is None:
@@ -8846,7 +9122,8 @@ class DicomViewer:
             metrics = self.compute_measurement(measurement, frame_array)
             measurement.summary_text = metrics["summary"]
             measurement.meta = self._canonicalize_measurement_meta(measurement, metrics)
-            selected = measurement.id == self.selected_persistent_measurement_id
+            self._action_update_measurement_in_store(measurement)
+            selected = projection.selected
             if measurement.kind == "roi":
                 outline = "#ffdc5e" if selected else "#ff7f50"
                 item_id = self.canvas.create_rectangle(
@@ -8979,7 +9256,7 @@ class DicomViewer:
         self._refresh_analysis_selectors()
 
     def export_measurements_csv(self) -> None:
-        if not self.persistent_measurements:
+        if not self._selector_measurements_for_image():
             messagebox.showinfo("안내", "내보낼 영구 측정값이 없습니다.")
             return
         path = filedialog.asksaveasfilename(
@@ -9013,7 +9290,7 @@ class DicomViewer:
                     "meta",
                 ]
             )
-            for item in self.persistent_measurements:
+            for item in self._selector_measurements_for_image():
                 metrics = self.compute_measurement(item, self._get_frame_pixel_array(item.frame_index))
                 item.summary_text = metrics["summary"]
                 item.meta = self._canonicalize_measurement_meta(item, metrics)
@@ -9092,7 +9369,7 @@ class DicomViewer:
         )
 
     def save_measurement_set(self) -> None:
-        if not self.persistent_measurements:
+        if not self._selector_measurements_for_image():
             messagebox.showinfo("안내", "저장할 영구 측정값이 없습니다.")
             return
         geometry_key = self._get_current_geometry_key()
@@ -9101,7 +9378,7 @@ class DicomViewer:
         name = simple_prompt(self.root, "세트 이름", "측정 세트 이름을 입력하세요:")
         if not name:
             return
-        selected = [m for m in self.persistent_measurements if self._geometry_matches(m.geometry_key, geometry_key)]
+        selected = [m for m in self._selector_measurements_for_image() if self._geometry_matches(m.geometry_key, geometry_key)]
         measurement_set = MeasurementSet(
             id=str(uuid.uuid4()),
             name=name,
@@ -9127,7 +9404,8 @@ class DicomViewer:
         copied = copy.deepcopy(selected.measurements)
         for item in copied:
             item.id = str(uuid.uuid4())
-        self.persistent_measurements.extend(copied)
+        for item in copied:
+            self._action_add_measurement_to_store(item)
         self._draw_persistent_measurements()
         messagebox.showinfo("적용 완료", f"{selected.name} 세트를 추가 적용했습니다.")
 
@@ -9239,35 +9517,41 @@ class DicomViewer:
         )
 
     def serialize_session(self) -> dict[str, Any]:
+        self._ensure_window_b_services()
         current_path = self._get_current_image_path()
-        roi_items = [item for item in self.persistent_measurements if item.kind == "roi"]
-        line_items = [item for item in self.persistent_measurements if item.kind == "line"]
-        return {
-            "version": SESSION_SCHEMA_VERSION,
-            "created_at": datetime.utcnow().isoformat(),
-            "app": "moduba",
-            "source_image_path": current_path,
-            "frame_index": int(self.current_frame),
-            "display": {
+        all_measurements = self._selector_measurements_for_image()
+        roi_items = [item for item in all_measurements if item.kind == "roi"]
+        line_items = [item for item in all_measurements if item.kind == "line"]
+        store_snapshot = self.domain_store.snapshot()
+        analysis_groups = self._select_analysis_groups_map()
+        study_sessions = self._select_study_sessions_map()
+        return self.session_controller.build_serialize_payload(
+            {
+                "schema_version": SESSION_SCHEMA_VERSION,
+                "source_image_path": current_path,
+                "frame_index": int(self.current_frame),
+                "display": {
                 "window_width": self.window_width_value,
                 "window_level": self.window_level_value,
                 "invert": bool(self.invert_display.get()),
                 "zoom_scale": float(self.zoom_scale),
                 "show_grid_overlay": bool(self.show_grid_overlay.get()),
             },
-            "roi_list": [self._serialize_measurement_for_session(item) for item in roi_items],
-            "line_list": [self._serialize_measurement_for_session(item) for item in line_items],
-            "analysis_options": {key: var.get() for key, var in self.analysis_inputs.items()},
-            "results_history": [self._serialize_history_entry(item) for item in self.result_history_store.entries()],
-            "analysis_groups": [self._serialize_analysis_group(item) for item in self.analysis_groups.values()],
-            "study_sessions": [self._serialize_study_session(item) for item in self.study_sessions.values()],
-            "active_study_id": self.active_study_id,
-            "active_group_id": self.active_group_id,
-            "compare_state": {
+                "roi_list": [self._serialize_measurement_for_session(item) for item in roi_items],
+                "line_list": [self._serialize_measurement_for_session(item) for item in line_items],
+                "analysis_options": {key: var.get() for key, var in self.analysis_inputs.items()},
+                "results_history": [self._serialize_history_entry(item) for item in self._select_result_history_entries()],
+                "analysis_groups": [self._serialize_analysis_group(item) for item in analysis_groups.values()],
+                "study_sessions": [self._serialize_study_session(item) for item in study_sessions.values()],
+                "active_study_id": self.active_study_id,
+                "active_group_id": self.active_group_id,
+                "compare_state": {
                 "selected_history_row_ids": list(self._session_compare_state.get("selected_entry_ids", [])),
                 "baseline_index": int(self._session_compare_state.get("baseline_index", 0)),
             },
-        }
+                "store_snapshot": store_snapshot,
+            }
+        )
 
     def deserialize_session(self, payload: dict[str, Any]) -> dict[str, Any]:
         version = str(payload.get("version", "0"))
@@ -9291,20 +9575,56 @@ class DicomViewer:
             "active_study_id": str(payload.get("active_study_id", "")),
             "active_group_id": str(payload.get("active_group_id", "")),
             "compare_state": dict(payload.get("compare_state") or {}),
+            "store_snapshot": dict(payload.get("store_snapshot") or {}),
         }
 
+    def _migrate_legacy_session_to_store_snapshot(self, session_data: dict[str, Any]) -> dict[str, Any]:
+        migrated = DomainStore()
+        image_path = str(session_data.get("source_image_path", ""))
+        image_name = Path(image_path).name if image_path else "current"
+        frame_index = int(session_data.get("frame_index", 0))
+        image_id = migrated.add_image_context(image_path, image_name, frame_index=frame_index)
+        migrated.state.selected_image_id = image_id
+
+        for measurement in list(session_data.get("roi_list") or []) + list(session_data.get("line_list") or []):
+            migrated.add_measurement(
+                image_id=image_id,
+                kind=measurement.kind,
+                start=(float(measurement.start[0]), float(measurement.start[1])),
+                end=(float(measurement.end[0]), float(measurement.end[1])),
+                frame_index=int(measurement.frame_index),
+                geometry_key=measurement.geometry_key,
+                summary_text=measurement.summary_text,
+                role=self._get_measurement_roi_role(measurement),
+                meta=dict(measurement.meta or {}),
+                measurement_id=measurement.id,
+            )
+
+        history_payloads = [self._serialize_history_entry(item) for item in (session_data.get("results_history") or [])]
+        migrated.replace_history_payloads(history_payloads)
+        migrated.state.analysis_groups = {
+            group.group_id: group
+            for group in (session_data.get("analysis_groups") or [])
+        }
+        migrated.state.sessions = {
+            study.study_id: study
+            for study in (session_data.get("study_sessions") or [])
+        }
+        return migrated.snapshot()
+
     def _reset_analysis_session_state(self) -> None:
-        self.persistent_measurements.clear()
         self.selected_persistent_measurement_id = None
         self._persistent_canvas_item_to_measurement_id.clear()
-        self.result_history_store.clear()
-        self.analysis_groups.clear()
-        self.study_sessions.clear()
+        self.domain_store = DomainStore()
+        self._store_image_id = self.domain_store.add_image_context(self._get_current_image_path(), "current")
+        self._action_history_clear()
+        self._select_analysis_groups_map().clear()
+        self._select_study_sessions_map().clear()
         self.active_study_id = ""
         self.active_group_id = ""
         self._session_compare_state = {"selected_entry_ids": [], "baseline_index": 0}
         self.line_profile_series_cache.clear()
-        self.analysis_last_run = {}
+        self._action_clear_analysis_last_run()
         self._ensure_default_study_session()
         self._refresh_analysis_selectors()
         self._refresh_result_history_table()
@@ -9336,6 +9656,19 @@ class DicomViewer:
             if 0 <= requested_frame < len(self.frames):
                 self.current_frame = requested_frame
 
+        store_snapshot = dict(session_data.get("store_snapshot") or {})
+        if not (store_snapshot.get("state") is not None and store_snapshot.get("snapshot_timestamp")):
+            # LEGACY_BRIDGE: 구세션 payload를 최신 store snapshot 구조로 1회 변환한다.
+            store_snapshot = self._migrate_legacy_session_to_store_snapshot(session_data)
+        self.domain_store.load_session({**store_snapshot, "session_id": str(session_data.get("active_study_id", ""))})
+        self._store_image_id = self.domain_store.state.selected_image_id or self._store_image_id
+        self.result_history_store.clear()
+        for payload in self.domain_store.select_history_payloads():
+            self.result_history_store.append(self._deserialize_history_entry(payload))
+        image_ctx = self.domain_store.state.images.get(self._store_image_id)
+        if image_ctx is not None:
+            self.current_frame = int(image_ctx.frame_index)
+
         display = session_data.get("display") or {}
         self.window_width_value = display.get("window_width")
         self.window_level_value = display.get("window_level")
@@ -9348,14 +9681,8 @@ class DicomViewer:
         if self.frames:
             self._show_frame()
 
-        restored_measurements: list[Measurement] = []
-        for measurement in list(session_data.get("roi_list") or []) + list(session_data.get("line_list") or []):
-            frame_array = self._get_frame_pixel_array(measurement.frame_index)
-            metrics = self.compute_measurement(measurement, frame_array)
-            measurement.summary_text = metrics.get("summary", measurement.summary_text)
-            measurement.meta = self._canonicalize_measurement_meta(measurement, metrics)
-            restored_measurements.append(measurement)
-        self.persistent_measurements = restored_measurements
+        self.domain_store.set_frame(self._store_image_id, int(self.current_frame))
+        self.domain_store.set_selection(self._store_image_id, [])
         self._draw_persistent_measurements()
 
         for key, value in (session_data.get("analysis_options") or {}).items():
@@ -9365,29 +9692,29 @@ class DicomViewer:
         self._sync_analysis_selector_inputs()
         self._toggle_cnr_noise_widgets()
 
-        for entry in session_data.get("results_history", []):
-            self.result_history_store.append(entry)
-        loaded_groups = list(session_data.get("analysis_groups") or [])
-        self.analysis_groups = {group.group_id: group for group in loaded_groups}
-        loaded_studies = list(session_data.get("study_sessions") or [])
-        self.study_sessions = {study.study_id: study for study in loaded_studies}
+        analysis_groups = self._select_analysis_groups_map()
+        study_sessions = self._select_study_sessions_map()
+        analysis_groups.clear()
+        analysis_groups.update({group.group_id: group for group in self.domain_store.select_analysis_groups()})
+        study_sessions.clear()
+        study_sessions.update({study.study_id: study for study in self.domain_store.select_study_sessions()})
         self.active_study_id = str(session_data.get("active_study_id", ""))
         self.active_group_id = str(session_data.get("active_group_id", ""))
         self._ensure_default_study_session()
-        for entry in self.result_history_store.entries():
+        for entry in self._select_result_history_entries():
             if not entry.group_id:
                 continue
-            group = self.analysis_groups.get(entry.group_id)
+            group = analysis_groups.get(entry.group_id)
             if group is None:
                 continue
             if entry.entry_id not in group.entry_ids:
                 group.entry_ids.append(entry.entry_id)
             if entry.frame_index not in group.frame_indices:
                 group.frame_indices.append(int(entry.frame_index))
-        if not self.analysis_groups:
+        if not analysis_groups:
             default_study = self._ensure_default_study_session()
             image_to_group: dict[str, ImageAnalysisGroup] = {}
-            for entry in self.result_history_store.entries():
+            for entry in self._select_result_history_entries():
                 image_key = entry.source_image_path or entry.image_name
                 if image_key not in image_to_group:
                     group_id = str(uuid.uuid4())
@@ -9401,7 +9728,7 @@ class DicomViewer:
                         frame_indices=[],
                         roi_source_type="manual",
                     )
-                    self.analysis_groups[group_id] = group
+                    analysis_groups[group_id] = group
                     default_study.group_ids.append(group_id)
                     image_to_group[image_key] = group
                 group = image_to_group[image_key]
@@ -9460,7 +9787,7 @@ class DicomViewer:
     def _collect_roi_role_template(self) -> dict[str, str]:
         role_map: dict[str, str] = {}
         display_map = self._build_roi_display_name_map()
-        for measurement in self.persistent_measurements:
+        for measurement in self._selector_measurements_for_current_frame(kind="roi"):
             if measurement.kind != "roi":
                 continue
             role = self._get_measurement_roi_role(measurement)
@@ -9682,7 +10009,7 @@ class DicomViewer:
         self.analysis_results["line_info"].set(
             f"{line_label} | mean {summary['mean_intensity']:.2f} | peak {summary['peak_value']:.2f} | FWHM {fwhm_text}"
         )
-        self.analysis_last_run["line_profile"] = {
+        self._action_set_analysis_last_run("line_profile", {
             "inputs": {
                 "line_id": measurement.id,
             },
@@ -9709,7 +10036,7 @@ class DicomViewer:
                 else np.asarray(profile["distance_mm"], dtype=np.float64).tolist(),
                 "intensity": np.asarray(profile["intensity"], dtype=np.float64).tolist(),
             },
-        }
+        })
         cache_key = self._line_profile_cache_key(self._get_current_image_path(), self.current_frame, measurement.id)
         self.line_profile_series_cache[cache_key] = {
             "distance_px": np.asarray(profile.get("distance_px", []), dtype=np.float64).tolist(),
@@ -9905,7 +10232,7 @@ class DicomViewer:
                 return [], "role_group(empty role filter)"
             candidates = [
                 measurement
-                for measurement in self.persistent_measurements
+                for measurement in self._selector_measurements_for_image()
                 if measurement.kind == "roi"
                 and measurement.frame_index == self.current_frame
                 and self._geometry_matches(measurement.geometry_key, current_geometry)
@@ -9931,7 +10258,7 @@ class DicomViewer:
         selected_lookup = set(selected_ids)
         candidates = [
             measurement
-            for measurement in self.persistent_measurements
+            for measurement in self._selector_measurements_for_image()
             if measurement.kind == "roi"
             and measurement.id in selected_lookup
             and measurement.frame_index == self.current_frame
@@ -9956,124 +10283,33 @@ class DicomViewer:
         }
 
     def calculate_uniformity_from_inputs(self) -> None:
+        self._ensure_window_b_services()
         roi_set, source = self._collect_uniformity_roi_set()
-        roi_ids = [measurement.id for measurement in roi_set]
         formula_key = self.analysis_inputs["uniformity_formula"].get()
         formulas = self._uniformity_formula_definitions()
-        selected_formula = formulas.get(formula_key, formulas["max_min"])
-        uniformity_payload: dict[str, Any] = {
-            "metric": "uniformity",
-            "status": "missing",
-            "reason": "",
-            "preview_text": "",
-            "result_text": "",
-            "inputs": {
-                "source": source,
-                "roi_count": int(len(roi_set)),
-                "roi_ids": roi_ids,
-                "formula": formula_key,
-                "formula_label": selected_formula["label"],
-            },
-            "factors": [self._collect_analysis_factors(measurement) for measurement in roi_set],
-            "stats": {},
-            "result": {
-                "value": None,
-                "formula": formula_key,
-                "formula_label": selected_formula["label"],
-            },
-        }
-        if not roi_set:
-            preview_text = "ROI set not selected"
-            result_text = "Uniformity unavailable"
-            self.analysis_results["uniformity_preview"].set("ROI selection required")
-            self.analysis_results["uniformity_result"].set(result_text)
-            uniformity_payload["status"] = "missing"
-            uniformity_payload["reason"] = "no ROI set"
-            uniformity_payload["preview_text"] = f"Preview: {preview_text}"
-            uniformity_payload["result_text"] = result_text
-            self.analysis_last_run["uniformity"] = uniformity_payload
-            self._refresh_analysis_results_panel()
-            messagebox.showinfo("Uniformity", "Uniformity 계산에 사용할 ROI 집합이 비어 있습니다.")
-            return
-        samples: list[np.ndarray] = []
-        for measurement in roi_set:
-            frame = self._get_frame_pixel_array(measurement.frame_index)
-            roi_pixels, _bounds = self._extract_roi_pixels(frame, measurement.start, measurement.end, ensure_non_empty=False)
-            if roi_pixels.size > 0:
-                samples.append(roi_pixels.reshape(-1))
-        if not samples:
-            preview_text = "Selected ROIs are empty"
-            result_text = "Uniformity unavailable"
-            self.analysis_results["uniformity_preview"].set(preview_text)
-            self.analysis_results["uniformity_result"].set(result_text)
-            uniformity_payload["status"] = "missing"
-            uniformity_payload["reason"] = "ROI pixels unavailable"
-            uniformity_payload["preview_text"] = f"Preview: {preview_text}"
-            uniformity_payload["result_text"] = result_text
-            self.analysis_last_run["uniformity"] = uniformity_payload
-            self._refresh_analysis_results_panel()
-            messagebox.showinfo("Uniformity", "선택된 ROI에서 유효한 픽셀을 찾지 못했습니다.")
-            return
-        values = np.concatenate(samples)
-        aggregate_stats = {
-            "max": float(np.max(values)),
-            "min": float(np.min(values)),
-            "mean": float(np.mean(values)),
-            "std": float(np.std(values)),
-            "pixel_count": int(values.size),
-        }
-        uniformity_payload["stats"] = aggregate_stats
-        uniformity_payload["inputs"] = {
-            "source": source,
-            "roi_count": int(len(roi_set)),
-            "roi_ids": roi_ids,
-            "formula": formula_key,
-            "formula_label": selected_formula["label"],
-        }
-        uniformity_payload["factors"] = [self._collect_analysis_factors(measurement) for measurement in roi_set]
-        uniformity_value = selected_formula["calculator"](aggregate_stats)
-        preview_text = f"{len(roi_set)} ROIs selected"
-        if uniformity_value is None:
-            result_text = "Uniformity unavailable"
-            self.analysis_results["uniformity_preview"].set(preview_text)
-            self.analysis_results["uniformity_result"].set(result_text)
-            uniformity_payload["status"] = "invalid"
-            uniformity_payload["reason"] = "invalid denominator"
-            uniformity_payload["preview_text"] = f"Preview: {preview_text}"
-            uniformity_payload["result_text"] = result_text
-            uniformity_payload["result"] = {
-                "value": None,
-                "formula": formula_key,
-                "formula_label": selected_formula["label"],
-            }
-            self.analysis_last_run["uniformity"] = uniformity_payload
-            self._refresh_analysis_results_panel()
-            messagebox.showwarning("Uniformity", "선택한 공식에서 분모가 0 또는 음수입니다.")
-            return
-        result_text = f"Uniformity: {uniformity_value:.2f}"
-        self.analysis_results["uniformity_preview"].set(preview_text)
-        self.analysis_results["uniformity_result"].set(result_text)
-        uniformity_payload["status"] = "success"
-        uniformity_payload["reason"] = ""
-        uniformity_payload["preview_text"] = f"Preview: {preview_text}"
-        uniformity_payload["result_text"] = result_text
-        uniformity_payload["result"] = {
-            "value": float(uniformity_value),
-            "formula": formula_key,
-            "formula_label": selected_formula["label"],
-        }
-        self.analysis_last_run["uniformity"] = uniformity_payload
-        self._refresh_analysis_results_panel()
-        self._append_analysis_history_row(
-            {
-                "metric_name": "UNIFORMITY",
-                "item_name": "Uniformity",
-                "stats": aggregate_stats,
-                "result_value": float(uniformity_value),
-            },
-            unit="%",
-            related_target_ids=roi_ids,
+        uniformity_result = self.analysis_result_controller.evaluate_uniformity(
+            roi_set=roi_set,
+            source=source,
+            formula_key=formula_key,
+            formulas=formulas,
+            collect_factors=self._collect_analysis_factors,
+            get_frame_array=self._get_frame_pixel_array,
+            extract_roi_pixels=self._extract_roi_pixels,
         )
+        self.analysis_results["uniformity_preview"].set(uniformity_result.preview_text)
+        self.analysis_results["uniformity_result"].set(uniformity_result.result_text)
+        self._action_set_analysis_last_run("uniformity", uniformity_result.payload)
+        self._refresh_analysis_results_panel()
+        if uniformity_result.history_row is not None:
+            self._append_analysis_history_row(
+                uniformity_result.history_row,
+                unit="%",
+                related_target_ids=list(uniformity_result.payload.get("inputs", {}).get("roi_ids", [])),
+            )
+        if uniformity_result.message_level == "info":
+            messagebox.showinfo("Uniformity", uniformity_result.message_text)
+        elif uniformity_result.message_level == "warning":
+            messagebox.showwarning("Uniformity", uniformity_result.message_text)
 
     def calculate_snr_from_inputs(self) -> None:
         self._auto_bind_analysis_inputs_from_roles(overwrite_existing=False)
@@ -10118,7 +10354,7 @@ class DicomViewer:
             snr_payload["preview"] = preview_text
             snr_payload["preview_text"] = f"Preview: {preview_text}"
             snr_payload["result_text"] = result_text
-            self.analysis_last_run["snr"] = snr_payload
+            self._action_set_analysis_last_run("snr", snr_payload)
             self._refresh_analysis_results_panel()
             messagebox.showinfo("SNR", "SNR 계산에 필요한 ROI가 부족합니다.\nrole 지정 또는 수동 선택을 확인하세요.")
             return
@@ -10149,7 +10385,7 @@ class DicomViewer:
             snr_payload["reason"] = "noise std <= 0"
             snr_payload["result"] = None
             snr_payload["result_text"] = result_text
-            self.analysis_last_run["snr"] = snr_payload
+            self._action_set_analysis_last_run("snr", snr_payload)
             self._refresh_analysis_results_panel()
             messagebox.showwarning("SNR", "Noise ROI 표준편차가 0입니다.")
             return
@@ -10160,7 +10396,7 @@ class DicomViewer:
         snr_payload["reason"] = ""
         snr_payload["result"] = float(snr)
         snr_payload["result_text"] = result_text
-        self.analysis_last_run["snr"] = snr_payload
+        self._action_set_analysis_last_run("snr", snr_payload)
         self._refresh_analysis_results_panel()
         self._append_analysis_history_row(
             {
@@ -10229,7 +10465,7 @@ class DicomViewer:
             cnr_payload["reason"] = reason
             cnr_payload["preview_text"] = f"Preview: {preview_text}"
             cnr_payload["result_text"] = result_text
-            self.analysis_last_run["cnr"] = cnr_payload
+            self._action_set_analysis_last_run("cnr", cnr_payload)
             self._refresh_analysis_results_panel()
             messagebox.showinfo("CNR", "CNR 계산에 필요한 ROI가 부족합니다.\nrole 지정 또는 수동 선택을 확인하세요.")
             return
@@ -10279,7 +10515,7 @@ class DicomViewer:
             cnr_payload["reason"] = "denominator <= 0"
             cnr_payload["result"] = None
             cnr_payload["result_text"] = result_text
-            self.analysis_last_run["cnr"] = cnr_payload
+            self._action_set_analysis_last_run("cnr", cnr_payload)
             self._refresh_analysis_results_panel()
             messagebox.showwarning("CNR", invalid_msg)
             return
@@ -10290,7 +10526,7 @@ class DicomViewer:
         cnr_payload["reason"] = ""
         cnr_payload["result"] = float(cnr)
         cnr_payload["result_text"] = result_text
-        self.analysis_last_run["cnr"] = cnr_payload
+        self._action_set_analysis_last_run("cnr", cnr_payload)
         self._refresh_analysis_results_panel()
         history_stats = {"target_mean": target_mean, "reference_mean": reference_mean}
         if formula == "standard_noise":
@@ -10442,7 +10678,8 @@ class DicomViewer:
         metrics = self.compute_measurement(selected, self._get_frame_pixel_array(selected.frame_index))
         selected.summary_text = metrics["summary"]
         selected.meta = self._canonicalize_measurement_meta(selected, metrics)
-        self.analysis_last_run = {}
+        self._action_update_measurement_in_store(selected)
+        self._action_clear_analysis_last_run()
         self._reset_signal_analysis_results()
         self._refresh_analysis_selectors()
         self._auto_bind_analysis_inputs_from_roles(overwrite_existing=True)
@@ -10472,7 +10709,7 @@ class DicomViewer:
     def _find_measurement_by_id(self, measurement_id: str | None, expected_kind: str | None = None) -> Measurement | None:
         if measurement_id is None:
             return None
-        for measurement in self.persistent_measurements:
+        for measurement in self._selector_measurements_for_current_frame(kind="roi"):
             if measurement.id == measurement_id:
                 if expected_kind is not None and measurement.kind != expected_kind:
                     return None
@@ -10569,7 +10806,7 @@ class DicomViewer:
         frame = np.asarray(self.frames[frame_index])
         source_h, source_w = frame.shape[:2]
         current_geometry = self._get_geometry_key_for_frame(frame_index)
-        for measurement in self.persistent_measurements:
+        for measurement in self._selector_measurements_for_current_frame(kind="roi"):
             if not self._geometry_matches(current_geometry, measurement.geometry_key):
                 continue
             if measurement.frame_index != frame_index:
@@ -10924,6 +11161,7 @@ class DicomViewer:
         if not 0 <= new_index < len(self.frames):
             return
         self.current_frame = new_index
+        self._action_commit_frame_change(self.current_frame)
         self._propagate_rois_from_geometry(source_geometry_key, source_frame_index, navigation_step=delta)
         self.clear_preview_overlay()
         self._show_frame()

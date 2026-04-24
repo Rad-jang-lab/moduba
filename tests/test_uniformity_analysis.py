@@ -28,6 +28,7 @@ if "matplotlib" not in sys.modules:
     sys.modules["matplotlib.pyplot"] = pyplot_stub
 
 from dicom_viewer import DicomViewer
+from domain_store import DomainStore
 
 
 class DummyVar:
@@ -46,8 +47,16 @@ def _build_viewer() -> DicomViewer:
     viewer.frames = [np.arange(100, dtype=np.float32).reshape(10, 10)]
     viewer.current_frame = 0
     viewer.dataset = SimpleNamespace()
-    viewer.persistent_measurements = []
+    viewer.domain_store = DomainStore()
+    viewer._store_image_id = viewer.domain_store.add_image_context("/tmp/a.dcm", "a")
     viewer._uniformity_roi_listbox = None
+    viewer._ensure_domain_store = lambda: None
+    viewer._get_current_geometry_key = lambda: "g1"
+    viewer._geometry_matches = lambda left, right: DicomViewer._geometry_matches(left, right)
+    viewer._get_measurement_roi_role = DicomViewer._get_measurement_roi_role.__get__(viewer, DicomViewer)
+    viewer._selector_measurements_for_current_frame = DicomViewer._selector_measurements_for_current_frame.__get__(viewer, DicomViewer)
+    viewer._selector_measurements_for_image = DicomViewer._selector_measurements_for_image.__get__(viewer, DicomViewer)
+    viewer._action_add_measurement_to_store = DicomViewer._action_add_measurement_to_store.__get__(viewer, DicomViewer)
 
     viewer.analysis_inputs = {
         "uniformity_formula": DummyVar("max_min"),
@@ -65,17 +74,21 @@ def _build_viewer() -> DicomViewer:
 
 
 def _add_roi(viewer: DicomViewer, roi_id: str, start, end, role=None):
-    measurement = viewer._append_persistent_measurement(
-        "roi",
-        start,
-        end,
-        extra_meta={"roi_type": "free", "role": role} if role else {"roi_type": "free"},
-        roi_bounds_exclusive=True,
+    from dicom_viewer import Measurement
+    measurement = Measurement(
+        id=roi_id,
+        kind="roi",
+        start=(float(start[0]), float(start[1])),
+        end=(float(end[0]), float(end[1])),
+        frame_index=0,
+        geometry_key="g1",
+        summary_text="",
+        meta={"roi_type": "free", "role": role} if role else {"roi_type": "free"},
     )
-    assert measurement is not None
-    measurement.id = roi_id
-    if role:
-        measurement.meta["role"] = role
+    metrics = viewer.compute_measurement(measurement, viewer.frames[0])
+    measurement.summary_text = metrics["summary"]
+    measurement.meta = viewer._canonicalize_measurement_meta(measurement, metrics)
+    viewer._action_add_measurement_to_store(measurement)
     return measurement
 
 
