@@ -395,6 +395,8 @@ class DicomViewer:
         self._mtf_summary_value_vars: dict[str, tk.StringVar] = {}
         self._mtf_graph_canvas: tk.Canvas | None = None
         self._mtf_graph_status_var = tk.StringVar(value="MTF Curve: no result")
+        self._mtf_esf_status_var = tk.StringVar(value="ESF: 결과 없음")
+        self._mtf_lsf_status_var = tk.StringVar(value="LSF: 결과 없음")
         self._uniformity_roi_listbox: tk.Listbox | None = None
         self._analysis_ui_bindings_initialized = False
         self.analysis_results_table: ttk.Frame | None = None
@@ -1158,7 +1160,12 @@ class DicomViewer:
         panel = ttk.LabelFrame(strip, text="MTF Analysis", padding=(8, 6))
         panel.pack(side="left", padx=(0, 8), fill="both", expand=True)
 
-        input_group = ttk.LabelFrame(panel, text="Input", padding=(6, 4))
+        left_frame = ttk.Frame(panel)
+        left_frame.grid(row=0, column=0, sticky="nsew")
+        right_frame = ttk.Frame(panel)
+        right_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+
+        input_group = ttk.LabelFrame(left_frame, text="Input", padding=(6, 4))
         input_group.grid(row=0, column=0, sticky="ew")
         ttk.Label(input_group, textvariable=self.signal_analysis_results["mtf_selected_roi_status"]).grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(input_group, text="Imaging Mode").grid(row=1, column=0, sticky="w", pady=(4, 0))
@@ -1193,7 +1200,7 @@ class DicomViewer:
         ttk.Button(input_group, text="Show MTF Details", command=self._show_mtf_details).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         ttk.Label(input_group, textvariable=self.signal_analysis_results["mtf_validation_summary"]).grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
-        summary_group = ttk.LabelFrame(panel, text="Result Summary", padding=(6, 4))
+        summary_group = ttk.LabelFrame(left_frame, text="Result Summary", padding=(6, 4))
         summary_group.grid(row=1, column=0, sticky="ew", pady=(6, 0))
         summary_items = [
             ("MTF50", "mtf50"),
@@ -1213,23 +1220,27 @@ class DicomViewer:
             self._mtf_summary_value_vars[key] = var
             ttk.Label(summary_group, textvariable=var).grid(row=row_index, column=1, sticky="w", padx=(8, 0))
 
-        warning_group = ttk.LabelFrame(panel, text="Warnings / Validation", padding=(6, 4))
+        warning_group = ttk.LabelFrame(left_frame, text="Warnings / Validation", padding=(6, 4))
         warning_group.grid(row=2, column=0, sticky="ew", pady=(6, 0))
         ttk.Label(warning_group, textvariable=self.signal_analysis_results["mtf_warning_summary"], justify="left").grid(row=0, column=0, sticky="w")
         ttk.Label(warning_group, textvariable=self.signal_analysis_results["mtf_reason_codes"], justify="left").grid(row=1, column=0, sticky="w", pady=(2, 0))
 
-        graph_group = ttk.LabelFrame(panel, text="Graph", padding=(6, 4))
-        graph_group.grid(row=3, column=0, sticky="nsew", pady=(6, 0))
+        graph_group = ttk.LabelFrame(right_frame, text="Graph", padding=(6, 4))
+        graph_group.grid(row=0, column=0, sticky="nsew")
         canvas = tk.Canvas(graph_group, width=360, height=180, bg="#FFFFFF", highlightthickness=1, highlightbackground=self.ui_colors["border"])
         canvas.grid(row=0, column=0, sticky="nsew")
         self._mtf_graph_canvas = canvas
         ttk.Label(graph_group, textvariable=self._mtf_graph_status_var).grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(graph_group, text="ESF: future-ready").grid(row=2, column=0, sticky="w")
-        ttk.Label(graph_group, text="LSF: future-ready").grid(row=3, column=0, sticky="w")
+        ttk.Label(graph_group, textvariable=self._mtf_esf_status_var).grid(row=2, column=0, sticky="w")
+        ttk.Label(graph_group, textvariable=self._mtf_lsf_status_var).grid(row=3, column=0, sticky="w")
         graph_group.grid_columnconfigure(0, weight=1)
         graph_group.grid_rowconfigure(0, weight=1)
+        left_frame.grid_columnconfigure(0, weight=1)
         panel.grid_columnconfigure(0, weight=1)
-        panel.grid_rowconfigure(3, weight=1)
+        panel.grid_columnconfigure(1, weight=2)
+        panel.grid_rowconfigure(0, weight=1)
+        right_frame.grid_columnconfigure(0, weight=1)
+        right_frame.grid_rowconfigure(0, weight=1)
 
     def _bind_analysis_selector_events(self) -> None:
         for key in ("snr_signal", "snr_noise", "cnr_target", "cnr_reference", "cnr_noise"):
@@ -3377,6 +3388,8 @@ class DicomViewer:
             "edge_angle_deg": phase1.get("edge_angle_deg"),
             "edge_snr": edge_snr,
             "mtf_curve": phase1.get("mtf_curve") or {},
+            "esf_curve": phase1.get("esf_curve") or {},
+            "lsf_curve": phase1.get("lsf_curve") or {},
             "key_mtf_metrics": key_metrics,
             "warnings": phase2.get("warnings") or [],
             "reason_codes": phase2.get("reason_codes") or [],
@@ -3432,9 +3445,60 @@ class DicomViewer:
             self.analysis_results["mtf_validation_summary"].set(str(mtf_result.get("validation_summary", "Validation: -")))
         warnings = mtf_result.get("warnings") or []
         reason_codes = mtf_result.get("reason_codes") or []
-        self.analysis_results["mtf_warning_summary"].set(f"Warnings: {', '.join(str(item) for item in warnings) if warnings else '-'}")
+        warning_summary = self._summarize_mtf_warnings_korean(reason_codes, warnings)
+        self.analysis_results["mtf_warning_summary"].set(f"경고 요약: {warning_summary}")
         self.analysis_results["mtf_reason_codes"].set(f"Reason Codes: {', '.join(str(item) for item in reason_codes) if reason_codes else '-'}")
         self._render_mtf_curve(mtf_result.get("mtf_curve") or {})
+        self._update_mtf_esf_lsf_summary(
+            mtf_result.get("esf_curve") or {},
+            mtf_result.get("lsf_curve") or {},
+        )
+
+    def _summarize_mtf_warnings_korean(self, reason_codes: list[Any], warnings: list[Any]) -> str:
+        reason_to_ko = {
+            "NONMONOTONIC_TAIL": "고주파 MTF 곡선이 단조 감소하지 않아 aliasing/sharpening/noise 영향 가능성이 있습니다.",
+            "POSSIBLE_ALIASING": "aliasing 가능성이 있습니다. edge 각도 또는 샘플링 조건을 확인하세요.",
+            "HIGH_FREQUENCY_NOISE_BIAS_RISK": "고주파 MTF가 noise floor의 영향을 받을 수 있습니다.",
+            "EDGE_SNR_LOW": "Edge SNR이 낮아 MTF 결과 신뢰도가 떨어질 수 있습니다.",
+            "EDGE_SNR_BORDERLINE": "Edge SNR이 경계 수준입니다. 고주파 해석에 주의하세요.",
+            "RESULT_QUESTIONABLE": "결과 해석에 주의가 필요합니다.",
+            "MTF_PEAK_GT_ONE": "MTF peak가 1.0을 초과했습니다. sharpening 영향 가능성이 있습니다.",
+            "POSSIBLE_SHARPENING": "샤프닝(에지 강화) 영향 가능성이 있습니다.",
+            "EDGE_CLIPPING_DETECTED": "에지 클리핑이 감지되어 MTF 해석이 왜곡될 수 있습니다.",
+            "PHASE1_REJECT": "MTF 1차 계산이 거부되어 결과가 유효하지 않습니다.",
+            "IEC_EDGE_GEOMETRY_NONCOMPLIANT": "IEC 기준에서 에지 기하 조건이 충족되지 않습니다.",
+            "IEC_ROI_NONCOMPLIANT": "ROI 크기가 IEC 기준보다 작습니다.",
+            "IEC_ROI_UNVERIFIABLE": "ROI mm 크기를 검증할 수 없습니다(Pixel Spacing 또는 입력값 부족).",
+            "IEC_AVERAGING_METHOD_NONCOMPLIANT": "IEC 보고 허용 averaging 방식이 아닙니다.",
+            "IEC_AVERAGING_METHOD_UNVERIFIABLE": "averaging 방식을 확인할 수 없습니다.",
+            "IEC_SCOPE_NOT_DECLARED": "IEC scope 선언이 없어 완전한 검증이 어렵습니다.",
+            "IEC_EXPLORATORY_MODE_NOT_REPORTABLE": "Exploratory 모드 결과는 IEC 보고용으로 제한됩니다.",
+            "EDGE_SNR_NOT_ASSESSED": "Edge SNR을 평가하지 못했습니다.",
+        }
+        if reason_codes:
+            translated = []
+            for code in reason_codes:
+                text = reason_to_ko.get(str(code))
+                if text:
+                    translated.append(text)
+            if translated:
+                return " / ".join(dict.fromkeys(translated))
+        fallback = [str(item) for item in warnings if str(item).strip()]
+        return ", ".join(fallback) if fallback else "-"
+
+    def _update_mtf_esf_lsf_summary(self, esf_curve: dict[str, Any], lsf_curve: dict[str, Any]) -> None:
+        self._mtf_esf_status_var.set(self._format_curve_summary("ESF", esf_curve))
+        self._mtf_lsf_status_var.set(self._format_curve_summary("LSF", lsf_curve))
+
+    @staticmethod
+    def _format_curve_summary(label: str, curve: dict[str, Any]) -> str:
+        y = np.asarray(curve.get("y", []), dtype=np.float64)
+        if y.size == 0:
+            return f"{label}: 결과 없음"
+        finite = y[np.isfinite(y)]
+        if finite.size == 0:
+            return f"{label}: 결과 없음"
+        return f"{label}: {finite.size} points, range {np.min(finite):.2f} ~ {np.max(finite):.2f}"
 
     def _render_mtf_curve(self, mtf_curve: dict[str, Any]) -> None:
         canvas = self._mtf_graph_canvas
