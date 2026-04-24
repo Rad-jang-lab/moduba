@@ -890,11 +890,6 @@ class DicomViewer:
             )
             button.grid(row=row, column=0, sticky="ew", pady=(0, 4))
             self._draw_tool_buttons[mode] = button
-        ttk.Separator(parent, orient="horizontal").grid(row=4, column=0, sticky="ew", pady=(2, 6))
-        ttk.Label(parent, text="ROI mode").grid(row=5, column=0, sticky="w")
-        ttk.Radiobutton(parent, text="Grid ROI", value="grid", variable=self.roi_draw_mode).grid(row=6, column=0, sticky="w")
-        ttk.Radiobutton(parent, text="Free ROI", value="free", variable=self.roi_draw_mode).grid(row=7, column=0, sticky="w")
-        ttk.Label(parent, text="Grid ON → polygon snap").grid(row=8, column=0, sticky="w", pady=(6, 0))
 
     def _set_measurement_mode(self, mode: str) -> None:
         self.measurement_mode.set(mode)
@@ -915,10 +910,6 @@ class DicomViewer:
 
     def _build_measure_toolbar(self, tab: ttk.Frame) -> None:
         strip = self._build_grouped_toolbar_strip(tab)
-
-        tools_group = ttk.LabelFrame(strip, text="Tools", padding=(8, 6))
-        tools_group.pack(side="left", padx=(0, 8), fill="y")
-        self._build_draw_tool_panel(tools_group)
 
         grid_group = ttk.LabelFrame(strip, text="Grid", padding=(8, 6))
         grid_group.pack(side="left", padx=(0, 8), fill="y")
@@ -959,30 +950,35 @@ class DicomViewer:
         self._sync_grid_spacing_from_mode()
         self._sync_grid_roi_size_from_mode()
 
-        measurement_group = ttk.LabelFrame(strip, text="Measurement", padding=(8, 6))
-        measurement_group.pack(side="left", padx=(0, 8), fill="y")
-        ttk.Label(measurement_group, text="ROI Geometry: X/Y, Width, Height, Area").grid(row=0, column=0, sticky="w")
-        ttk.Label(measurement_group, text="Display: mm first, px second").grid(row=1, column=0, sticky="w", pady=(2, 0))
-        ttk.Button(measurement_group, text="Grid ROI Summary", command=self._show_grid_roi_combined_summary).grid(
-            row=2, column=0, sticky="ew", pady=(6, 0)
-        )
+        roi_tool_group = ttk.LabelFrame(strip, text="ROI Tool", padding=(8, 6))
+        roi_tool_group.pack(side="left", padx=(0, 8), fill="y")
+        self._build_draw_tool_panel(roi_tool_group)
+
+        roi_mode_group = ttk.LabelFrame(strip, text="ROI Mode", padding=(8, 6))
+        roi_mode_group.pack(side="left", padx=(0, 8), fill="both", expand=True)
+        roi_mode_group.columnconfigure(0, weight=1)
+        ttk.Label(roi_mode_group, text="ROI mode").grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(roi_mode_group, text="Grid ROI", value="grid", variable=self.roi_draw_mode).grid(row=1, column=0, sticky="w")
+        ttk.Radiobutton(roi_mode_group, text="Free ROI", value="free", variable=self.roi_draw_mode).grid(row=2, column=0, sticky="w")
+        ttk.Label(roi_mode_group, text="Grid ON → polygon snap").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Separator(roi_mode_group, orient="horizontal").grid(row=4, column=0, sticky="ew", pady=(6, 6))
         ttk.Checkbutton(
-            measurement_group,
+            roi_mode_group,
             text="ROI Propagation",
             variable=self.roi_propagation_enabled,
-        ).grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ).grid(row=5, column=0, sticky="w")
         ttk.Radiobutton(
-            measurement_group,
+            roi_mode_group,
             text="Next frame/image",
             value="next",
             variable=self.roi_propagation_scope,
-        ).grid(row=4, column=0, sticky="w")
+        ).grid(row=6, column=0, sticky="w")
         ttk.Radiobutton(
-            measurement_group,
+            roi_mode_group,
             text="All navigated targets",
             value="all",
             variable=self.roi_propagation_scope,
-        ).grid(row=5, column=0, sticky="w")
+        ).grid(row=7, column=0, sticky="w")
 
         manage_group = ttk.LabelFrame(strip, text="Manage", padding=(8, 6))
         manage_group.pack(side="left", padx=(0, 8), fill="y")
