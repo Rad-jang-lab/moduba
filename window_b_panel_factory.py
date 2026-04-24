@@ -26,6 +26,10 @@ class WindowBViewerAdapter(Protocol):
     history_compare_button: Any
 
     def _relayout_analysis_result_rows(self) -> None: ...
+    def _build_grouped_toolbar_strip(self, parent: ttk.Frame) -> ttk.Frame: ...
+    def _build_signal_analysis_toolbar(self, strip: ttk.Frame) -> None: ...
+    def _build_image_analysis_toolbar(self, tab: ttk.Frame) -> None: ...
+    def _initialize_analysis_ui_bindings(self) -> None: ...
     def _refresh_result_history_table(self) -> None: ...
     def _on_history_row_selected(self, event: tk.Event) -> None: ...
     def delete_selected_history_rows(self) -> None: ...
@@ -47,9 +51,24 @@ def build_window_b_analysis_panel(
     store: Any,
     analysis_controller: Any,
 ) -> ttk.Frame:
-    panel = ttk.LabelFrame(parent, text="Analysis Results", padding=(8, 6))
-    panel.pack(side="left", padx=(0, 8), fill="both", expand=True)
-    header = ttk.Frame(panel)
+    panel = ttk.Frame(parent)
+    panel.pack(fill="both", expand=True)
+
+    analysis_notebook = ttk.Notebook(panel)
+    analysis_notebook.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
+    signal_tab = ttk.Frame(analysis_notebook, padding=(4, 4, 4, 4))
+    image_tab = ttk.Frame(analysis_notebook, padding=(4, 4, 4, 4))
+    analysis_notebook.add(signal_tab, text="Signal Analysis")
+    analysis_notebook.add(image_tab, text="Image Analysis")
+
+    signal_strip = viewer_adapter._build_grouped_toolbar_strip(signal_tab)
+    viewer_adapter._build_signal_analysis_toolbar(signal_strip)
+    viewer_adapter._build_image_analysis_toolbar(image_tab)
+    viewer_adapter._initialize_analysis_ui_bindings()
+
+    results_panel = ttk.LabelFrame(panel, text="Analysis Results", padding=(8, 6))
+    results_panel.grid(row=1, column=0, sticky="nsew")
+    header = ttk.Frame(results_panel)
     header.grid(row=0, column=0, sticky="ew", columnspan=2)
     header.columnconfigure(0, weight=0, minsize=220)
     header.columnconfigure(1, weight=0, minsize=180)
@@ -59,7 +78,7 @@ def build_window_b_analysis_panel(
     ttk.Label(header, text="Note", anchor="w").grid(row=0, column=2, sticky="ew")
 
     canvas = tk.Canvas(
-        panel,
+        results_panel,
         background="#FFFFFF",
         highlightthickness=1,
         # [viewer_adapter 의존]
@@ -70,7 +89,7 @@ def build_window_b_analysis_panel(
         bd=0,
     )
     canvas.grid(row=1, column=0, sticky="nsew", columnspan=2)
-    scrollbar = ttk.Scrollbar(panel, orient="vertical", command=canvas.yview)
+    scrollbar = ttk.Scrollbar(results_panel, orient="vertical", command=canvas.yview)
     scrollbar.grid(row=1, column=2, sticky="ns")
     canvas.configure(yscrollcommand=scrollbar.set)
 
@@ -95,16 +114,19 @@ def build_window_b_analysis_panel(
     # 목적: 기존 export callback 의미를 변경 없이 전달
     # 분류: report/export callback
     # 향후: report controller action entrypoint로 직접 연결 가능
-    ttk.Button(panel, text="Export Results CSV", command=viewer_adapter.export_analysis_results_csv).grid(row=2, column=0, sticky="ew", pady=(6, 0), padx=(0, 4))
-    ttk.Button(panel, text="Export Results JSON", command=viewer_adapter.export_analysis_results_json).grid(row=2, column=1, sticky="ew", pady=(6, 0), padx=(4, 0))
+    ttk.Button(results_panel, text="Export Results CSV", command=viewer_adapter.export_analysis_results_csv).grid(row=2, column=0, sticky="ew", pady=(6, 0), padx=(0, 4))
+    ttk.Button(results_panel, text="Export Results JSON", command=viewer_adapter.export_analysis_results_json).grid(row=2, column=1, sticky="ew", pady=(6, 0), padx=(4, 0))
+    results_panel.grid_columnconfigure(0, weight=1)
+    results_panel.grid_columnconfigure(1, weight=1)
+    results_panel.grid_rowconfigure(1, weight=1)
     panel.grid_columnconfigure(0, weight=1)
-    panel.grid_columnconfigure(1, weight=1)
+    panel.grid_rowconfigure(0, weight=1)
     panel.grid_rowconfigure(1, weight=1)
     # [viewer_adapter 의존]
     # 목적: 기존 viewer 기반 refresh 루프에서 참조하는 widget 핸들 등록
     # 분류: legacy compatibility
     # 향후: Window B 전용 view-state 객체로 대체 가능
-    viewer_adapter.analysis_results_table = panel
+    viewer_adapter.analysis_results_table = results_panel
     viewer_adapter.analysis_results_canvas = canvas
     viewer_adapter.analysis_results_rows_container = rows_container
     return panel

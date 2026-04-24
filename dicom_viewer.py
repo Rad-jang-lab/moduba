@@ -396,6 +396,7 @@ class DicomViewer:
         self._mtf_graph_canvas: tk.Canvas | None = None
         self._mtf_graph_status_var = tk.StringVar(value="MTF Curve: no result")
         self._uniformity_roi_listbox: tk.Listbox | None = None
+        self._analysis_ui_bindings_initialized = False
         self.analysis_results_table: ttk.Frame | None = None
         self.analysis_results_canvas: tk.Canvas | None = None
         self.analysis_results_rows_container: ttk.Frame | None = None
@@ -998,39 +999,26 @@ class DicomViewer:
         )
 
     def _build_analysis_toolbar(self, tab: ttk.Frame) -> None:
-        analysis_notebook = ttk.Notebook(tab)
-        analysis_notebook.pack(fill="both", expand=True)
-
-        signal_tab = ttk.Frame(analysis_notebook, padding=(4, 4, 4, 4))
-        image_tab = ttk.Frame(analysis_notebook, padding=(4, 4, 4, 4))
-        history_tab = ttk.Frame(analysis_notebook, padding=(4, 4, 4, 4))
-        analysis_notebook.add(signal_tab, text="Signal Analysis")
-        analysis_notebook.add(image_tab, text="Image Analysis")
-        analysis_notebook.add(history_tab, text="Results History")
-
-        signal_strip = self._build_grouped_toolbar_strip(signal_tab)
-        self._build_signal_analysis_toolbar(signal_strip)
-        self._build_image_analysis_toolbar(image_tab)
-        history_info = ttk.Frame(history_tab, padding=(12, 12))
+        history_info = ttk.Frame(tab, padding=(12, 12))
         history_info.pack(fill="both", expand=True)
         ttk.Label(
             history_info,
-            text="Results/History/Session/Report 주 작업 공간은 Window B 입니다.",
+            text="Analysis tools are available in Window B.",
         ).pack(anchor="w")
         ttk.Button(history_info, text="Open Window B", command=self.open_window_b).pack(anchor="w", pady=(8, 0))
-        ttk.Button(
+        ttk.Label(
             history_info,
-            text="Open History in Window B",
-            command=self._open_window_b_and_refresh_history,
+            text="Use Window B for Signal/Image Analysis, Results, History, Session, and Report.",
         ).pack(anchor="w", pady=(6, 0))
-        ttk.Button(
-            history_info,
-            text="Open Session/Report in Window B",
-            command=self._open_window_b_and_refresh_all,
-        ).pack(anchor="w", pady=(6, 0))
+        self._initialize_analysis_ui_bindings()
+
+    def _initialize_analysis_ui_bindings(self) -> None:
+        if self._analysis_ui_bindings_initialized:
+            return
         self.analysis_inputs["cnr_formula"].trace_add("write", self._update_cnr_formula_ui)
         self.analysis_inputs["uniformity_input_mode"].trace_add("write", self._update_uniformity_input_ui)
         self.image_analysis_inputs["scope_type"].trace_add("write", self._update_image_scope_ui)
+        self._analysis_ui_bindings_initialized = True
         self._update_cnr_formula_ui()
         self._update_uniformity_input_ui()
         self._update_image_scope_ui()
