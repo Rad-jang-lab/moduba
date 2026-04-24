@@ -1024,12 +1024,25 @@ class DicomViewer:
         self._update_image_scope_ui()
         self._refresh_analysis_selectors()
 
-    def _build_signal_analysis_toolbar(self, strip: ttk.Frame) -> None:
+    def _build_signal_analysis_toolbar(self, parent: ttk.Frame) -> None:
         for key in ("snr_signal", "snr_noise", "cnr_target", "cnr_reference", "cnr_noise"):
             self._analysis_selector_vars[key] = tk.StringVar(value="")
 
-        snr_group = ttk.LabelFrame(strip, text="SNR", padding=(8, 6))
-        snr_group.pack(side="left", padx=(0, 8), fill="y")
+        nested_notebook = ttk.Notebook(parent)
+        nested_notebook.pack(fill="both", expand=True)
+        snr_tab = ttk.Frame(nested_notebook, padding=(4, 4, 4, 4))
+        cnr_tab = ttk.Frame(nested_notebook, padding=(4, 4, 4, 4))
+        uniformity_tab = ttk.Frame(nested_notebook, padding=(4, 4, 4, 4))
+        line_profile_tab = ttk.Frame(nested_notebook, padding=(4, 4, 4, 4))
+        mtf_tab = ttk.Frame(nested_notebook, padding=(4, 4, 4, 4))
+        nested_notebook.add(snr_tab, text="SNR")
+        nested_notebook.add(cnr_tab, text="CNR")
+        nested_notebook.add(uniformity_tab, text="Uniformity")
+        nested_notebook.add(line_profile_tab, text="Line Profile")
+        nested_notebook.add(mtf_tab, text="MTF")
+
+        snr_group = ttk.LabelFrame(snr_tab, text="SNR", padding=(8, 6))
+        snr_group.pack(fill="both", expand=True)
         ttk.Label(snr_group, text="Input: Signal ROI").grid(row=0, column=0, sticky="w")
         self._analysis_comboboxes["snr_signal"] = ttk.Combobox(
             snr_group,
@@ -1053,8 +1066,8 @@ class DicomViewer:
         self._analysis_action_buttons["snr"].grid(row=7, column=0, sticky="ew", pady=(6, 0))
         ttk.Label(snr_group, textvariable=self.signal_analysis_results["snr_ready_reason"]).grid(row=8, column=0, sticky="w", pady=(2, 0))
 
-        cnr_group = ttk.LabelFrame(strip, text="CNR", padding=(8, 6))
-        cnr_group.pack(side="left", padx=(0, 8), fill="y")
+        cnr_group = ttk.LabelFrame(cnr_tab, text="CNR", padding=(8, 6))
+        cnr_group.pack(fill="both", expand=True)
         formula_cards = ttk.LabelFrame(cnr_group, text="Formula Selection", padding=(6, 4))
         formula_cards.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         ttk.Radiobutton(formula_cards, text="Option A | |S_A - S_B| / sigma_o", value="standard_noise", variable=self.analysis_inputs["cnr_formula"]).grid(row=0, column=0, sticky="w")
@@ -1090,8 +1103,8 @@ class DicomViewer:
         self._analysis_action_buttons["cnr"] = ttk.Button(cnr_group, text="Calculate CNR", command=self.calculate_cnr_from_inputs)
         self._analysis_action_buttons["cnr"].grid(row=9, column=0, sticky="ew", pady=(6, 0))
 
-        uniformity_group = ttk.LabelFrame(strip, text="Uniformity", padding=(8, 6))
-        uniformity_group.pack(side="left", padx=(0, 8), fill="y")
+        uniformity_group = ttk.LabelFrame(uniformity_tab, text="Uniformity", padding=(8, 6))
+        uniformity_group.pack(fill="both", expand=True)
         ttk.Label(uniformity_group, text="Formula").grid(row=0, column=0, sticky="w")
         uniformity_formula_combo = ttk.Combobox(
             uniformity_group,
@@ -1128,8 +1141,8 @@ class DicomViewer:
         ttk.Label(uniformity_group, textvariable=self.signal_analysis_results["uniformity_result"]).grid(row=9, column=0, sticky="w", pady=(2, 0))
         ttk.Button(uniformity_group, text="Calculate Uniformity", command=self.calculate_uniformity_from_inputs).grid(row=10, column=0, sticky="ew", pady=(6, 0))
 
-        line_group = ttk.LabelFrame(strip, text="Line Profile", padding=(8, 6))
-        line_group.pack(side="left", padx=(0, 8), fill="y")
+        line_group = ttk.LabelFrame(line_profile_tab, text="Line Profile", padding=(8, 6))
+        line_group.pack(fill="both", expand=True)
         ttk.Label(line_group, text="Input: Profile Line").grid(row=0, column=0, sticky="w")
         self._analysis_comboboxes["line_profile"] = ttk.Combobox(line_group, state="readonly", width=42)
         self._analysis_comboboxes["line_profile"].grid(row=1, column=0, sticky="ew", pady=(2, 4))
@@ -1140,8 +1153,9 @@ class DicomViewer:
         ttk.Button(line_group, text="Export Profile CSV", command=self.export_selected_line_profile_csv).grid(row=6, column=0, sticky="ew", pady=(4, 0))
         ttk.Label(line_group, textvariable=self.snr_workflow_var).grid(row=7, column=0, sticky="w", pady=(2, 0))
 
-        self._build_mtf_analysis_panel(strip)
-        self._build_analysis_results_panel(strip)
+        self._build_mtf_analysis_panel(mtf_tab)
+        if False:  # pragma: no cover - legacy call path retained for auditable deprecation tracking
+            self._build_analysis_results_panel(parent)
         self._bind_analysis_selector_events()
 
     def _build_mtf_analysis_panel(self, strip: ttk.Frame) -> None:

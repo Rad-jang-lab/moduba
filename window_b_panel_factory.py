@@ -61,8 +61,9 @@ def build_window_b_analysis_panel(
     analysis_notebook.add(signal_tab, text="Signal Analysis")
     analysis_notebook.add(image_tab, text="Image Analysis")
 
-    signal_strip = viewer_adapter._build_grouped_toolbar_strip(signal_tab)
-    viewer_adapter._build_signal_analysis_toolbar(signal_strip)
+    signal_container = ttk.Frame(signal_tab)
+    signal_container.pack(fill="both", expand=True)
+    viewer_adapter._build_signal_analysis_toolbar(signal_container)
     viewer_adapter._build_image_analysis_toolbar(image_tab)
     viewer_adapter._initialize_analysis_ui_bindings()
 
