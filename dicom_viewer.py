@@ -409,6 +409,7 @@ class DicomViewer:
         self._mtf_graph_status_var = tk.StringVar(value="MTF Curve: no result")
         self._mtf_esf_status_var = tk.StringVar(value="ESF: 결과 없음")
         self._mtf_lsf_status_var = tk.StringVar(value="LSF: 결과 없음")
+        self._mtf_warning_text_widget: tk.Text | None = None
         self._uniformity_roi_listbox: tk.Listbox | None = None
         self._analysis_ui_bindings_initialized = False
         self.analysis_results_table: ttk.Frame | None = None
@@ -1238,11 +1239,26 @@ class DicomViewer:
 
         warning_group = ttk.LabelFrame(left_frame, text="Warnings / Validation", padding=(6, 4))
         warning_group.grid(row=2, column=0, sticky="ew", pady=(6, 0))
-        ttk.Label(warning_group, textvariable=self.signal_analysis_results["mtf_warning_summary"], justify="left").grid(row=0, column=0, sticky="w")
-        ttk.Label(warning_group, textvariable=self.signal_analysis_results["mtf_reason_codes"], justify="left").grid(row=1, column=0, sticky="w", pady=(2, 0))
+        warning_group.configure(height=104)
+        warning_group.grid_propagate(False)
+        warning_group.grid_columnconfigure(0, weight=1)
+        warning_text = tk.Text(
+            warning_group,
+            height=5,
+            wrap="word",
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            background=self.ui_colors["panel_bg"],
+            foreground=self.ui_colors["text"],
+        )
+        warning_text.grid(row=0, column=0, sticky="nsew")
+        warning_text.configure(state="disabled")
+        self._mtf_warning_text_widget = warning_text
 
         graph_group = ttk.LabelFrame(right_frame, text="Curve Viewer", padding=(6, 4))
         graph_group.grid(row=0, column=0, sticky="nsew")
+        graph_group.configure(height=300)
         self._mtf_graph_group = graph_group
         curve_notebook = ttk.Notebook(graph_group)
         curve_notebook.grid(row=0, column=0, sticky="nsew")
@@ -1269,13 +1285,17 @@ class DicomViewer:
         ttk.Label(summary_group_right, textvariable=self._mtf_esf_status_var).grid(row=1, column=0, sticky="w")
         ttk.Label(summary_group_right, textvariable=self._mtf_lsf_status_var).grid(row=2, column=0, sticky="w")
         graph_group.grid_columnconfigure(0, weight=1)
-        graph_group.grid_rowconfigure(0, weight=1, minsize=220)
+        graph_group.grid_rowconfigure(0, weight=1, minsize=300)
         left_frame.grid_columnconfigure(0, weight=1)
+        left_frame.grid_rowconfigure(0, weight=0)
+        left_frame.grid_rowconfigure(1, weight=0)
+        left_frame.grid_rowconfigure(2, weight=0)
         panel.grid_columnconfigure(0, weight=1)
         panel.grid_columnconfigure(1, weight=2)
-        panel.grid_rowconfigure(0, weight=1, minsize=260)
+        panel.grid_rowconfigure(0, weight=1, minsize=300)
         right_frame.grid_columnconfigure(0, weight=1)
-        right_frame.grid_rowconfigure(0, weight=1, minsize=240)
+        right_frame.grid_rowconfigure(0, weight=1, minsize=300)
+        self._refresh_mtf_warning_text_widget()
 
     def _bind_analysis_selector_events(self) -> None:
         for key in ("snr_signal", "snr_noise", "cnr_target", "cnr_reference", "cnr_noise"):
@@ -3530,6 +3550,7 @@ class DicomViewer:
         warning_summary = self._summarize_mtf_warnings_korean(reason_codes, warnings)
         self.analysis_results["mtf_warning_summary"].set(f"경고 요약: {warning_summary}")
         self.analysis_results["mtf_reason_codes"].set(f"Reason Codes: {', '.join(str(item) for item in reason_codes) if reason_codes else '-'}")
+        self._refresh_mtf_warning_text_widget()
         self._last_mtf_curve_payload = dict(mtf_result.get("mtf_curve") or {})
         self._last_esf_curve_payload = dict(mtf_result.get("esf_curve") or {})
         self._last_lsf_curve_payload = dict(mtf_result.get("lsf_curve") or {})
@@ -3538,6 +3559,21 @@ class DicomViewer:
         self._render_xy_curve(self._mtf_lsf_canvas, self._last_lsf_curve_payload, "LSF", "x")
         self._update_mtf_esf_lsf_summary(self._last_esf_curve_payload, self._last_lsf_curve_payload)
         self._schedule_mtf_graph_redraw()
+
+    def _refresh_mtf_warning_text_widget(self) -> None:
+        warning_text = self._mtf_warning_text_widget
+        if warning_text is None:
+            return
+        warning_summary = self.analysis_results.get("mtf_warning_summary")
+        reason_codes = self.analysis_results.get("mtf_reason_codes")
+        lines = [
+            warning_summary.get() if warning_summary is not None else "Warnings: -",
+            reason_codes.get() if reason_codes is not None else "Reason Codes: -",
+        ]
+        warning_text.configure(state="normal")
+        warning_text.delete("1.0", "end")
+        warning_text.insert("1.0", "\n".join(lines))
+        warning_text.configure(state="disabled")
 
     def _summarize_mtf_warnings_korean(self, reason_codes: list[Any], warnings: list[Any]) -> str:
         reason_to_ko = {
