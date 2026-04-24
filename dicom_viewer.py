@@ -1297,7 +1297,16 @@ class DicomViewer:
         panel.grid_rowconfigure(0, weight=1, minsize=300)
         right_frame.grid_columnconfigure(0, weight=1)
         right_frame.grid_rowconfigure(0, weight=1, minsize=300)
+        self._restore_mtf_ui_from_last_run()
+
+    def _restore_mtf_ui_from_last_run(self) -> None:
         self._refresh_mtf_warning_text_widget()
+        last_run = self._select_analysis_last_run("mtf") or {}
+        result = dict(last_run.get("result") or {})
+        if not result:
+            self._schedule_mtf_graph_redraw()
+            return
+        self._update_mtf_analysis_ui(result)
 
     def _bind_analysis_selector_events(self) -> None:
         for key in ("snr_signal", "snr_noise", "cnr_target", "cnr_reference", "cnr_noise"):
