@@ -394,6 +394,18 @@ class DicomViewer:
         self._analysis_action_buttons: dict[str, ttk.Button] = {}
         self._mtf_summary_value_vars: dict[str, tk.StringVar] = {}
         self._mtf_graph_canvas: tk.Canvas | None = None
+        self._mtf_esf_canvas: tk.Canvas | None = None
+        self._mtf_lsf_canvas: tk.Canvas | None = None
+        self._mtf_curve_notebook: ttk.Notebook | None = None
+        self._mtf_curve_tabs: dict[str, ttk.Frame] = {}
+        self._mtf_graph_group: ttk.LabelFrame | None = None
+        self._mtf_right_frame: ttk.Frame | None = None
+        self._mtf_notebook: ttk.Notebook | None = None
+        self._mtf_tab: ttk.Frame | None = None
+        self._mtf_graph_redraw_job: str | None = None
+        self._last_mtf_curve_payload: dict[str, Any] = {}
+        self._last_esf_curve_payload: dict[str, Any] = {}
+        self._last_lsf_curve_payload: dict[str, Any] = {}
         self._mtf_graph_status_var = tk.StringVar(value="MTF Curve: no result")
         self._mtf_esf_status_var = tk.StringVar(value="ESF: 결과 없음")
         self._mtf_lsf_status_var = tk.StringVar(value="LSF: 결과 없음")
@@ -1038,6 +1050,9 @@ class DicomViewer:
         nested_notebook.add(uniformity_tab, text="Uniformity")
         nested_notebook.add(line_profile_tab, text="Line Profile")
         nested_notebook.add(mtf_tab, text="MTF")
+        self._mtf_notebook = nested_notebook
+        self._mtf_tab = mtf_tab
+        nested_notebook.bind("<<NotebookTabChanged>>", self._on_signal_analysis_tab_changed, add="+")
 
         snr_group = ttk.LabelFrame(snr_tab, text="SNR", padding=(8, 6))
         snr_group.pack(fill="both", expand=True)
@@ -1164,6 +1179,7 @@ class DicomViewer:
         left_frame.grid(row=0, column=0, sticky="nsew")
         right_frame = ttk.Frame(panel)
         right_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        self._mtf_right_frame = right_frame
 
         input_group = ttk.LabelFrame(left_frame, text="Input", padding=(6, 4))
         input_group.grid(row=0, column=0, sticky="ew")
@@ -1225,22 +1241,41 @@ class DicomViewer:
         ttk.Label(warning_group, textvariable=self.signal_analysis_results["mtf_warning_summary"], justify="left").grid(row=0, column=0, sticky="w")
         ttk.Label(warning_group, textvariable=self.signal_analysis_results["mtf_reason_codes"], justify="left").grid(row=1, column=0, sticky="w", pady=(2, 0))
 
-        graph_group = ttk.LabelFrame(right_frame, text="Graph", padding=(6, 4))
+        graph_group = ttk.LabelFrame(right_frame, text="Curve Viewer", padding=(6, 4))
         graph_group.grid(row=0, column=0, sticky="nsew")
-        canvas = tk.Canvas(graph_group, width=360, height=180, bg="#FFFFFF", highlightthickness=1, highlightbackground=self.ui_colors["border"])
-        canvas.grid(row=0, column=0, sticky="nsew")
-        self._mtf_graph_canvas = canvas
-        ttk.Label(graph_group, textvariable=self._mtf_graph_status_var).grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(graph_group, textvariable=self._mtf_esf_status_var).grid(row=2, column=0, sticky="w")
-        ttk.Label(graph_group, textvariable=self._mtf_lsf_status_var).grid(row=3, column=0, sticky="w")
+        self._mtf_graph_group = graph_group
+        curve_notebook = ttk.Notebook(graph_group)
+        curve_notebook.grid(row=0, column=0, sticky="nsew")
+        self._mtf_curve_notebook = curve_notebook
+        curve_notebook.bind("<<NotebookTabChanged>>", self._on_mtf_curve_tab_changed, add="+")
+        for key, title in (("mtf", "MTF"), ("esf", "ESF"), ("lsf", "LSF")):
+            tab = ttk.Frame(curve_notebook, padding=(2, 2, 2, 2))
+            curve_notebook.add(tab, text=title)
+            tab.grid_columnconfigure(0, weight=1)
+            tab.grid_rowconfigure(0, weight=1)
+            canvas = tk.Canvas(tab, width=360, height=180, bg="#FFFFFF", highlightthickness=1, highlightbackground=self.ui_colors["border"])
+            canvas.grid(row=0, column=0, sticky="nsew")
+            canvas.bind("<Configure>", self._on_mtf_graph_canvas_configure, add="+")
+            self._mtf_curve_tabs[key] = tab
+            if key == "mtf":
+                self._mtf_graph_canvas = canvas
+            elif key == "esf":
+                self._mtf_esf_canvas = canvas
+            else:
+                self._mtf_lsf_canvas = canvas
+        summary_group_right = ttk.LabelFrame(graph_group, text="Curve Summary", padding=(6, 4))
+        summary_group_right.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(summary_group_right, textvariable=self._mtf_graph_status_var).grid(row=0, column=0, sticky="w")
+        ttk.Label(summary_group_right, textvariable=self._mtf_esf_status_var).grid(row=1, column=0, sticky="w")
+        ttk.Label(summary_group_right, textvariable=self._mtf_lsf_status_var).grid(row=2, column=0, sticky="w")
         graph_group.grid_columnconfigure(0, weight=1)
-        graph_group.grid_rowconfigure(0, weight=1)
+        graph_group.grid_rowconfigure(0, weight=1, minsize=220)
         left_frame.grid_columnconfigure(0, weight=1)
         panel.grid_columnconfigure(0, weight=1)
         panel.grid_columnconfigure(1, weight=2)
-        panel.grid_rowconfigure(0, weight=1)
+        panel.grid_rowconfigure(0, weight=1, minsize=260)
         right_frame.grid_columnconfigure(0, weight=1)
-        right_frame.grid_rowconfigure(0, weight=1)
+        right_frame.grid_rowconfigure(0, weight=1, minsize=240)
 
     def _bind_analysis_selector_events(self) -> None:
         for key in ("snr_signal", "snr_noise", "cnr_target", "cnr_reference", "cnr_noise"):
@@ -1284,6 +1319,52 @@ class DicomViewer:
             f"{line_label} | n={summary['sample_count']} | min={summary['min_intensity']:.2f} | "
             f"max={summary['max_intensity']:.2f} | mean={summary['mean_intensity']:.2f}"
         )
+
+    def _on_signal_analysis_tab_changed(self, event: tk.Event | None = None) -> None:
+        notebook = self._mtf_notebook
+        mtf_tab = self._mtf_tab
+        if notebook is None or mtf_tab is None:
+            return
+        if event is not None and event.widget is not notebook:
+            return
+        if notebook.select() != str(mtf_tab):
+            return
+        self._schedule_mtf_graph_redraw()
+
+    def _on_mtf_graph_canvas_configure(self, _event: tk.Event | None = None) -> None:
+        self._schedule_mtf_graph_redraw()
+
+    def _on_mtf_curve_tab_changed(self, _event: tk.Event | None = None) -> None:
+        self._schedule_mtf_graph_redraw()
+
+    def _schedule_mtf_graph_redraw(self) -> None:
+        canvas = self._mtf_graph_canvas
+        if canvas is None:
+            return
+        if self._mtf_graph_redraw_job is not None:
+            try:
+                canvas.after_cancel(self._mtf_graph_redraw_job)
+            except Exception:
+                pass
+        self._mtf_graph_redraw_job = canvas.after_idle(self._redraw_all_mtf_curves_from_cached_result)
+
+    def _redraw_all_mtf_curves_from_cached_result(self) -> None:
+        self._mtf_graph_redraw_job = None
+        canvas = self._mtf_graph_canvas
+        if canvas is None or not canvas.winfo_exists():
+            return
+        mtf_curve = self._last_mtf_curve_payload
+        esf_curve = self._last_esf_curve_payload
+        lsf_curve = self._last_lsf_curve_payload
+        if not mtf_curve or not esf_curve or not lsf_curve:
+            last_run = self._select_analysis_last_run("mtf") or {}
+            mtf_result = last_run.get("result") or {}
+            mtf_curve = mtf_curve or (mtf_result.get("mtf_curve") or {})
+            esf_curve = esf_curve or (mtf_result.get("esf_curve") or {})
+            lsf_curve = lsf_curve or (mtf_result.get("lsf_curve") or {})
+        self._render_mtf_curve(dict(mtf_curve or {}))
+        self._render_xy_curve(self._mtf_esf_canvas, dict(esf_curve or {}), "ESF", "x")
+        self._render_xy_curve(self._mtf_lsf_canvas, dict(lsf_curve or {}), "LSF", "x")
 
     def _sync_analysis_input_from_combobox(self, kind: str, combobox_key: str, input_key: str) -> None:
         combobox = self._analysis_comboboxes.get(combobox_key)
@@ -2962,6 +3043,7 @@ class DicomViewer:
         self._update_uniformity_input_ui()
         self._refresh_analysis_results_panel()
         self._refresh_image_analysis_selectors()
+        self._schedule_mtf_graph_redraw()
 
     def _refresh_image_analysis_selectors(self) -> None:
         image_options = self._build_image_analysis_options()
@@ -3448,11 +3530,14 @@ class DicomViewer:
         warning_summary = self._summarize_mtf_warnings_korean(reason_codes, warnings)
         self.analysis_results["mtf_warning_summary"].set(f"경고 요약: {warning_summary}")
         self.analysis_results["mtf_reason_codes"].set(f"Reason Codes: {', '.join(str(item) for item in reason_codes) if reason_codes else '-'}")
-        self._render_mtf_curve(mtf_result.get("mtf_curve") or {})
-        self._update_mtf_esf_lsf_summary(
-            mtf_result.get("esf_curve") or {},
-            mtf_result.get("lsf_curve") or {},
-        )
+        self._last_mtf_curve_payload = dict(mtf_result.get("mtf_curve") or {})
+        self._last_esf_curve_payload = dict(mtf_result.get("esf_curve") or {})
+        self._last_lsf_curve_payload = dict(mtf_result.get("lsf_curve") or {})
+        self._render_mtf_curve(self._last_mtf_curve_payload)
+        self._render_xy_curve(self._mtf_esf_canvas, self._last_esf_curve_payload, "ESF", "x")
+        self._render_xy_curve(self._mtf_lsf_canvas, self._last_lsf_curve_payload, "LSF", "x")
+        self._update_mtf_esf_lsf_summary(self._last_esf_curve_payload, self._last_lsf_curve_payload)
+        self._schedule_mtf_graph_redraw()
 
     def _summarize_mtf_warnings_korean(self, reason_codes: list[Any], warnings: list[Any]) -> str:
         reason_to_ko = {
@@ -3537,6 +3622,51 @@ class DicomViewer:
         canvas.create_text(pad_l + plot_w / 2, height - 10, text="Frequency (cy/pixel)", fill="#334155")
         canvas.create_text(12, pad_t + plot_h / 2, text="MTF", fill="#334155", angle=90)
         self._mtf_graph_status_var.set(f"MTF Curve: {freqs.size} points")
+
+    def _render_xy_curve(
+        self,
+        canvas: tk.Canvas | None,
+        curve: dict[str, Any],
+        curve_name: str,
+        x_label: str,
+    ) -> None:
+        if canvas is None:
+            return
+        canvas.delete("all")
+        width = int(canvas.winfo_width() or 360)
+        height = int(canvas.winfo_height() or 180)
+        pad_l, pad_r, pad_t, pad_b = 34, 10, 10, 26
+        plot_w = max(width - pad_l - pad_r, 20)
+        plot_h = max(height - pad_t - pad_b, 20)
+        canvas.create_rectangle(pad_l, pad_t, pad_l + plot_w, pad_t + plot_h, outline="#CBD5E1")
+        canvas.create_line(pad_l, pad_t + plot_h, pad_l + plot_w, pad_t + plot_h, fill="#64748B")
+        canvas.create_line(pad_l, pad_t, pad_l, pad_t + plot_h, fill="#64748B")
+        xs = np.asarray(curve.get("x", []), dtype=np.float64)
+        ys = np.asarray(curve.get("y", []), dtype=np.float64)
+        if xs.size < 2 or ys.size < 2 or xs.size != ys.size:
+            canvas.create_text(width / 2, height / 2, text="No curve data", fill="#64748B")
+            return
+        valid = np.isfinite(xs) & np.isfinite(ys)
+        xs = xs[valid]
+        ys = ys[valid]
+        if xs.size < 2:
+            canvas.create_text(width / 2, height / 2, text="No curve data", fill="#64748B")
+            return
+        x_min = float(np.min(xs))
+        x_max = float(np.max(xs))
+        y_min = float(np.min(ys))
+        y_max = float(np.max(ys))
+        x_span = (x_max - x_min) if x_max > x_min else 1.0
+        y_span = (y_max - y_min) if y_max > y_min else 1.0
+        points: list[float] = []
+        for x_val, y_val in zip(xs, ys):
+            px = pad_l + ((float(x_val) - x_min) / x_span) * plot_w
+            py = pad_t + plot_h - ((float(y_val) - y_min) / y_span) * plot_h
+            points.extend([px, py])
+        if len(points) >= 4:
+            canvas.create_line(*points, fill="#0A84FF", width=2, smooth=True)
+        canvas.create_text(pad_l + plot_w / 2, height - 10, text=x_label, fill="#334155")
+        canvas.create_text(12, pad_t + plot_h / 2, text=curve_name, fill="#334155", angle=90)
 
     def _show_mtf_details(self) -> None:
         mtf_payload = (self._select_analysis_last_run("mtf") or {}).get("result")
@@ -8923,6 +9053,12 @@ class DicomViewer:
         self.domain_store.clear_analysis_last_run()
         # LEGACY_BRIDGE: 결과 패널 read 경로 완전 selector화 전까지만 캐시 유지.
         self.analysis_last_run = {}
+        self._last_mtf_curve_payload = {}
+        self._last_esf_curve_payload = {}
+        self._last_lsf_curve_payload = {}
+        self._render_mtf_curve({})
+        self._render_xy_curve(self._mtf_esf_canvas, {}, "ESF", "x")
+        self._render_xy_curve(self._mtf_lsf_canvas, {}, "LSF", "x")
 
     def _action_history_append_entry(self, entry: ResultHistoryEntry) -> None:
         self._ensure_domain_store()
