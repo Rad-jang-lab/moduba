@@ -94,6 +94,14 @@ def calculate_slanted_edge_mtf(
             "frequency_cy_per_pixel": freqs.tolist(),
             "mtf": mtf.tolist(),
         },
+        "esf_curve": {
+            "x": esf_x.tolist(),
+            "y": esf_y.tolist(),
+        },
+        "lsf_curve": {
+            "x": esf_x.tolist(),
+            "y": lsf.tolist(),
+        },
         "mtf50": mtf50,
         "mtf10": mtf10,
         "basic_notes": [
@@ -289,6 +297,8 @@ def _reject(message: str, edge_angle_deg: Optional[float] = None) -> Dict[str, A
         "rejection_reason": message,
         "edge_angle_deg": edge_angle_deg,
         "mtf_curve": None,
+        "esf_curve": None,
+        "lsf_curve": None,
         "mtf50": None,
         "mtf10": None,
         "basic_notes": ["Phase 1 fatal validation rejection."],
