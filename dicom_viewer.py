@@ -1174,7 +1174,9 @@ class DicomViewer:
 
     def _build_mtf_analysis_panel(self, strip: ttk.Frame) -> None:
         panel = ttk.LabelFrame(strip, text="MTF Analysis", padding=(8, 6))
-        panel.pack(side="left", padx=(0, 8), fill="both", expand=True)
+        strip.grid_columnconfigure(0, weight=1)
+        strip.grid_rowconfigure(0, weight=1)
+        panel.grid(row=0, column=0, sticky="nsew")
 
         left_frame = ttk.Frame(panel)
         left_frame.grid(row=0, column=0, sticky="nsew")
@@ -1290,8 +1292,8 @@ class DicomViewer:
         left_frame.grid_rowconfigure(0, weight=0)
         left_frame.grid_rowconfigure(1, weight=0)
         left_frame.grid_rowconfigure(2, weight=0)
-        panel.grid_columnconfigure(0, weight=1)
-        panel.grid_columnconfigure(1, weight=2)
+        panel.grid_columnconfigure(0, weight=0)
+        panel.grid_columnconfigure(1, weight=1)
         panel.grid_rowconfigure(0, weight=1, minsize=300)
         right_frame.grid_columnconfigure(0, weight=1)
         right_frame.grid_rowconfigure(0, weight=1, minsize=300)
