@@ -95,8 +95,8 @@ def build_window_b_analysis_panel(
     header.columnconfigure(1, weight=0, minsize=190)
     header.columnconfigure(2, weight=0, minsize=130)
     ttk.Label(header, text="ROI / Analysis / Metric", anchor="w").grid(row=0, column=0, sticky="ew", padx=(2, 8))
-    ttk.Label(header, text="Result", anchor="w").grid(row=0, column=1, sticky="ew", padx=(0, 8))
-    ttk.Label(header, text="Status / Remark", anchor="w").grid(row=0, column=2, sticky="ew")
+    ttk.Label(header, text="Formula / Calculation", anchor="w").grid(row=0, column=1, sticky="ew", padx=(0, 8))
+    ttk.Label(header, text="Result", anchor="w").grid(row=0, column=2, sticky="ew")
 
     canvas = tk.Canvas(
         results_panel,
