@@ -413,6 +413,8 @@ class DicomViewer:
         self._mtf_lsf_status_var = tk.StringVar(value="LSF: 결과 없음")
         self._mtf_warning_popup_message: str = "경고 요약: -\nReason Codes: -"
         self._last_mtf_key_metrics: dict[str, Any] = {}
+        self._last_mtf_warning_details: list[str] = []
+        self._mtf_warning_text_widget: tk.Text | None = None
         self._uniformity_roi_listbox: tk.Listbox | None = None
         self._analysis_ui_bindings_initialized = False
         self.analysis_results_table: ttk.Frame | None = None
@@ -1224,38 +1226,62 @@ class DicomViewer:
 
         summary_group = ttk.LabelFrame(left_frame, text="Result Summary", padding=(6, 4))
         summary_group.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        summary_group.grid_columnconfigure(0, weight=1)
+        core_group = ttk.LabelFrame(summary_group, text="Core Results", padding=(6, 4))
+        core_group.grid(row=0, column=0, sticky="ew")
+        roi_group = ttk.LabelFrame(summary_group, text="ROI / Edge Info", padding=(6, 4))
+        roi_group.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(summary_group, text="lp/mm (converted from PixelSpacing)").grid(row=2, column=0, sticky="w", pady=(4, 0))
+
         summary_items = [
             ("MTF50", "mtf50"),
             ("MTF10", "mtf10"),
             ("Nyquist MTF", "nyquist_mtf"),
-            ("Frequency (lp/mm)", "frequency_lpmm"),
+            ("IEC Compliance", "iec_compliance"),
+            ("QA Grade", "qa_grade"),
             ("Edge Angle", "edge_angle"),
             ("Edge SNR", "edge_snr"),
             ("ROI Width", "roi_width"),
             ("ROI Height", "roi_height"),
             ("Calculation Validity", "calculation_validity"),
-            ("IEC Compliance", "iec_compliance"),
-            ("QA Grade", "qa_grade"),
+            ("Frequency (lp/mm)", "frequency_lpmm"),
         ]
-        for row_index, (label, key) in enumerate(summary_items):
-            ttk.Label(summary_group, text=f"{label}:").grid(row=row_index, column=0, sticky="w")
+        core_keys = {"mtf50", "mtf10", "nyquist_mtf", "iec_compliance", "qa_grade"}
+        core_row = 0
+        roi_row = 0
+        for label, key in summary_items:
+            parent = core_group if key in core_keys else roi_group
+            row_index = core_row if key in core_keys else roi_row
+            ttk.Label(parent, text=f"{label}:").grid(row=row_index, column=0, sticky="w")
             var = tk.StringVar(value="-")
             self._mtf_summary_value_vars[key] = var
-            ttk.Label(summary_group, textvariable=var).grid(row=row_index, column=1, sticky="w", padx=(8, 0))
+            ttk.Label(parent, textvariable=var).grid(row=row_index, column=1, sticky="w", padx=(8, 0))
+            if key in core_keys:
+                core_row += 1
+            else:
+                roi_row += 1
 
         warning_group = ttk.LabelFrame(left_frame, text="Warnings / Validation", padding=(6, 4))
         warning_group.grid(row=2, column=0, sticky="ew", pady=(6, 0))
         warning_group.grid_columnconfigure(0, weight=1)
+        warning_group.grid_rowconfigure(1, weight=1)
         ttk.Label(
             warning_group,
             textvariable=self.signal_analysis_results["mtf_status_overview"],
             wraplength=300,
             justify="left",
         ).grid(row=0, column=0, sticky="w")
-        ttk.Label(warning_group, textvariable=self.signal_analysis_results["mtf_warning_summary"], wraplength=300, justify="left").grid(row=1, column=0, sticky="w", pady=(2, 0))
-        ttk.Label(warning_group, textvariable=self.signal_analysis_results["mtf_reason_codes"], wraplength=300, justify="left").grid(row=2, column=0, sticky="w", pady=(2, 0))
-        ttk.Label(warning_group, textvariable=self.signal_analysis_results["mtf_suggested_actions"], wraplength=300, justify="left").grid(row=3, column=0, sticky="w", pady=(2, 0))
-        ttk.Button(warning_group, text="경고 상세 팝업", command=self._show_mtf_warning_popup).grid(row=4, column=0, sticky="e", pady=(6, 0))
+        warning_text_frame = ttk.Frame(warning_group)
+        warning_text_frame.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+        warning_text = tk.Text(warning_text_frame, height=8, wrap="word", relief="solid", borderwidth=1)
+        warning_text.grid(row=0, column=0, sticky="nsew")
+        warning_scroll = ttk.Scrollbar(warning_text_frame, orient="vertical", command=warning_text.yview)
+        warning_scroll.grid(row=0, column=1, sticky="ns")
+        warning_text.configure(yscrollcommand=warning_scroll.set, state="disabled")
+        warning_text_frame.grid_columnconfigure(0, weight=1)
+        warning_text_frame.grid_rowconfigure(0, weight=1)
+        self._mtf_warning_text_widget = warning_text
+        ttk.Button(warning_group, text="경고 상세 팝업", command=self._show_mtf_warning_popup).grid(row=2, column=0, sticky="e", pady=(6, 0))
 
         graph_group = ttk.LabelFrame(right_frame, text="Curve Viewer", padding=(6, 4))
         graph_group.grid(row=0, column=0, sticky="nsew")
@@ -3533,17 +3559,17 @@ class DicomViewer:
         key_metrics = mtf_result.get("key_mtf_metrics") or {}
         self._last_mtf_key_metrics = dict(key_metrics)
         invalid = self._is_mtf_result_invalid(mtf_result)
-        def _fmt(value: Any, suffix: str = "") -> str:
+        def _fmt(value: Any, digits: int = 4, suffix: str = "") -> str:
             if isinstance(value, (int, float)):
-                return f"{float(value):.4f}{suffix}"
-            return "-"
+                return f"{float(value):.{digits}f}{suffix}"
+            return "N/A"
         frequency_lpmm_text = self._format_mtf_frequency_lpmm_summary(key_metrics)
         if invalid:
             for var in self._mtf_summary_value_vars.values():
-                var.set("-")
+                var.set("N/A")
             self._mtf_summary_value_vars["calculation_validity"].set(str(mtf_result.get("calculation_validity", "invalid")))
-            self._mtf_summary_value_vars["iec_compliance"].set(str(mtf_result.get("iec_compliance", "-")))
-            self._mtf_summary_value_vars["qa_grade"].set(str(mtf_result.get("qa_grade", "-")))
+            self._mtf_summary_value_vars["iec_compliance"].set(str(mtf_result.get("iec_compliance", "N/A")))
+            self._mtf_summary_value_vars["qa_grade"].set(str(mtf_result.get("qa_grade", "N/A")))
             self._mtf_summary_value_vars["frequency_lpmm"].set(frequency_lpmm_text)
             self.analysis_results["mtf_validation_summary"].set(str(mtf_result.get("validation_summary") or mtf_result.get("rejection_reason") or "Rejected"))
         else:
@@ -3551,11 +3577,11 @@ class DicomViewer:
             self._mtf_summary_value_vars["mtf10"].set(_fmt(key_metrics.get("mtf10")))
             self._mtf_summary_value_vars["nyquist_mtf"].set(_fmt(key_metrics.get("nyquist_mtf")))
             self._mtf_summary_value_vars["frequency_lpmm"].set(frequency_lpmm_text)
-            self._mtf_summary_value_vars["edge_angle"].set(_fmt(mtf_result.get("edge_angle_deg"), " deg"))
+            self._mtf_summary_value_vars["edge_angle"].set(_fmt(mtf_result.get("edge_angle_deg"), digits=2, suffix=" deg"))
             self._mtf_summary_value_vars["edge_snr"].set(_fmt(mtf_result.get("edge_snr")))
             roi_size = mtf_result.get("roi_size_mm") or {}
-            self._mtf_summary_value_vars["roi_width"].set(_fmt(roi_size.get("width"), " mm"))
-            self._mtf_summary_value_vars["roi_height"].set(_fmt(roi_size.get("height"), " mm"))
+            self._mtf_summary_value_vars["roi_width"].set(_fmt(roi_size.get("width"), suffix=" mm"))
+            self._mtf_summary_value_vars["roi_height"].set(_fmt(roi_size.get("height"), suffix=" mm"))
             self._mtf_summary_value_vars["calculation_validity"].set(str(mtf_result.get("calculation_validity", "-")))
             self._mtf_summary_value_vars["iec_compliance"].set(str(mtf_result.get("iec_compliance", "-")))
             self._mtf_summary_value_vars["qa_grade"].set(str(mtf_result.get("qa_grade", "-")))
@@ -3567,6 +3593,7 @@ class DicomViewer:
         self.analysis_results["mtf_warning_summary"].set(f"경고 요약: {warning_summary}")
         self.analysis_results["mtf_reason_codes"].set(f"Reason Codes: {', '.join(str(item) for item in reason_codes) if reason_codes else '-'}")
         self.analysis_results["mtf_suggested_actions"].set(self._build_mtf_suggested_actions(reason_codes))
+        self._last_mtf_warning_details = [str(item) for item in warnings if str(item).strip()]
         self._refresh_mtf_warning_text_widget()
         self._last_mtf_curve_payload = dict(mtf_result.get("mtf_curve") or {})
         self._last_esf_curve_payload = dict(mtf_result.get("esf_curve") or {})
@@ -3582,13 +3609,23 @@ class DicomViewer:
         warning_summary = self.analysis_results.get("mtf_warning_summary")
         reason_codes = self.analysis_results.get("mtf_reason_codes")
         suggested_actions = self.analysis_results.get("mtf_suggested_actions")
-        lines = [
+        summary_lines = [
             status_overview.get() if status_overview is not None else "Validation: - | Calculation: - | IEC: - | QA Grade: -",
             warning_summary.get() if warning_summary is not None else "Warnings: -",
             reason_codes.get() if reason_codes is not None else "Reason Codes: -",
             suggested_actions.get() if suggested_actions is not None else "Suggested Actions: -",
         ]
-        self._mtf_warning_popup_message = "\n".join(lines)
+        detail_lines = [f"- {text}" for text in getattr(self, "_last_mtf_warning_details", [])]
+        if not detail_lines:
+            detail_lines = ["- -"]
+        body_lines = summary_lines + ["", "Warning Details:", *detail_lines]
+        warning_text_widget = getattr(self, "_mtf_warning_text_widget", None)
+        if warning_text_widget is not None:
+            warning_text_widget.configure(state="normal")
+            warning_text_widget.delete("1.0", tk.END)
+            warning_text_widget.insert("1.0", "\n".join(body_lines))
+            warning_text_widget.configure(state="disabled")
+        self._mtf_warning_popup_message = "\n".join(body_lines)
 
     def _show_mtf_warning_popup(self) -> None:
         message = str(getattr(self, "_mtf_warning_popup_message", "")).strip()
@@ -3606,27 +3643,27 @@ class DicomViewer:
 
     def _build_mtf_suggested_actions(self, reason_codes: list[Any]) -> str:
         actions_by_reason = {
-            "EDGE_SNR_LOW": "Suggested Actions: 노출 조건 또는 ROI contrast 확인.",
-            "EDGE_SNR_BORDERLINE": "Suggested Actions: 노출 조건 또는 ROI contrast 확인.",
-            "POSSIBLE_ALIASING": "Suggested Actions: edge 방향 및 sampling 상태 확인.",
-            "NONMONOTONIC_TAIL": "Suggested Actions: ROI 위치 및 edge 품질 확인.",
-            "IEC_EDGE_GEOMETRY_NONCOMPLIANT": "Suggested Actions: ROI 크기 및 각도 재검토.",
-            "IEC_ROI_NONCOMPLIANT": "Suggested Actions: ROI 크기 및 각도 재검토.",
-            "PHASE1_REJECT": "Suggested Actions: ROI 위치 및 edge 품질 확인.",
+            "EDGE_SNR_LOW": "Suggested Actions:\n- Increase exposure or improve edge contrast.\n- Reacquire ROI with cleaner edge profile.",
+            "EDGE_SNR_BORDERLINE": "Suggested Actions:\n- Increase exposure or improve edge contrast.\n- Recheck high-frequency interpretation.",
+            "POSSIBLE_ALIASING": "Suggested Actions:\n- Verify edge direction and sampling.\n- Reposition ROI away from resampling artifacts.",
+            "NONMONOTONIC_TAIL": "Suggested Actions:\n- Verify ROI position and edge quality.\n- Repeat measurement with stable edge.",
+            "IEC_EDGE_GEOMETRY_NONCOMPLIANT": "Suggested Actions:\n- Adjust ROI size/angle to meet IEC geometry.\n- Re-run in strict IEC mode.",
+            "IEC_ROI_NONCOMPLIANT": "Suggested Actions:\n- Enlarge ROI to IEC minimum dimensions.\n- Confirm edge location remains valid.",
+            "PHASE1_REJECT": "Suggested Actions:\n- Verify ROI position and edge direction.\n- Confirm adequate SNR before rerun.",
         }
         for reason in reason_codes:
             action = actions_by_reason.get(str(reason))
             if action:
                 return action
-        return "Suggested Actions: -"
+        return "Suggested Actions:\n- Verify ROI position, edge direction, and SNR."
 
     def _format_mtf_frequency_lpmm_summary(self, key_metrics: dict[str, Any]) -> str:
         spacing = self._get_pixel_spacing_mm()
         if spacing is None:
-            return "lp/mm unavailable"
+            return "lp/mm unavailable: missing PixelSpacing"
         row_spacing_mm = spacing[0]
         if not isinstance(row_spacing_mm, (int, float)) or row_spacing_mm <= 0:
-            return "lp/mm unavailable"
+            return "lp/mm unavailable: missing PixelSpacing"
         entries: list[str] = []
         for key in ("mtf50", "mtf10"):
             value = key_metrics.get(key)
@@ -3716,7 +3753,8 @@ class DicomViewer:
             points.extend([px, py])
         if len(points) >= 4:
             canvas.create_line(*points, fill="#0A84FF", width=2, smooth=True)
-        self._render_mtf_reference_markers(canvas, key_metrics=self._last_mtf_key_metrics, xmax=xmax, pad_l=pad_l, pad_t=pad_t, plot_w=plot_w, plot_h=plot_h)
+        show_nyquist_legend = self._render_mtf_reference_markers(canvas, key_metrics=self._last_mtf_key_metrics, xmax=xmax, pad_l=pad_l, pad_t=pad_t, plot_w=plot_w, plot_h=plot_h)
+        self._render_mtf_legend(canvas, width=width, pad_t=pad_t, include_nyquist=show_nyquist_legend)
         canvas.create_text(pad_l + plot_w / 2, height - 10, text="Frequency (cy/pixel)", fill="#334155")
         canvas.create_text(12, pad_t + plot_h / 2, text="MTF", fill="#334155", angle=90)
         self._mtf_graph_status_var.set(f"MTF Curve: {freqs.size} points")
@@ -3734,7 +3772,7 @@ class DicomViewer:
         pad_t: int,
         plot_w: int,
         plot_h: int,
-    ) -> None:
+    ) -> bool:
         marker_specs = [
             ("mtf50", "#DC2626", "MTF50"),
             ("mtf10", "#16A34A", "MTF10"),
@@ -3750,12 +3788,30 @@ class DicomViewer:
             canvas.create_line(px, pad_t, px, pad_t + plot_h, fill=color, dash=(4, 3), width=1)
             canvas.create_text(px + 4, pad_t + 10, text=f"{label}={freq:.4f}", fill=color, anchor="w")
         nyquist = key_metrics.get("nyquist_frequency_cy_per_pixel")
+        reliable_nyquist = self._is_finite_number(key_metrics.get("nyquist_mtf"))
         if not self._is_finite_number(nyquist):
             nyquist = 0.5
         nyquist_freq = float(nyquist)
         if 0 <= nyquist_freq <= xmax:
             px = pad_l + (nyquist_freq / xmax) * plot_w
             canvas.create_line(px, pad_t, px, pad_t + plot_h, fill="#7C3AED", dash=(2, 4), width=1)
+            return reliable_nyquist
+        return False
+
+    @staticmethod
+    def _render_mtf_legend(canvas: tk.Canvas, width: int, pad_t: int, include_nyquist: bool) -> None:
+        legend_items = [
+            ("#DC2626", (4, 3), "MTF50"),
+            ("#16A34A", (4, 3), "MTF10"),
+        ]
+        if include_nyquist:
+            legend_items.append(("#7C3AED", (2, 4), "Nyquist"))
+        legend_x = max(width - 170, 180)
+        y = pad_t + 8
+        for color, dash, label in legend_items:
+            canvas.create_line(legend_x, y, legend_x + 26, y, fill=color, dash=dash, width=2)
+            canvas.create_text(legend_x + 32, y, text=label, anchor="w", fill="#1E293B")
+            y += 14
 
     def _render_xy_curve(
         self,
@@ -4083,26 +4139,53 @@ class DicomViewer:
             metric_value = key_metrics.get("mtf50")
             status_text = str(result.get("calculation_validity", result.get("calculation_status", "")))
             reason_codes = ", ".join(str(item) for item in (result.get("reason_codes") or []))
-            rows.append(
-                {
-                    "metric_name": "MTF",
-                    "formula_mode": f"slanted_edge [{status_text}]",
-                    "roi_ids": [str((mtf.get('context') or {}).get("roi_id", ""))],
-                    "roles": [],
-                    "stats": {
-                        "mtf50": key_metrics.get("mtf50"),
-                        "mtf10": key_metrics.get("mtf10"),
-                        "nyquist_mtf": key_metrics.get("nyquist_mtf"),
-                        "edge_angle_deg": result.get("edge_angle_deg"),
-                        "edge_snr": result.get("edge_snr"),
-                    },
-                    "result_value": float(metric_value) if isinstance(metric_value, (int, float)) else None,
-                    "item_name": "MTF",
-                    "note_text": f"Validity={status_text}; reason_codes=[{reason_codes}]",
-                    "result_text": f"{float(metric_value):.4f}" if isinstance(metric_value, (int, float)) else status_text,
-                    "developer_meta": mtf,
-                }
-            )
+            mtf_row = {
+                "metric_name": "MTF",
+                "formula_mode": f"slanted_edge [{status_text}]",
+                "roi_ids": [str((mtf.get('context') or {}).get("roi_id", ""))],
+                "roles": [],
+                "stats": {
+                    "mtf50": key_metrics.get("mtf50"),
+                    "mtf10": key_metrics.get("mtf10"),
+                    "nyquist_mtf": key_metrics.get("nyquist_mtf"),
+                    "edge_angle_deg": result.get("edge_angle_deg"),
+                    "edge_snr": result.get("edge_snr"),
+                    "iec_compliance": result.get("iec_compliance"),
+                    "qa_grade": result.get("qa_grade"),
+                },
+                "result_value": float(metric_value) if isinstance(metric_value, (int, float)) else None,
+                "item_name": "MTF",
+                "note_text": f"Validity={status_text}; reason_codes=[{reason_codes}]",
+                "result_text": f"{float(metric_value):.4f}" if isinstance(metric_value, (int, float)) else status_text,
+                "developer_meta": mtf,
+            }
+            rows.append(mtf_row)
+            base_payload = {
+                "formula_mode": mtf_row["formula_mode"],
+                "roi_ids": mtf_row["roi_ids"],
+                "roles": [],
+                "stats": mtf_row["stats"],
+                "note_text": mtf_row["note_text"],
+                "developer_meta": mtf,
+            }
+            for metric_name, value in (
+                ("MTF50", key_metrics.get("mtf50")),
+                ("MTF10", key_metrics.get("mtf10")),
+                ("Nyquist MTF", key_metrics.get("nyquist_mtf")),
+                ("Edge SNR", result.get("edge_snr")),
+                ("IEC Compliance", result.get("iec_compliance")),
+                ("QA Grade", result.get("qa_grade")),
+            ):
+                metric_text = f"{float(value):.4f}" if isinstance(value, (int, float)) else (str(value) if value not in (None, "") else "N/A")
+                rows.append(
+                    {
+                        "metric_name": "MTF",
+                        "item_name": metric_name,
+                        "result_value": float(value) if isinstance(value, (int, float)) else None,
+                        "result_text": metric_text,
+                        **base_payload,
+                    }
+                )
         return rows
 
     def _build_analysis_result_rows(self) -> list[dict[str, Any]]:
@@ -4226,9 +4309,15 @@ class DicomViewer:
         return f"Derived metric\n= {self._format_numeric_for_note(result_value)}"
 
     def _format_analysis_value_text(self, row: dict[str, Any]) -> str:
+        metric_name = str(row.get("metric_name", "")).upper()
         result_value = row.get("result_value")
+        if metric_name == "MTF" and isinstance(result_value, (int, float)):
+            return f"{float(result_value):.4f}"
         if isinstance(result_value, (int, float)):
             return f"{float(result_value):.2f}"
+        if metric_name == "MTF":
+            result_text = str(row.get("result_text", "")).strip()
+            return result_text if result_text else "N/A"
         return "-"
 
     def _append_analysis_history_row(self, row: dict[str, Any], unit: str, related_target_ids: list[str] | None = None) -> None:
@@ -4565,6 +4654,12 @@ class DicomViewer:
                     "pixel_count",
                     "result_value",
                     "result_text",
+                    "mtf50",
+                    "mtf10",
+                    "nyquist_mtf",
+                    "edge_snr",
+                    "iec_compliance",
+                    "qa_grade",
                 ]
             )
             for row in payload["user_schema"]["rows"]:
@@ -4582,6 +4677,12 @@ class DicomViewer:
                         stats.get("pixel_count", ""),
                         row.get("result_value", ""),
                         row.get("result_text", ""),
+                        stats.get("mtf50", ""),
+                        stats.get("mtf10", ""),
+                        stats.get("nyquist_mtf", ""),
+                        stats.get("edge_snr", ""),
+                        stats.get("iec_compliance", ""),
+                        stats.get("qa_grade", ""),
                     ]
                 )
         messagebox.showinfo("저장 완료", f"Analysis CSV 저장 완료:\n{path}")
