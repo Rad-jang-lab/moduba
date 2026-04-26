@@ -411,10 +411,11 @@ class DicomViewer:
         self._last_esf_curve_payload: dict[str, Any] = {}
         self._last_lsf_curve_payload: dict[str, Any] = {}
         self._last_mtf_result: dict[str, Any] = {}
-        self._mtf_curve_interpretation_var = tk.StringVar(value="결과가 없어서 곡선 해석을 제공할 수 없습니다.")
         self._mtf_graph_status_var = tk.StringVar(value="MTF curve: no result")
         self._mtf_esf_status_var = tk.StringVar(value="ESF: 결과 없음")
         self._mtf_lsf_status_var = tk.StringVar(value="LSF: 결과 없음")
+        self._mtf_curve_metrics_tree: ttk.Treeview | None = None
+        self._mtf_active_curve_tab_key: str = "mtf"
         self._mtf_warning_popup_message: str = "[검증 결과]\n- 검증: -\n- 계산 유효성: -\n- IEC: -\n- QA 등급: -"
         self._last_mtf_key_metrics: dict[str, Any] = {}
         self._last_mtf_warning_details: list[str] = []
@@ -1311,20 +1312,26 @@ class DicomViewer:
                 self._mtf_esf_canvas = canvas
             else:
                 self._mtf_lsf_canvas = canvas
-        summary_group_right = ttk.LabelFrame(graph_group, text="Curve Interpretation", padding=(6, 4))
+        summary_group_right = ttk.LabelFrame(graph_group, text="Curve Metrics", padding=(6, 4))
         summary_group_right.grid(row=1, column=0, sticky="ew", pady=(6, 0))
         summary_group_right.grid_columnconfigure(0, weight=1)
-        ttk.Label(
+        metrics_tree = ttk.Treeview(
             summary_group_right,
-            textvariable=self._mtf_curve_interpretation_var,
-            justify="left",
-            wraplength=420,
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Separator(summary_group_right, orient="horizontal").grid(row=1, column=0, sticky="ew", pady=(6, 4))
-        ttk.Label(summary_group_right, text="[Data details]").grid(row=2, column=0, sticky="w")
-        ttk.Label(summary_group_right, textvariable=self._mtf_graph_status_var).grid(row=3, column=0, sticky="w")
-        ttk.Label(summary_group_right, textvariable=self._mtf_esf_status_var).grid(row=4, column=0, sticky="w")
-        ttk.Label(summary_group_right, textvariable=self._mtf_lsf_status_var).grid(row=5, column=0, sticky="w")
+            columns=("metric", "value", "definition"),
+            show="headings",
+            height=7,
+        )
+        metrics_tree.heading("metric", text="Metric")
+        metrics_tree.heading("value", text="Value")
+        metrics_tree.heading("definition", text="Formula / Definition")
+        metrics_tree.column("metric", width=130, anchor="w", stretch=False)
+        metrics_tree.column("value", width=140, anchor="w", stretch=False)
+        metrics_tree.column("definition", width=300, anchor="w", stretch=True)
+        metrics_tree.grid(row=0, column=0, sticky="ew")
+        self._mtf_curve_metrics_tree = metrics_tree
+        ttk.Label(summary_group_right, textvariable=self._mtf_graph_status_var).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(summary_group_right, textvariable=self._mtf_esf_status_var).grid(row=2, column=0, sticky="w")
+        ttk.Label(summary_group_right, textvariable=self._mtf_lsf_status_var).grid(row=3, column=0, sticky="w")
         controls_row = ttk.Frame(graph_group)
         controls_row.grid(row=2, column=0, sticky="e", pady=(6, 0))
         ttk.Button(controls_row, text="Copy Graph", command=self._copy_active_mtf_curve_graph).grid(row=0, column=0, padx=(0, 6))
@@ -1346,6 +1353,7 @@ class DicomViewer:
         self._refresh_mtf_warning_text_widget()
         last_run = self._select_analysis_last_run("mtf") or {}
         result = dict(last_run.get("result") or {})
+        self._rebuild_curve_metrics_for_active_tab()
         if not result:
             self._schedule_mtf_graph_redraw()
             return
@@ -1409,6 +1417,8 @@ class DicomViewer:
         self._schedule_mtf_graph_redraw()
 
     def _on_mtf_curve_tab_changed(self, _event: tk.Event | None = None) -> None:
+        self._mtf_active_curve_tab_key = self._get_active_mtf_curve_tab_key()
+        self._rebuild_curve_metrics_for_active_tab()
         self._schedule_mtf_graph_redraw()
 
     def _schedule_mtf_graph_redraw(self) -> None:
@@ -3638,7 +3648,7 @@ class DicomViewer:
         self._render_xy_curve(self._mtf_esf_canvas, self._last_esf_curve_payload, "ESF", "x")
         self._render_xy_curve(self._mtf_lsf_canvas, self._last_lsf_curve_payload, "LSF", "x")
         self._update_mtf_esf_lsf_summary(self._last_esf_curve_payload, self._last_lsf_curve_payload)
-        self._update_mtf_curve_interpretation(mtf_result)
+        self._rebuild_curve_metrics_for_active_tab()
         self._schedule_mtf_graph_redraw()
 
     def _refresh_mtf_warning_text_widget(self) -> None:
@@ -3830,56 +3840,61 @@ class DicomViewer:
         self._mtf_esf_status_var.set(self._format_curve_summary("ESF", esf_curve))
         self._mtf_lsf_status_var.set(self._format_curve_summary("LSF", lsf_curve))
 
-    def _update_mtf_curve_interpretation(self, mtf_result: dict[str, Any]) -> None:
-        reason_codes = [str(code).strip() for code in (mtf_result.get("reason_codes") or []) if str(code).strip()]
-        reason_set = set(reason_codes)
+    def _rebuild_curve_metrics_for_active_tab(self) -> None:
+        tree = getattr(self, "_mtf_curve_metrics_tree", None)
+        if tree is None:
+            return
+        for item_id in tree.get_children():
+            tree.delete(item_id)
+        tab_key = self._get_active_mtf_curve_tab_key()
+        if tab_key == "esf":
+            rows = self._build_esf_curve_metric_rows()
+        elif tab_key == "lsf":
+            rows = self._build_lsf_curve_metric_rows()
+        else:
+            rows = self._build_mtf_curve_metric_rows()
+        for row in rows:
+            tree.insert("", "end", values=(row[0], row[1], row[2]))
+
+    def _get_active_mtf_curve_tab_key(self) -> str:
+        notebook = getattr(self, "_mtf_curve_notebook", None)
+        if notebook is None:
+            return "mtf"
+        try:
+            selected = notebook.select()
+        except Exception:
+            return "mtf"
+        return self._mtf_curve_tab_ids.get(str(selected), "mtf")
+
+    @staticmethod
+    def _metric_value_text(value: Any, unit: str = "", digits: int = 4, na_reason: str = "") -> str:
+        if isinstance(value, (int, float)) and np.isfinite(float(value)):
+            suffix = f" {unit}".rstrip() if unit else ""
+            return f"{float(value):.{digits}f}{suffix}" if digits > 0 else f"{int(round(float(value)))}{suffix}"
+        reason = f" ({na_reason})" if na_reason else ""
+        return f"N/A{reason}"
+
+    def _build_mtf_curve_metric_rows(self) -> list[tuple[str, str, str]]:
+        mtf_result = getattr(self, "_last_mtf_result", {}) or {}
         key_metrics = mtf_result.get("key_mtf_metrics") or {}
-        mtf50 = key_metrics.get("mtf50")
-        mtf10 = key_metrics.get("mtf10")
-        nyquist = key_metrics.get("nyquist_mtf")
-        edge_snr = mtf_result.get("edge_snr")
-        qa_grade = str(mtf_result.get("qa_grade", "")).strip().upper()
-        iec_compliance = str(mtf_result.get("iec_compliance", "")).strip().lower()
-
-        lines: list[str] = []
-        if "NONMONOTONIC_TAIL" in reason_set:
-            lines.append("MTF 곡선은 단조 감소하지 않는 비정상적인 형태를 보이며, 노이즈 또는 aliasing 영향 가능성이 있습니다.")
-        else:
-            lines.append("MTF 곡선은 전반적으로 특이한 비정상 형태 없이 해석됩니다.")
-
-        if all(isinstance(v, (int, float)) for v in (mtf50, mtf10, nyquist)):
-            lines.append(
-                f"MTF50={float(mtf50):.4f}, MTF10={float(mtf10):.4f}, Nyquist MTF={float(nyquist):.4f}이며, 이 값들은 동일 조건 내 상대 비교 지표로 해석해야 합니다."
-            )
-
-        noise_interpretations = []
-        if "POSSIBLE_ALIASING" in reason_set:
-            noise_interpretations.append("aliasing 가능성이 있습니다.")
-        if "HIGH_FREQUENCY_NOISE_BIAS_RISK" in reason_set:
-            noise_interpretations.append("고주파 노이즈 영향 가능성이 있습니다.")
-        if "RESULT_QUESTIONABLE" in reason_set:
-            noise_interpretations.append("결과 신뢰도가 낮을 수 있습니다.")
-        optional_line_parts: list[str] = []
-        if noise_interpretations:
-            optional_line_parts.append(" ".join(noise_interpretations))
-        if "EDGE_SNR_LOW" in reason_set:
-            optional_line_parts.append("Edge SNR이 낮아 측정 결과의 신뢰도가 저하될 수 있습니다.")
-        elif isinstance(edge_snr, (int, float)):
-            optional_line_parts.append(f"Edge SNR={float(edge_snr):.2f}로 표시됩니다.")
-        if optional_line_parts:
-            lines.append(" ".join(optional_line_parts))
-
-        lines.extend(self._build_esf_numeric_interpretation(self._last_esf_curve_payload))
-        lines.extend(self._build_lsf_numeric_interpretation(self._last_lsf_curve_payload))
-
-        if qa_grade == "D" or "RESULT_QUESTIONABLE" in reason_set or "EDGE_SNR_LOW" in reason_set:
-            lines.append("종합적으로 노이즈 영향, 낮은 Edge SNR 또는 곡선 비정상 형태로 인해 결과 해석에 주의가 필요합니다.")
-        elif iec_compliance == "compliant":
-            lines.append("곡선 형태와 edge 품질이 안정적이며, 결과 신뢰도는 비교적 양호한 편입니다.")
-        else:
-            lines.append("일부 조건에서 해석에 주의가 필요한 결과로 판단됩니다.")
-
-        self._mtf_curve_interpretation_var.set("\n".join(lines[:12]))
+        frequency_unit = self._resolve_mtf_frequency_unit(mtf_result)
+        nyquist_freq = key_metrics.get("nyquist_frequency_lp_per_mm")
+        if not isinstance(nyquist_freq, (int, float)):
+            nyquist_freq = key_metrics.get("nyquist_frequency_cy_per_pixel")
+        rows = [
+            ("MTF50", self._metric_value_text(key_metrics.get("mtf50"), frequency_unit), "f where MTF = 0.5"),
+            ("MTF10", self._metric_value_text(key_metrics.get("mtf10"), frequency_unit), "f where MTF = 0.1"),
+            ("Nyquist MTF", self._metric_value_text(key_metrics.get("nyquist_mtf"), "", digits=4), "MTF at f_Nyquist"),
+            (
+                "Nyquist frequency",
+                self._metric_value_text(nyquist_freq, frequency_unit, na_reason="no spacing"),
+                "f_Nyquist = 1 / (2 × pixel spacing)",
+            ),
+            ("Edge SNR", self._metric_value_text(mtf_result.get("edge_snr"), "", digits=2), "edge contrast / noise"),
+            ("IEC Compliance", str(mtf_result.get("iec_compliance") or "N/A"), "IEC rule-based result"),
+            ("QA Grade", str(mtf_result.get("qa_grade") or "N/A"), "summary quality grade"),
+        ]
+        return rows
 
     @staticmethod
     def _curve_finite_stats(curve: dict[str, Any]) -> tuple[float | None, float | None, int]:
@@ -3891,36 +3906,165 @@ class DicomViewer:
             return (None, None, 0)
         return (float(np.min(finite)), float(np.max(finite)), int(finite.size))
 
-    def _build_esf_numeric_interpretation(self, curve: dict[str, Any]) -> list[str]:
+    def _build_esf_curve_metric_rows(self) -> list[tuple[str, str, str]]:
+        curve = self._last_esf_curve_payload
+        x, y = self._curve_xy_finite(curve)
+        x_unit = self._resolve_curve_x_unit(curve)
         esf_min, esf_max, esf_points = self._curve_finite_stats(curve)
-        if esf_min is None or esf_max is None or esf_points <= 0:
-            return ["ESF는 현재 데이터에서 계산되지 않아 수치 기반 해석을 제공할 수 없습니다."]
-
-        esf_range = esf_max - esf_min
+        delta_i = (esf_max - esf_min) if isinstance(esf_min, float) and isinstance(esf_max, float) else None
+        i50 = (esf_min + 0.5 * delta_i) if isinstance(esf_min, float) and isinstance(delta_i, float) else None
+        w10_90, w10_90_reason = self._compute_esf_transition_width(x, y, 0.1, 0.9)
+        w20_80, w20_80_reason = self._compute_esf_transition_width(x, y, 0.2, 0.8)
         return [
-            f"ESF는 {esf_min:.2f} ~ {esf_max:.2f} 범위를 가지며,\n총 {esf_points}개의 샘플로 구성됩니다.",
-            f"전체 신호 변화 폭은 약 {esf_range:.2f}로,\nedge transition에서의 intensity 변화 규모를 반영합니다.",
-            "이 값은 edge 대비(contrast) 규모를 간접적으로 보여주는 참고 정보로 활용될 수 있습니다.",
-            "단, noise나 outlier의 영향을 받을 수 있으므로 절대적인 품질 기준으로 해석하지 않습니다.",
+            ("Sample count", self._metric_value_text(esf_points, "samples", digits=0, na_reason="missing data"), "number of ESF samples"),
+            ("Min", self._metric_value_text(esf_min, "", digits=4, na_reason="missing data"), "minimum ESF value"),
+            ("Max", self._metric_value_text(esf_max, "", digits=4, na_reason="missing data"), "maximum ESF value"),
+            ("Contrast (ΔI)", self._metric_value_text(delta_i, "", digits=4, na_reason="missing data"), "ΔI = I_max - I_min"),
+            ("Center level (I50)", self._metric_value_text(i50, "", digits=4, na_reason="missing data"), "I50 = I_min + 0.5 × ΔI"),
+            ("10–90% width", self._metric_value_text(w10_90, x_unit, digits=4, na_reason=w10_90_reason), "W10-90 = x90 - x10"),
+            ("20–80% width", self._metric_value_text(w20_80, x_unit, digits=4, na_reason=w20_80_reason), "W20-80 = x80 - x20"),
         ]
 
-    def _build_lsf_numeric_interpretation(self, curve: dict[str, Any]) -> list[str]:
+    def _build_lsf_curve_metric_rows(self) -> list[tuple[str, str, str]]:
+        curve = self._last_lsf_curve_payload
+        x, y = self._curve_xy_finite(curve)
+        x_unit = self._resolve_curve_x_unit(curve)
         lsf_min, lsf_max, lsf_points = self._curve_finite_stats(curve)
-        if lsf_min is None or lsf_max is None or lsf_points <= 0:
-            return ["LSF는 현재 데이터에서 계산되지 않아 수치 기반 해석을 제공할 수 없습니다."]
-
-        lsf_max_abs = max(abs(lsf_min), abs(lsf_max))
+        peak_amplitude, peak_position, peak_reason = self._compute_lsf_peak(x, y)
+        fwhm, fwhm_reason = self._compute_lsf_fwhm(x, y, peak_amplitude)
+        centroid, centroid_reason = self._compute_lsf_centroid(x, y)
+        area, area_reason = self._compute_lsf_area(x, y)
         return [
-            f"LSF는 {lsf_min:.2f} ~ {lsf_max:.2f} 범위를 가지며,\n총 {lsf_points}개의 샘플로 구성됩니다.",
-            f"관측된 최대 절대값 수준은 약 {lsf_max_abs:.2f}이며,\n이는 edge에서의 공간적 변화 강도를 참고적으로 보여줍니다.",
-            "LSF 범위와 최대 절대값 수준은 edge 주변 신호 변화 규모를 해석하는 참고 정보입니다.",
-            "단, ringing, symmetry, sharpness 등의 정량적 평가는 추가 계산 없이 단정할 수 없습니다.",
+            ("Sample count", self._metric_value_text(lsf_points, "samples", digits=0, na_reason="missing data"), "number of LSF samples"),
+            ("Min", self._metric_value_text(lsf_min, "", digits=4, na_reason="missing data"), "minimum LSF value"),
+            ("Max", self._metric_value_text(lsf_max, "", digits=4, na_reason="missing data"), "maximum LSF value"),
+            ("Peak amplitude", self._metric_value_text(peak_amplitude, "", digits=4, na_reason=peak_reason), "max(|LSF|)"),
+            ("Peak position", self._metric_value_text(peak_position, x_unit, digits=4, na_reason=peak_reason), "x at peak amplitude"),
+            ("FWHM", self._metric_value_text(fwhm, x_unit, digits=4, na_reason=fwhm_reason), "width at 50% of peak amplitude"),
+            ("Centroid", self._metric_value_text(centroid, x_unit, digits=4, na_reason=centroid_reason), "Σ(x·|LSF|) / Σ(|LSF|)"),
+            ("Area", self._metric_value_text(area, x_unit, digits=4, na_reason=area_reason), "ΣLSF or ∫LSF dx"),
         ]
 
     @staticmethod
     def _curve_has_finite_data(curve: dict[str, Any]) -> bool:
         y = np.asarray(curve.get("y", []), dtype=np.float64)
         return bool(y.size > 0 and np.isfinite(y).any())
+
+    def _curve_xy_finite(self, curve: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+        x = np.asarray(curve.get("x", []), dtype=np.float64)
+        y = np.asarray(curve.get("y", []), dtype=np.float64)
+        if x.size == 0 or y.size == 0:
+            return np.asarray([], dtype=np.float64), np.asarray([], dtype=np.float64)
+        n = min(x.size, y.size)
+        x = x[:n]
+        y = y[:n]
+        finite_mask = np.isfinite(x) & np.isfinite(y)
+        return x[finite_mask], y[finite_mask]
+
+    def _resolve_curve_x_unit(self, curve: dict[str, Any]) -> str:
+        unit = str(curve.get("x_unit") or "").strip()
+        if unit:
+            return unit
+        spacing = self._get_pixel_spacing_mm()
+        if spacing is not None:
+            return "mm"
+        return "px"
+
+    @staticmethod
+    def _interpolate_crossing_x(x0: float, y0: float, x1: float, y1: float, target: float) -> float | None:
+        dy = y1 - y0
+        if abs(dy) < 1e-12:
+            return None
+        t = (target - y0) / dy
+        if t < 0 or t > 1:
+            return None
+        return x0 + t * (x1 - x0)
+
+    def _compute_esf_transition_width(self, x: np.ndarray, y: np.ndarray, lo: float, hi: float) -> tuple[float | None, str]:
+        if x.size < 2 or y.size < 2:
+            return None, "missing data"
+        y_min = float(np.min(y))
+        y_max = float(np.max(y))
+        delta = y_max - y_min
+        if not np.isfinite(delta) or delta <= 0:
+            return None, "no contrast"
+        t_lo = y_min + lo * delta
+        t_hi = y_min + hi * delta
+        x_lo = self._find_curve_crossing(x, y, t_lo)
+        x_hi = self._find_curve_crossing(x, y, t_hi)
+        if x_lo is None or x_hi is None:
+            return None, "no crossing"
+        width = abs(float(x_hi - x_lo))
+        return (width, "") if np.isfinite(width) else (None, "unstable")
+
+    def _find_curve_crossing(self, x: np.ndarray, y: np.ndarray, target: float) -> float | None:
+        for idx in range(len(x) - 1):
+            y0 = float(y[idx])
+            y1 = float(y[idx + 1])
+            if (y0 - target) == 0:
+                return float(x[idx])
+            if (y0 - target) * (y1 - target) > 0:
+                continue
+            result = self._interpolate_crossing_x(float(x[idx]), y0, float(x[idx + 1]), y1, target)
+            if result is not None:
+                return float(result)
+        return None
+
+    def _compute_lsf_peak(self, x: np.ndarray, y: np.ndarray) -> tuple[float | None, float | None, str]:
+        if x.size == 0 or y.size == 0:
+            return None, None, "missing data"
+        abs_y = np.abs(y)
+        if abs_y.size == 0 or not np.isfinite(abs_y).any():
+            return None, None, "missing data"
+        idx = int(np.nanargmax(abs_y))
+        peak = float(abs_y[idx])
+        pos = float(x[idx]) if idx < x.size else None
+        if not np.isfinite(peak) or peak <= 0:
+            return None, None, "unstable"
+        return peak, pos, ""
+
+    def _compute_lsf_fwhm(self, x: np.ndarray, y: np.ndarray, peak_amplitude: float | None) -> tuple[float | None, str]:
+        if x.size < 2 or y.size < 2 or not isinstance(peak_amplitude, float) or peak_amplitude <= 0:
+            return None, "missing data"
+        half = 0.5 * peak_amplitude
+        abs_y = np.abs(y)
+        indices = np.where(abs_y >= half)[0]
+        if indices.size == 0:
+            return None, "no crossing"
+        left = indices[0]
+        right = indices[-1]
+        left_cross = float(x[left])
+        right_cross = float(x[right])
+        if left > 0:
+            candidate = self._interpolate_crossing_x(float(x[left - 1]), float(abs_y[left - 1]), float(x[left]), float(abs_y[left]), half)
+            if candidate is not None:
+                left_cross = float(candidate)
+        if right < (len(x) - 1):
+            candidate = self._interpolate_crossing_x(float(x[right]), float(abs_y[right]), float(x[right + 1]), float(abs_y[right + 1]), half)
+            if candidate is not None:
+                right_cross = float(candidate)
+        width = abs(right_cross - left_cross)
+        return (width, "") if np.isfinite(width) else (None, "unstable")
+
+    def _compute_lsf_centroid(self, x: np.ndarray, y: np.ndarray) -> tuple[float | None, str]:
+        if x.size == 0 or y.size == 0:
+            return None, "missing data"
+        abs_y = np.abs(y)
+        denom = float(np.sum(abs_y))
+        if not np.isfinite(denom) or denom <= 0:
+            return None, "zero denominator"
+        numer = float(np.sum(x * abs_y))
+        centroid = numer / denom
+        return (centroid, "") if np.isfinite(centroid) else (None, "unstable")
+
+    def _compute_lsf_area(self, x: np.ndarray, y: np.ndarray) -> tuple[float | None, str]:
+        if x.size == 0 or y.size == 0:
+            return None, "missing data"
+        if x.size >= 2:
+            area = float(np.trapezoid(y, x))
+        else:
+            area = float(np.sum(y))
+        return (area, "") if np.isfinite(area) else (None, "unstable")
 
     @staticmethod
     def _format_curve_summary(label: str, curve: dict[str, Any]) -> str:
