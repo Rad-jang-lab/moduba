@@ -411,7 +411,8 @@ class DicomViewer:
         self._last_esf_curve_payload: dict[str, Any] = {}
         self._last_lsf_curve_payload: dict[str, Any] = {}
         self._last_mtf_result: dict[str, Any] = {}
-        self._mtf_graph_status_var = tk.StringVar(value="MTF Curve: no result")
+        self._mtf_curve_interpretation_var = tk.StringVar(value="결과가 없어서 곡선 해석을 제공할 수 없습니다.")
+        self._mtf_graph_status_var = tk.StringVar(value="MTF curve: no result")
         self._mtf_esf_status_var = tk.StringVar(value="ESF: 결과 없음")
         self._mtf_lsf_status_var = tk.StringVar(value="LSF: 결과 없음")
         self._mtf_warning_popup_message: str = "[검증 결과]\n- 검증: -\n- 계산 유효성: -\n- IEC: -\n- QA 등급: -"
@@ -1310,11 +1311,20 @@ class DicomViewer:
                 self._mtf_esf_canvas = canvas
             else:
                 self._mtf_lsf_canvas = canvas
-        summary_group_right = ttk.LabelFrame(graph_group, text="Curve Summary", padding=(6, 4))
+        summary_group_right = ttk.LabelFrame(graph_group, text="Curve Interpretation", padding=(6, 4))
         summary_group_right.grid(row=1, column=0, sticky="ew", pady=(6, 0))
-        ttk.Label(summary_group_right, textvariable=self._mtf_graph_status_var).grid(row=0, column=0, sticky="w")
-        ttk.Label(summary_group_right, textvariable=self._mtf_esf_status_var).grid(row=1, column=0, sticky="w")
-        ttk.Label(summary_group_right, textvariable=self._mtf_lsf_status_var).grid(row=2, column=0, sticky="w")
+        summary_group_right.grid_columnconfigure(0, weight=1)
+        ttk.Label(
+            summary_group_right,
+            textvariable=self._mtf_curve_interpretation_var,
+            justify="left",
+            wraplength=420,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Separator(summary_group_right, orient="horizontal").grid(row=1, column=0, sticky="ew", pady=(6, 4))
+        ttk.Label(summary_group_right, text="[Data details]").grid(row=2, column=0, sticky="w")
+        ttk.Label(summary_group_right, textvariable=self._mtf_graph_status_var).grid(row=3, column=0, sticky="w")
+        ttk.Label(summary_group_right, textvariable=self._mtf_esf_status_var).grid(row=4, column=0, sticky="w")
+        ttk.Label(summary_group_right, textvariable=self._mtf_lsf_status_var).grid(row=5, column=0, sticky="w")
         controls_row = ttk.Frame(graph_group)
         controls_row.grid(row=2, column=0, sticky="e", pady=(6, 0))
         ttk.Button(controls_row, text="Copy Graph", command=self._copy_active_mtf_curve_graph).grid(row=0, column=0, padx=(0, 6))
@@ -3628,6 +3638,7 @@ class DicomViewer:
         self._render_xy_curve(self._mtf_esf_canvas, self._last_esf_curve_payload, "ESF", "x")
         self._render_xy_curve(self._mtf_lsf_canvas, self._last_lsf_curve_payload, "LSF", "x")
         self._update_mtf_esf_lsf_summary(self._last_esf_curve_payload, self._last_lsf_curve_payload)
+        self._update_mtf_curve_interpretation(mtf_result)
         self._schedule_mtf_graph_redraw()
 
     def _refresh_mtf_warning_text_widget(self) -> None:
@@ -3819,6 +3830,69 @@ class DicomViewer:
         self._mtf_esf_status_var.set(self._format_curve_summary("ESF", esf_curve))
         self._mtf_lsf_status_var.set(self._format_curve_summary("LSF", lsf_curve))
 
+    def _update_mtf_curve_interpretation(self, mtf_result: dict[str, Any]) -> None:
+        reason_codes = [str(code).strip() for code in (mtf_result.get("reason_codes") or []) if str(code).strip()]
+        reason_set = set(reason_codes)
+        key_metrics = mtf_result.get("key_mtf_metrics") or {}
+        mtf50 = key_metrics.get("mtf50")
+        mtf10 = key_metrics.get("mtf10")
+        nyquist = key_metrics.get("nyquist_mtf")
+        edge_snr = mtf_result.get("edge_snr")
+        qa_grade = str(mtf_result.get("qa_grade", "")).strip().upper()
+        iec_compliance = str(mtf_result.get("iec_compliance", "")).strip().lower()
+
+        lines: list[str] = []
+        if "NONMONOTONIC_TAIL" in reason_set:
+            lines.append("MTF 곡선은 단조 감소하지 않는 비정상적인 형태를 보이며, 노이즈 또는 aliasing 영향 가능성이 있습니다.")
+        else:
+            lines.append("MTF 곡선은 전반적으로 특이한 비정상 형태 없이 해석됩니다.")
+
+        if all(isinstance(v, (int, float)) for v in (mtf50, mtf10, nyquist)):
+            lines.append(
+                f"MTF50={float(mtf50):.4f}, MTF10={float(mtf10):.4f}, Nyquist MTF={float(nyquist):.4f}이며, 이 값들은 동일 조건 내 상대 비교 지표로 해석해야 합니다."
+            )
+
+        noise_interpretations = []
+        if "POSSIBLE_ALIASING" in reason_set:
+            noise_interpretations.append("aliasing 가능성이 있습니다.")
+        if "HIGH_FREQUENCY_NOISE_BIAS_RISK" in reason_set:
+            noise_interpretations.append("고주파 노이즈 영향 가능성이 있습니다.")
+        if "RESULT_QUESTIONABLE" in reason_set:
+            noise_interpretations.append("결과 신뢰도가 낮을 수 있습니다.")
+        optional_line_parts: list[str] = []
+        if noise_interpretations:
+            optional_line_parts.append(" ".join(noise_interpretations))
+        if "EDGE_SNR_LOW" in reason_set:
+            optional_line_parts.append("Edge SNR이 낮아 측정 결과의 신뢰도가 저하될 수 있습니다.")
+        elif isinstance(edge_snr, (int, float)):
+            optional_line_parts.append(f"Edge SNR={float(edge_snr):.2f}로 표시됩니다.")
+        if optional_line_parts:
+            lines.append(" ".join(optional_line_parts))
+
+        if self._curve_has_finite_data(self._last_esf_curve_payload):
+            lines.append("ESF는 edge transition의 신호 변화를 나타내며, edge 품질과 transition 특성을 확인하는 데 사용됩니다.")
+        else:
+            lines.append("ESF는 현재 데이터에서 계산되지 않아 상세 해석을 제공할 수 없습니다.")
+
+        if self._curve_has_finite_data(self._last_lsf_curve_payload):
+            lines.append("LSF는 ESF의 미분 기반 곡선으로, edge sharpness와 고주파 응답 특성을 확인하는 데 사용됩니다.")
+        else:
+            lines.append("LSF는 현재 데이터에서 계산되지 않아 상세 해석을 제공할 수 없습니다.")
+
+        if qa_grade == "D" or "RESULT_QUESTIONABLE" in reason_set or "EDGE_SNR_LOW" in reason_set:
+            lines.append("종합적으로 노이즈 영향, 낮은 Edge SNR 또는 곡선 비정상 형태로 인해 결과 해석에 주의가 필요합니다.")
+        elif iec_compliance == "compliant":
+            lines.append("곡선 형태와 edge 품질이 안정적이며, 결과 신뢰도는 비교적 양호한 편입니다.")
+        else:
+            lines.append("일부 조건에서 해석에 주의가 필요한 결과로 판단됩니다.")
+
+        self._mtf_curve_interpretation_var.set("\n".join(lines[:6]))
+
+    @staticmethod
+    def _curve_has_finite_data(curve: dict[str, Any]) -> bool:
+        y = np.asarray(curve.get("y", []), dtype=np.float64)
+        return bool(y.size > 0 and np.isfinite(y).any())
+
     @staticmethod
     def _format_curve_summary(label: str, curve: dict[str, Any]) -> str:
         y = np.asarray(curve.get("y", []), dtype=np.float64)
@@ -3845,13 +3919,13 @@ class DicomViewer:
         freqs = np.asarray(mtf_curve.get("frequency_cy_per_pixel", []), dtype=np.float64)
         mtf = np.asarray(mtf_curve.get("mtf", []), dtype=np.float64)
         if freqs.size < 2 or mtf.size < 2 or freqs.size != mtf.size:
-            self._mtf_graph_status_var.set("MTF Curve: unavailable")
+            self._mtf_graph_status_var.set("MTF curve: unavailable")
             return
         finite = np.isfinite(freqs) & np.isfinite(mtf)
         freqs = freqs[finite]
         mtf = mtf[finite]
         if freqs.size < 2:
-            self._mtf_graph_status_var.set("MTF Curve: unavailable")
+            self._mtf_graph_status_var.set("MTF curve: unavailable")
             return
         xmax = float(np.max(freqs))
         xmax = xmax if xmax > 0 else 1.0
@@ -3878,7 +3952,7 @@ class DicomViewer:
         self._render_mtf_legend(canvas, width=width, pad_t=pad_t, include_nyquist=show_nyquist_legend)
         canvas.create_text(pad_l + plot_w / 2, height - 10, text="Frequency (cy/pixel)", fill="#334155")
         canvas.create_text(12, pad_t + plot_h / 2, text="MTF", fill="#334155", angle=90)
-        self._mtf_graph_status_var.set(f"MTF Curve: {freqs.size} points")
+        self._mtf_graph_status_var.set(f"MTF curve: {freqs.size} points")
 
     @staticmethod
     def _is_finite_number(value: Any) -> bool:
