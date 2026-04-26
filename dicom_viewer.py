@@ -3869,15 +3869,8 @@ class DicomViewer:
         if optional_line_parts:
             lines.append(" ".join(optional_line_parts))
 
-        if self._curve_has_finite_data(self._last_esf_curve_payload):
-            lines.append("ESF는 edge transition의 신호 변화를 나타내며, edge 품질과 transition 특성을 확인하는 데 사용됩니다.")
-        else:
-            lines.append("ESF는 현재 데이터에서 계산되지 않아 상세 해석을 제공할 수 없습니다.")
-
-        if self._curve_has_finite_data(self._last_lsf_curve_payload):
-            lines.append("LSF는 ESF의 미분 기반 곡선으로, edge sharpness와 고주파 응답 특성을 확인하는 데 사용됩니다.")
-        else:
-            lines.append("LSF는 현재 데이터에서 계산되지 않아 상세 해석을 제공할 수 없습니다.")
+        lines.extend(self._build_esf_numeric_interpretation(self._last_esf_curve_payload))
+        lines.extend(self._build_lsf_numeric_interpretation(self._last_lsf_curve_payload))
 
         if qa_grade == "D" or "RESULT_QUESTIONABLE" in reason_set or "EDGE_SNR_LOW" in reason_set:
             lines.append("종합적으로 노이즈 영향, 낮은 Edge SNR 또는 곡선 비정상 형태로 인해 결과 해석에 주의가 필요합니다.")
@@ -3886,7 +3879,43 @@ class DicomViewer:
         else:
             lines.append("일부 조건에서 해석에 주의가 필요한 결과로 판단됩니다.")
 
-        self._mtf_curve_interpretation_var.set("\n".join(lines[:6]))
+        self._mtf_curve_interpretation_var.set("\n".join(lines[:12]))
+
+    @staticmethod
+    def _curve_finite_stats(curve: dict[str, Any]) -> tuple[float | None, float | None, int]:
+        y = np.asarray(curve.get("y", []), dtype=np.float64)
+        if y.size == 0:
+            return (None, None, 0)
+        finite = y[np.isfinite(y)]
+        if finite.size == 0:
+            return (None, None, 0)
+        return (float(np.min(finite)), float(np.max(finite)), int(finite.size))
+
+    def _build_esf_numeric_interpretation(self, curve: dict[str, Any]) -> list[str]:
+        esf_min, esf_max, esf_points = self._curve_finite_stats(curve)
+        if esf_min is None or esf_max is None or esf_points <= 0:
+            return ["ESF는 현재 데이터에서 계산되지 않아 수치 기반 해석을 제공할 수 없습니다."]
+
+        esf_range = esf_max - esf_min
+        return [
+            f"ESF는 {esf_min:.2f} ~ {esf_max:.2f} 범위를 가지며,\n총 {esf_points}개의 샘플로 구성됩니다.",
+            f"전체 신호 변화 폭은 약 {esf_range:.2f}로,\nedge transition에서의 intensity 변화 규모를 반영합니다.",
+            "이 값은 edge 대비(contrast) 규모를 간접적으로 보여주는 참고 정보로 활용될 수 있습니다.",
+            "단, noise나 outlier의 영향을 받을 수 있으므로 절대적인 품질 기준으로 해석하지 않습니다.",
+        ]
+
+    def _build_lsf_numeric_interpretation(self, curve: dict[str, Any]) -> list[str]:
+        lsf_min, lsf_max, lsf_points = self._curve_finite_stats(curve)
+        if lsf_min is None or lsf_max is None or lsf_points <= 0:
+            return ["LSF는 현재 데이터에서 계산되지 않아 수치 기반 해석을 제공할 수 없습니다."]
+
+        lsf_max_abs = max(abs(lsf_min), abs(lsf_max))
+        return [
+            f"LSF는 {lsf_min:.2f} ~ {lsf_max:.2f} 범위를 가지며,\n총 {lsf_points}개의 샘플로 구성됩니다.",
+            f"관측된 최대 절대값 수준은 약 {lsf_max_abs:.2f}이며,\n이는 edge에서의 공간적 변화 강도를 참고적으로 보여줍니다.",
+            "LSF 범위와 최대 절대값 수준은 edge 주변 신호 변화 규모를 해석하는 참고 정보입니다.",
+            "단, ringing, symmetry, sharpness 등의 정량적 평가는 추가 계산 없이 단정할 수 없습니다.",
+        ]
 
     @staticmethod
     def _curve_has_finite_data(curve: dict[str, Any]) -> bool:
