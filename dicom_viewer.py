@@ -1473,12 +1473,12 @@ class DicomViewer:
         panel.pack(side="left", padx=(0, 8), fill="both", expand=True)
         header = ttk.Frame(panel)
         header.grid(row=0, column=0, sticky="ew", columnspan=2)
-        header.columnconfigure(0, weight=0, minsize=220)
-        header.columnconfigure(1, weight=0, minsize=180)
-        header.columnconfigure(2, weight=1, minsize=300)
-        ttk.Label(header, text="Item", anchor="w").grid(row=0, column=0, sticky="ew", padx=(2, 8))
-        ttk.Label(header, text="Value", anchor="w").grid(row=0, column=1, sticky="ew", padx=(0, 8))
-        ttk.Label(header, text="Note", anchor="w").grid(row=0, column=2, sticky="ew")
+        header.columnconfigure(0, weight=1, minsize=340)
+        header.columnconfigure(1, weight=0, minsize=190)
+        header.columnconfigure(2, weight=0, minsize=130)
+        ttk.Label(header, text="ROI / Analysis / Metric", anchor="w").grid(row=0, column=0, sticky="ew", padx=(2, 8))
+        ttk.Label(header, text="Result", anchor="w").grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        ttk.Label(header, text="Status / Remark", anchor="w").grid(row=0, column=2, sticky="ew")
 
         canvas = tk.Canvas(
             panel,
@@ -4648,51 +4648,133 @@ class DicomViewer:
 
     @staticmethod
     def _group_analysis_rows_for_panel(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        metric_rows: list[dict[str, Any]] = []
-        snapshot_rows: list[dict[str, Any]] = []
-        for row in rows:
+        def _normalize_analysis_name(value: str) -> str:
+            if not value:
+                return ""
+            normalized = value.strip()
+            if not normalized:
+                return ""
+            lowered = normalized.lower()
+            if "mtf" in lowered:
+                return "MTF"
+            if "snr" in lowered:
+                return "SNR"
+            if "cnr" in lowered:
+                return "CNR"
+            if "uniform" in lowered:
+                return "Uniformity"
+            if "line" in lowered or "profile" in lowered:
+                return "Line Profile"
+            return normalized
+
+        def _resolve_analysis_type(row: dict[str, Any]) -> str:
+            candidates = [
+                row.get("analysis_type"),
+                row.get("category"),
+                row.get("source"),
+                row.get("metric_name"),
+                row.get("item_name"),
+            ]
+            for raw in candidates:
+                text = _normalize_analysis_name(str(raw or ""))
+                if text:
+                    return text
+            return ""
+
+        def _resolve_roi_label(row: dict[str, Any]) -> str:
+            roi_ids = [str(item).strip() for item in (row.get("roi_ids") or []) if str(item).strip()]
+            if roi_ids:
+                return ", ".join(roi_ids)
             metric_name = str(row.get("metric_name", "")).upper()
             if metric_name == "ROI_STATS":
-                snapshot_rows.append(row)
-            else:
-                metric_rows.append(row)
+                item_name = str(row.get("item_name", "")).strip()
+                if item_name:
+                    return item_name
+            return ""
+
+        analysis_priority = {
+            "MTF": 0,
+            "SNR": 1,
+            "CNR": 2,
+            "Uniformity": 3,
+            "Line Profile": 4,
+            "Other": 5,
+        }
+
+        normalized_rows: list[dict[str, Any]] = []
+        for row in rows:
+            merged = dict(row)
+            analysis_type = _resolve_analysis_type(merged)
+            roi_label = _resolve_roi_label(merged)
+            if not roi_label:
+                roi_label = "ROI 1" if len(rows) == 1 else "ROI Unknown"
+            if not analysis_type:
+                return [{**dict(item), "category": "METRIC_FLAT"} for item in rows]
+            analysis_type = _normalize_analysis_name(analysis_type)
+            if not analysis_type:
+                return [{**dict(item), "category": "METRIC_FLAT"} for item in rows]
+            merged["resolved_roi_label"] = roi_label
+            merged["resolved_analysis_type"] = analysis_type if analysis_type in analysis_priority else (analysis_type or "Other")
+            normalized_rows.append(merged)
+
+        if any(not row.get("resolved_roi_label") for row in normalized_rows):
+            return [{**dict(item), "category": "METRIC_FLAT"} for item in rows]
+        if any(not row.get("resolved_analysis_type") for row in normalized_rows):
+            return [{**dict(item), "category": "METRIC_FLAT"} for item in rows]
+
+        grouped: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        roi_order: list[str] = []
+        for row in normalized_rows:
+            roi_key = str(row["resolved_roi_label"])
+            analysis_type = str(row["resolved_analysis_type"])
+            if analysis_type not in analysis_priority:
+                analysis_type = "Other"
+            if roi_key not in grouped:
+                grouped[roi_key] = {}
+                roi_order.append(roi_key)
+            grouped[roi_key].setdefault(analysis_type, []).append(row)
 
         ordered: list[dict[str, Any]] = []
-        if metric_rows:
-            ordered.append(
-                {
-                    "category": "SECTION",
-                    "metric_name": "Results",
-                    "formula_mode": "",
-                    "roi_ids": [],
-                    "roles": [],
-                    "stats": {},
-                    "result_value": None,
-                    "result_text": "",
-                }
-            )
-            for row in metric_rows:
-                merged = dict(row)
-                merged["category"] = "METRIC"
-                ordered.append(merged)
-        if snapshot_rows:
-            ordered.append(
-                {
-                    "category": "SECTION",
-                    "metric_name": "ROI Stats",
-                    "formula_mode": "",
-                    "roi_ids": [],
-                    "roles": [],
-                    "stats": {},
-                    "result_value": None,
-                    "result_text": "",
-                }
-            )
-            for row in snapshot_rows:
-                merged = dict(row)
-                merged["category"] = "ROI_SNAPSHOT"
-                ordered.append(merged)
+        for roi_key in roi_order:
+            ordered.append({"category": "ROI", "item_name": roi_key, "result_text": "", "note_text": ""})
+            analysis_nodes = grouped[roi_key]
+            analysis_keys = sorted(analysis_nodes.keys(), key=lambda key: (analysis_priority.get(key, 5), key))
+            for analysis_key in analysis_keys:
+                ordered.append({"category": "ANALYSIS", "item_name": analysis_key, "result_text": "", "note_text": ""})
+                metric_rows = analysis_nodes.get(analysis_key, [])
+                metric_rows_sorted = sorted(
+                    metric_rows,
+                    key=lambda item: (
+                        str(item.get("item_name", item.get("metric_name", ""))).lower(),
+                        str(item.get("metric_name", "")).lower(),
+                    ),
+                )
+                for metric_row in metric_rows_sorted:
+                    ordered.append({**metric_row, "category": "METRIC"})
         return ordered
+
+    def _build_analysis_panel_remark_text(self, row: dict[str, Any], category: str) -> str:
+        if category != "METRIC":
+            return ""
+        candidates = [
+            row.get("remark"),
+            row.get("status"),
+            row.get("note_text"),
+            (row.get("stats") or {}).get("status"),
+            (row.get("stats") or {}).get("reason"),
+        ]
+        result_text = str(row.get("result_text", "")).strip()
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            lowered = text.lower()
+            if not text:
+                continue
+            if lowered in {"derived metric", "= n/a", "n/a", "-"}:
+                continue
+            if text == result_text:
+                continue
+            return text
+        return ""
 
     def _refresh_analysis_results_panel(self) -> None:
         rows_container = getattr(self, "analysis_results_rows_container", None)
@@ -4706,15 +4788,17 @@ class DicomViewer:
         data_row_index = 0
         for row_index, row in enumerate(grouped_rows):
             category = str(row.get("category", "METRIC"))
-            item_text = row["metric_name"] if category == "SECTION" else row.get("item_name", row["metric_name"])
-            note_text = self._build_analysis_note_text(row) if category != "SECTION" else ""
-            value_text = self._format_analysis_value_text(row) if category != "SECTION" else ""
-            if category == "SECTION":
-                item_text = f"[{item_text}]"
+            item_text = row.get("item_name", row.get("metric_name", ""))
+            if category == "ANALYSIS":
+                item_text = f"  {item_text}"
+            elif category == "METRIC":
+                item_text = f"    {item_text}"
+            value_text = self._format_analysis_value_text(row) if category in {"METRIC", "METRIC_FLAT"} else ""
+            note_text = self._build_analysis_panel_remark_text(row, category)
             item_value = self._sanitize_ui_text(str(item_text))
             value_value = self._sanitize_ui_text("" if value_text is None else str(value_text))
             note_value = note_text
-            if category == "SECTION":
+            if category in {"ROI", "ANALYSIS"}:
                 background = "#F8FAFC"
                 font = ("TkDefaultFont", 10, "bold")
             else:
@@ -4723,9 +4807,9 @@ class DicomViewer:
                 data_row_index += 1
             row_frame = tk.Frame(rows_container, bg=background, highlightthickness=0, bd=0)
             row_frame.grid(row=row_index, column=0, sticky="ew")
-            row_frame.grid_columnconfigure(0, weight=0, minsize=220)
-            row_frame.grid_columnconfigure(1, weight=0, minsize=180)
-            row_frame.grid_columnconfigure(2, weight=1, minsize=300)
+            row_frame.grid_columnconfigure(0, weight=1, minsize=340)
+            row_frame.grid_columnconfigure(1, weight=0, minsize=190)
+            row_frame.grid_columnconfigure(2, weight=0, minsize=130)
 
             item_label = tk.Label(row_frame, text=item_value, anchor="w", justify="left", bg=background, fg=self.ui_colors["text_primary"], font=font, padx=8, pady=4)
             value_label = tk.Label(row_frame, text=value_value, anchor="w", justify="left", bg=background, fg=self.ui_colors["text_primary"], font=font, padx=6, pady=4)
@@ -4742,7 +4826,7 @@ class DicomViewer:
                 "frame": row_frame,
                 "labels": (item_label, value_label, note_label),
                 "base_bg": background,
-                "is_section": category == "SECTION",
+                "is_section": category in {"ROI", "ANALYSIS"},
             }
             self._analysis_results_row_widgets.append(row_widgets)
             for widget in (row_frame, item_label, value_label, note_label):
