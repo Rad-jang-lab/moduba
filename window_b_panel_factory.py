@@ -53,8 +53,28 @@ def build_window_b_analysis_panel(
 ) -> ttk.Frame:
     panel = ttk.Frame(parent)
     panel.pack(fill="both", expand=True)
+    panel.grid_rowconfigure(0, weight=1)
+    panel.grid_columnconfigure(0, weight=1)
 
-    analysis_notebook = ttk.Notebook(panel)
+    outer_canvas = tk.Canvas(panel, highlightthickness=0, bd=0)
+    outer_canvas.grid(row=0, column=0, sticky="nsew")
+    outer_scrollbar = ttk.Scrollbar(panel, orient="vertical", command=outer_canvas.yview)
+    outer_scrollbar.grid(row=0, column=1, sticky="ns")
+    outer_canvas.configure(yscrollcommand=outer_scrollbar.set)
+
+    content_frame = ttk.Frame(outer_canvas)
+    content_window = outer_canvas.create_window((0, 0), window=content_frame, anchor="nw")
+
+    def _sync_outer_scroll_region(_event: tk.Event) -> None:
+        outer_canvas.configure(scrollregion=outer_canvas.bbox("all"))
+
+    def _sync_outer_content_width(event: tk.Event) -> None:
+        outer_canvas.itemconfigure(content_window, width=event.width)
+
+    content_frame.bind("<Configure>", _sync_outer_scroll_region)
+    outer_canvas.bind("<Configure>", _sync_outer_content_width)
+
+    analysis_notebook = ttk.Notebook(content_frame)
     analysis_notebook.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
     signal_tab = ttk.Frame(analysis_notebook, padding=(4, 4, 4, 4))
     image_tab = ttk.Frame(analysis_notebook, padding=(4, 4, 4, 4))
@@ -67,7 +87,7 @@ def build_window_b_analysis_panel(
     viewer_adapter._build_image_analysis_toolbar(image_tab)
     viewer_adapter._initialize_analysis_ui_bindings()
 
-    results_panel = ttk.LabelFrame(panel, text="Analysis Results", padding=(8, 6))
+    results_panel = ttk.LabelFrame(content_frame, text="Analysis Results", padding=(8, 6))
     results_panel.grid(row=1, column=0, sticky="nsew")
     header = ttk.Frame(results_panel)
     header.grid(row=0, column=0, sticky="ew", columnspan=2)
@@ -161,9 +181,60 @@ def build_window_b_analysis_panel(
     results_panel.grid_columnconfigure(0, weight=1)
     results_panel.grid_columnconfigure(1, weight=1)
     results_panel.grid_rowconfigure(1, weight=1)
-    panel.grid_columnconfigure(0, weight=1)
-    panel.grid_rowconfigure(0, weight=0)
-    panel.grid_rowconfigure(1, weight=1)
+    content_frame.grid_columnconfigure(0, weight=1)
+    content_frame.grid_rowconfigure(0, weight=0)
+    content_frame.grid_rowconfigure(1, weight=1)
+
+    def _is_descendant_of_content(widget: tk.Misc | None) -> bool:
+        current = widget
+        while current is not None:
+            if current == content_frame:
+                return True
+            current = current.master
+        return False
+
+    def _is_descendant_of_treeview(widget: tk.Misc | None) -> bool:
+        current = widget
+        while current is not None:
+            if isinstance(current, ttk.Treeview):
+                return True
+            current = current.master
+        return False
+
+    def _scroll_outer_canvas(units: int) -> None:
+        if units != 0:
+            outer_canvas.yview_scroll(units, "units")
+
+    def _on_outer_mousewheel(event: tk.Event) -> str | None:
+        if not _is_descendant_of_content(event.widget):
+            return None
+        if _is_descendant_of_results_panel(event.widget) or _is_descendant_of_treeview(event.widget):
+            return None
+        delta = int(event.delta)
+        if delta == 0:
+            return "break"
+        _scroll_outer_canvas(int(-delta / 120))
+        return "break"
+
+    outer_canvas.bind_all("<MouseWheel>", _on_outer_mousewheel, add="+")
+    outer_canvas.bind_all(
+        "<Button-4>",
+        lambda event: (_scroll_outer_canvas(-1), "break")[1]
+        if _is_descendant_of_content(event.widget)
+        and not _is_descendant_of_results_panel(event.widget)
+        and not _is_descendant_of_treeview(event.widget)
+        else None,
+        add="+",
+    )
+    outer_canvas.bind_all(
+        "<Button-5>",
+        lambda event: (_scroll_outer_canvas(1), "break")[1]
+        if _is_descendant_of_content(event.widget)
+        and not _is_descendant_of_results_panel(event.widget)
+        and not _is_descendant_of_treeview(event.widget)
+        else None,
+        add="+",
+    )
     # [viewer_adapter 의존]
     # 목적: 기존 viewer 기반 refresh 루프에서 참조하는 widget 핸들 등록
     # 분류: legacy compatibility
