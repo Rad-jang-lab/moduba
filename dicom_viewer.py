@@ -3560,6 +3560,21 @@ class DicomViewer:
         value = mtf[idx]
         return float(value) if np.isfinite(value) else None
 
+    @staticmethod
+    def _format_edge_angle_with_tilt(edge_angle_deg: Any, digits: int = 2) -> str:
+        if not isinstance(edge_angle_deg, (int, float)):
+            return "N/A"
+        edge_angle = float(edge_angle_deg)
+        tilt_from_vertical = edge_angle - 90.0
+        rounded_tilt = float(f"{tilt_from_vertical:.{digits}f}")
+        if rounded_tilt > 0:
+            tilt_text = f"+{rounded_tilt:.{digits}f}°"
+        elif rounded_tilt < 0:
+            tilt_text = f"{rounded_tilt:.{digits}f}°"
+        else:
+            tilt_text = f"{0.0:.{digits}f}°"
+        return f"{edge_angle:.{digits}f}° (Tilt: {tilt_text} from vertical)"
+
     def _update_mtf_analysis_ui(self, mtf_result: dict[str, Any]) -> None:
         if not getattr(self, "_mtf_summary_value_vars", None):
             return
@@ -3584,7 +3599,9 @@ class DicomViewer:
             self._mtf_summary_value_vars["mtf10"].set(_fmt(key_metrics.get("mtf10")))
             self._mtf_summary_value_vars["nyquist_mtf"].set(_fmt(key_metrics.get("nyquist_mtf")))
             self._mtf_summary_value_vars["frequency_lpmm"].set(frequency_lpmm_text)
-            self._mtf_summary_value_vars["edge_angle"].set(_fmt(mtf_result.get("edge_angle_deg"), digits=2, suffix=" deg"))
+            self._mtf_summary_value_vars["edge_angle"].set(
+                self._format_edge_angle_with_tilt(mtf_result.get("edge_angle_deg"), digits=2)
+            )
             self._mtf_summary_value_vars["edge_snr"].set(_fmt(mtf_result.get("edge_snr")))
             roi_size = mtf_result.get("roi_size_mm") or {}
             self._mtf_summary_value_vars["roi_width"].set(_fmt(roi_size.get("width"), suffix=" mm"))
