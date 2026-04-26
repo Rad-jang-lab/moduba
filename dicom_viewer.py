@@ -410,10 +410,11 @@ class DicomViewer:
         self._last_mtf_curve_payload: dict[str, Any] = {}
         self._last_esf_curve_payload: dict[str, Any] = {}
         self._last_lsf_curve_payload: dict[str, Any] = {}
+        self._last_mtf_result: dict[str, Any] = {}
         self._mtf_graph_status_var = tk.StringVar(value="MTF Curve: no result")
         self._mtf_esf_status_var = tk.StringVar(value="ESF: 결과 없음")
         self._mtf_lsf_status_var = tk.StringVar(value="LSF: 결과 없음")
-        self._mtf_warning_popup_message: str = "경고 요약: -\nReason Codes: -"
+        self._mtf_warning_popup_message: str = "[검증 결과]\n- 검증: -\n- 계산 유효성: -\n- IEC: -\n- QA 등급: -"
         self._last_mtf_key_metrics: dict[str, Any] = {}
         self._last_mtf_warning_details: list[str] = []
         self._mtf_warning_text_widget: tk.Text | None = None
@@ -3578,6 +3579,7 @@ class DicomViewer:
     def _update_mtf_analysis_ui(self, mtf_result: dict[str, Any]) -> None:
         if not getattr(self, "_mtf_summary_value_vars", None):
             return
+        self._last_mtf_result = dict(mtf_result)
         key_metrics = mtf_result.get("key_mtf_metrics") or {}
         self._last_mtf_key_metrics = dict(key_metrics)
         invalid = self._is_mtf_result_invalid(mtf_result)
@@ -3629,20 +3631,12 @@ class DicomViewer:
         self._schedule_mtf_graph_redraw()
 
     def _refresh_mtf_warning_text_widget(self) -> None:
-        status_overview = self.analysis_results.get("mtf_status_overview")
-        warning_summary = self.analysis_results.get("mtf_warning_summary")
-        reason_codes = self.analysis_results.get("mtf_reason_codes")
-        suggested_actions = self.analysis_results.get("mtf_suggested_actions")
-        summary_lines = [
-            status_overview.get() if status_overview is not None else "Validation: - | Calculation: - | IEC: - | QA Grade: -",
-            warning_summary.get() if warning_summary is not None else "Warnings: -",
-            reason_codes.get() if reason_codes is not None else "Reason Codes: -",
-            suggested_actions.get() if suggested_actions is not None else "Suggested Actions: -",
-        ]
-        detail_lines = [f"- {text}" for text in getattr(self, "_last_mtf_warning_details", [])]
-        if not detail_lines:
-            detail_lines = ["- -"]
-        body_lines = summary_lines + ["", "Warning Details:", *detail_lines]
+        latest = getattr(self, "_last_mtf_result", {}) or {}
+        if not isinstance(latest, dict):
+            latest = {}
+        reason_codes = [str(code).strip() for code in (latest.get("reason_codes") or []) if str(code).strip()]
+        detail_warnings = [str(item).strip() for item in getattr(self, "_last_mtf_warning_details", []) if str(item).strip()]
+        body_lines = self._build_mtf_warning_display_lines(latest, reason_codes, detail_warnings)
         warning_text_widget = getattr(self, "_mtf_warning_text_widget", None)
         if warning_text_widget is not None:
             warning_text_widget.configure(state="normal")
@@ -3654,8 +3648,53 @@ class DicomViewer:
     def _show_mtf_warning_popup(self) -> None:
         message = str(getattr(self, "_mtf_warning_popup_message", "")).strip()
         if not message:
-            message = "Validation: - | Calculation: - | IEC: - | QA Grade: -\n경고 요약: -\nReason Codes: -\nSuggested Actions: -"
+            message = "[검증 결과]\n- 검증: -\n- 계산 유효성: -\n- IEC: -\n- QA 등급: -"
         messagebox.showinfo("MTF Warnings / Validation", message)
+
+    def _build_mtf_warning_display_lines(
+        self,
+        mtf_result: dict[str, Any],
+        reason_codes: list[str],
+        detail_warnings: list[str],
+    ) -> list[str]:
+        sections: list[list[str]] = []
+        validation = str(mtf_result.get("validation_summary") or self.analysis_results["mtf_validation_summary"].get() or "-").strip()
+        calculation = str(mtf_result.get("calculation_validity", "-")).strip() or "-"
+        iec = str(mtf_result.get("iec_compliance", "-")).strip() or "-"
+        qa_grade = str(mtf_result.get("qa_grade", "-")).strip() or "-"
+        sections.append(
+            [
+                "[검증 결과]",
+                f"- 검증: {validation or '-'}",
+                f"- 계산 유효성: {calculation}",
+                f"- IEC 기준: {iec}",
+                f"- QA 등급: {qa_grade}",
+            ]
+        )
+
+        reason_lines = self._translate_reason_codes_to_display_lines(reason_codes)
+        if reason_lines:
+            numbered = [f"{idx}. {line}" for idx, line in enumerate(reason_lines, start=1)]
+            sections.append(["[주요 원인]", *numbered])
+
+        interpretation_lines = self._build_mtf_interpretation_lines(reason_codes)
+        if interpretation_lines:
+            sections.append(["[해석]", *[f"- {line}" for line in interpretation_lines]])
+
+        action_lines = self._build_mtf_suggested_action_lines(reason_codes)
+        if action_lines:
+            sections.append(["[권장 조치]", *[f"- {line}" for line in action_lines]])
+
+        if detail_warnings:
+            dedup_details = list(dict.fromkeys(detail_warnings))
+            sections.append(["[참고 원문]", *[f"- {line}" for line in dedup_details]])
+
+        merged: list[str] = []
+        for index, section in enumerate(sections):
+            if index > 0:
+                merged.append("")
+            merged.extend(section)
+        return merged or ["[검증 결과]", "- 검증: -"]
 
     def _build_mtf_status_overview(self, mtf_result: dict[str, Any]) -> str:
         validation = str(mtf_result.get("validation_summary") or self.analysis_results["mtf_validation_summary"].get() or "-")
@@ -3666,20 +3705,67 @@ class DicomViewer:
         return f"Validation: {validation} | Calculation: {calculation} | IEC: {iec} | QA Grade: {qa_grade}"
 
     def _build_mtf_suggested_actions(self, reason_codes: list[Any]) -> str:
+        action_lines = self._build_mtf_suggested_action_lines([str(reason) for reason in reason_codes])
+        if not action_lines:
+            return "권장 조치:\n- ROI 위치, 에지 방향, SNR 상태를 재확인하세요."
+        return "권장 조치:\n" + "\n".join(f"- {line}" for line in action_lines)
+
+    def _build_mtf_suggested_action_lines(self, reason_codes: list[str]) -> list[str]:
         actions_by_reason = {
-            "EDGE_SNR_LOW": "Suggested Actions:\n- Increase exposure or improve edge contrast.\n- Reacquire ROI with cleaner edge profile.",
-            "EDGE_SNR_BORDERLINE": "Suggested Actions:\n- Increase exposure or improve edge contrast.\n- Recheck high-frequency interpretation.",
-            "POSSIBLE_ALIASING": "Suggested Actions:\n- Verify edge direction and sampling.\n- Reposition ROI away from resampling artifacts.",
-            "NONMONOTONIC_TAIL": "Suggested Actions:\n- Verify ROI position and edge quality.\n- Repeat measurement with stable edge.",
-            "IEC_EDGE_GEOMETRY_NONCOMPLIANT": "Suggested Actions:\n- Adjust ROI size/angle to meet IEC geometry.\n- Re-run in strict IEC mode.",
-            "IEC_ROI_NONCOMPLIANT": "Suggested Actions:\n- Enlarge ROI to IEC minimum dimensions.\n- Confirm edge location remains valid.",
-            "PHASE1_REJECT": "Suggested Actions:\n- Verify ROI position and edge direction.\n- Confirm adequate SNR before rerun.",
+            "EDGE_SNR_LOW": ["노출 또는 edge 대비를 높여 SNR을 개선하세요.", "더 안정적인 edge 구간으로 ROI를 다시 설정해 재측정하세요."],
+            "EDGE_SNR_BORDERLINE": ["고주파 구간 해석을 보수적으로 수행하세요.", "가능하면 edge 대비를 개선한 후 재측정하세요."],
+            "POSSIBLE_ALIASING": ["edge 방향과 샘플링 조건을 재확인하세요.", "리샘플링 영향이 적은 위치로 ROI를 이동해 재측정하세요."],
+            "NONMONOTONIC_TAIL": ["ROI 위치와 edge 품질을 재확인하세요.", "안정적인 edge로 반복 측정을 권장합니다."],
+            "IEC_EDGE_GEOMETRY_NONCOMPLIANT": ["ROI 크기/각도를 IEC 기하 조건에 맞게 조정하세요.", "IEC 엄격 모드에서 다시 계산하세요."],
+            "IEC_ROI_NONCOMPLIANT": ["ROI 크기를 IEC 최소 조건 이상으로 확대하세요.", "에지 위치가 유효한지 다시 확인하세요."],
+            "PHASE1_REJECT": ["ROI 위치와 edge 방향을 우선 확인하세요.", "SNR이 충분한지 점검한 뒤 재측정하세요."],
         }
         for reason in reason_codes:
-            action = actions_by_reason.get(str(reason))
+            action = actions_by_reason.get(reason)
             if action:
                 return action
-        return "Suggested Actions:\n- Verify ROI position, edge direction, and SNR."
+        return ["ROI 위치, 에지 방향, SNR 상태를 재확인하세요."]
+
+    def _translate_reason_codes_to_display_lines(self, reason_codes: list[str]) -> list[str]:
+        reason_to_ko = {
+            "NONMONOTONIC_TAIL": "MTF 곡선 단조성 문제 발생 (non-monotonic).",
+            "POSSIBLE_ALIASING": "aliasing 가능성이 있습니다.",
+            "HIGH_FREQUENCY_NOISE_BIAS_RISK": "고주파 노이즈 영향 가능성이 있습니다.",
+            "EDGE_SNR_LOW": "Edge SNR이 낮습니다 (Low edge SNR).",
+            "EDGE_SNR_BORDERLINE": "Edge SNR이 경계 수준입니다.",
+            "RESULT_QUESTIONABLE": "결과 신뢰도가 낮을 수 있습니다.",
+            "MTF_PEAK_GT_ONE": "MTF peak가 1.0을 초과했습니다.",
+            "POSSIBLE_SHARPENING": "샤프닝 영향 가능성이 있습니다.",
+            "EDGE_CLIPPING_DETECTED": "에지 클리핑이 감지되었습니다.",
+            "PHASE1_REJECT": "MTF 1차 계산이 거부되었습니다.",
+            "IEC_EDGE_GEOMETRY_NONCOMPLIANT": "IEC 에지 기하 조건을 만족하지 못했습니다.",
+            "IEC_ROI_NONCOMPLIANT": "ROI 크기가 IEC 기준에 미달합니다.",
+            "IEC_ROI_UNVERIFIABLE": "ROI의 IEC 검증에 필요한 정보가 부족합니다.",
+            "IEC_AVERAGING_METHOD_NONCOMPLIANT": "IEC 허용 averaging 방식이 아닙니다.",
+            "IEC_AVERAGING_METHOD_UNVERIFIABLE": "averaging 방식을 확인할 수 없습니다.",
+            "IEC_SCOPE_NOT_DECLARED": "IEC scope 선언 정보가 없습니다.",
+            "IEC_EXPLORATORY_MODE_NOT_REPORTABLE": "Exploratory 모드는 IEC 보고용으로 제한됩니다.",
+            "EDGE_SNR_NOT_ASSESSED": "Edge SNR을 평가하지 못했습니다.",
+            "IEC_DATA_NOT_LINEAR": "IEC 선형성 가정을 만족하지 못했을 가능성이 있습니다.",
+        }
+        translated: list[str] = []
+        for code in reason_codes:
+            translated.append(reason_to_ko.get(code, f"추가 확인 필요: {code}"))
+        return list(dict.fromkeys(translated))
+
+    def _build_mtf_interpretation_lines(self, reason_codes: list[str]) -> list[str]:
+        interpretation_by_reason = {
+            "NONMONOTONIC_TAIL": "MTF 곡선이 단조 감소하지 않아 고주파 해석 신뢰도가 낮아질 수 있습니다.",
+            "POSSIBLE_ALIASING": "샘플링 영향으로 실제 해상도보다 높게 보일 가능성이 있습니다.",
+            "HIGH_FREQUENCY_NOISE_BIAS_RISK": "고주파 영역에서 노이즈 floor 영향이 커질 수 있습니다.",
+            "EDGE_SNR_LOW": "측정 재현성이 낮아질 수 있습니다.",
+            "EDGE_SNR_BORDERLINE": "고주파 성능 해석은 보수적으로 판단하는 것이 좋습니다.",
+            "RESULT_QUESTIONABLE": "최종 결과를 단독 근거로 사용하기 어렵습니다.",
+            "EDGE_CLIPPING_DETECTED": "LSF/MTF 형상이 왜곡되었을 수 있습니다.",
+            "PHASE1_REJECT": "현재 ROI 조건에서는 신뢰 가능한 MTF 산출이 어렵습니다.",
+        }
+        lines = [interpretation_by_reason[code] for code in reason_codes if code in interpretation_by_reason]
+        return list(dict.fromkeys(lines))
 
     def _format_mtf_frequency_lpmm_summary(self, key_metrics: dict[str, Any]) -> str:
         spacing = self._get_pixel_spacing_mm()
@@ -3725,7 +3811,7 @@ class DicomViewer:
                 if text:
                     translated.append(text)
             if translated:
-                return " / ".join(dict.fromkeys(translated))
+                return ", ".join(dict.fromkeys(translated))
         fallback = [str(item) for item in warnings if str(item).strip()]
         return ", ".join(fallback) if fallback else "-"
 
