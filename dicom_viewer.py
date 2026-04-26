@@ -406,6 +406,7 @@ class DicomViewer:
         self._mtf_right_frame: ttk.Frame | None = None
         self._mtf_notebook: ttk.Notebook | None = None
         self._mtf_tab: ttk.Frame | None = None
+        self._active_signal_analysis_tab: str = "SNR"
         self._mtf_graph_redraw_job: str | None = None
         self._last_mtf_curve_payload: dict[str, Any] = {}
         self._last_esf_curve_payload: dict[str, Any] = {}
@@ -1409,9 +1410,23 @@ class DicomViewer:
             return
         if event is not None and event.widget is not notebook:
             return
+        self._active_signal_analysis_tab = self._get_active_signal_analysis_tab()
+        self._refresh_analysis_results_panel()
         if notebook.select() != str(mtf_tab):
             return
         self._schedule_mtf_graph_redraw()
+
+    def _get_active_signal_analysis_tab(self) -> str:
+        notebook = self._mtf_notebook
+        if notebook is None:
+            return "SNR"
+        try:
+            tab_id = notebook.select()
+            tab_text = notebook.tab(tab_id, "text")
+        except Exception:
+            return "SNR"
+        normalized = self._normalize_analysis_tab_name(str(tab_text))
+        return normalized or "SNR"
 
     def _on_mtf_graph_canvas_configure(self, _event: tk.Event | None = None) -> None:
         self._schedule_mtf_graph_redraw()
@@ -5009,25 +5024,6 @@ class DicomViewer:
             note_text = str(row.get("note_text", "")).strip()
             return _is_placeholder_text(metric_name) and _is_placeholder_text(item_name) and _is_placeholder_text(result_text) and _is_placeholder_text(note_text)
 
-        def _normalize_analysis_name(value: str) -> str:
-            if not value:
-                return ""
-            normalized = value.strip()
-            if not normalized:
-                return ""
-            lowered = normalized.lower()
-            if "mtf" in lowered:
-                return "MTF"
-            if "snr" in lowered:
-                return "SNR"
-            if "cnr" in lowered:
-                return "CNR"
-            if "uniform" in lowered:
-                return "Uniformity"
-            if "line" in lowered or "profile" in lowered:
-                return "Line Profile"
-            return normalized
-
         def _summarize_validation_text(value: Any) -> str:
             text = str(value or "").strip()
             if not text:
@@ -5064,7 +5060,7 @@ class DicomViewer:
                 row.get("item_name"),
             ]
             for raw in candidates:
-                text = _normalize_analysis_name(str(raw or ""))
+                text = DicomViewer._normalize_analysis_tab_name(str(raw or ""))
                 if text:
                     return text
             return ""
@@ -5102,7 +5098,7 @@ class DicomViewer:
                 roi_label = "ROI 1"
             if not analysis_type:
                 return [{**dict(item), "category": "METRIC_FLAT"} for item in filtered_rows]
-            analysis_type = _normalize_analysis_name(analysis_type)
+            analysis_type = DicomViewer._normalize_analysis_tab_name(analysis_type)
             if not analysis_type:
                 return [{**dict(item), "category": "METRIC_FLAT"} for item in filtered_rows]
             merged["resolved_roi_label"] = roi_label
@@ -5152,6 +5148,45 @@ class DicomViewer:
                     ordered.append({**metric_row, "category": "METRIC"})
         return ordered
 
+    @staticmethod
+    def _normalize_analysis_tab_name(value: str) -> str:
+        normalized = str(value or "").strip()
+        if not normalized:
+            return ""
+        lowered = normalized.lower()
+        if "mtf" in lowered:
+            return "MTF"
+        if "snr" in lowered:
+            return "SNR"
+        if "cnr" in lowered:
+            return "CNR"
+        if "uniform" in lowered:
+            return "Uniformity"
+        if "line" in lowered or "profile" in lowered:
+            return "Line Profile"
+        return normalized
+
+    @classmethod
+    def _resolve_analysis_tab_for_row(cls, row: dict[str, Any]) -> str:
+        for key in ("analysis_type", "category", "tab"):
+            value = row.get(key)
+            normalized = cls._normalize_analysis_tab_name(str(value or ""))
+            if normalized in {"SNR", "CNR", "Uniformity", "Line Profile", "MTF"}:
+                return normalized
+        for key in ("metric_name", "item_name", "formula_mode", "result_text"):
+            value = row.get(key)
+            normalized = cls._normalize_analysis_tab_name(str(value or ""))
+            if normalized in {"SNR", "CNR", "Uniformity", "Line Profile", "MTF"}:
+                return normalized
+        return ""
+
+    @classmethod
+    def _filter_analysis_rows_for_selected_tab(cls, rows: list[dict[str, Any]], selected_tab: str) -> list[dict[str, Any]]:
+        active_tab = cls._normalize_analysis_tab_name(selected_tab)
+        if active_tab not in {"SNR", "CNR", "Uniformity", "Line Profile", "MTF"}:
+            return list(rows)
+        return [row for row in rows if cls._resolve_analysis_tab_for_row(row) == active_tab]
+
     def _build_analysis_panel_remark_text(self, row: dict[str, Any], category: str) -> str:
         if category == "ANALYSIS":
             return str(row.get("note_text", "")).strip()
@@ -5185,7 +5220,13 @@ class DicomViewer:
             child.destroy()
         self._analysis_results_row_widgets = []
         self._analysis_results_selected_index = None
-        grouped_rows = self._group_analysis_rows_for_panel(self._build_analysis_result_rows())
+        active_tab = self._get_active_signal_analysis_tab()
+        self._active_signal_analysis_tab = active_tab
+        rows = self._build_analysis_result_rows()
+        filtered_rows = self._filter_analysis_rows_for_selected_tab(rows, active_tab)
+        grouped_rows = self._group_analysis_rows_for_panel(filtered_rows)
+        if not grouped_rows:
+            grouped_rows = [{"category": "ROI", "item_name": "No results for selected analysis", "result_text": "", "note_text": ""}]
         data_row_index = 0
         for row_index, row in enumerate(grouped_rows):
             category = str(row.get("category", "METRIC"))
