@@ -126,3 +126,38 @@ def test_group_analysis_rows_for_panel_moves_validation_summary_to_analysis_node
     assert grouped[1]["note_text"].startswith("Questionable")
     assert grouped[2]["category"] == "METRIC"
     assert grouped[2]["note_text"] == ""
+
+
+def test_filter_analysis_rows_for_selected_tab_keeps_only_active_analysis():
+    rows = [
+        {"metric_name": "SNR", "item_name": "SNR", "result_text": "3.0"},
+        {"metric_name": "CNR", "item_name": "CNR", "result_text": "2.0"},
+        {"metric_name": "MTF", "item_name": "MTF50", "result_text": "0.1"},
+    ]
+
+    filtered = DicomViewer._filter_analysis_rows_for_selected_tab(rows, "CNR")
+
+    assert len(filtered) == 1
+    assert filtered[0]["metric_name"] == "CNR"
+
+
+def test_filter_analysis_rows_for_selected_tab_uses_explicit_analysis_type_first():
+    rows = [
+        {
+            "analysis_type": "Uniformity",
+            "metric_name": "ROI_STATS",
+            "item_name": "Current frame ROI statistics",
+            "result_text": "10.0",
+        },
+        {
+            "analysis_type": "SNR",
+            "metric_name": "ROI_STATS",
+            "item_name": "Current frame ROI statistics",
+            "result_text": "11.0",
+        },
+    ]
+
+    filtered = DicomViewer._filter_analysis_rows_for_selected_tab(rows, "Uniformity")
+
+    assert len(filtered) == 1
+    assert filtered[0]["analysis_type"] == "Uniformity"
