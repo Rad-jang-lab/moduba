@@ -12,6 +12,7 @@ from typing import Any, Optional
 import uuid
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 import numpy as np
 import pydicom
 from PIL import Image, ImageDraw, ImageTk
@@ -400,6 +401,7 @@ class DicomViewer:
         self._mtf_lsf_canvas: tk.Canvas | None = None
         self._mtf_curve_notebook: ttk.Notebook | None = None
         self._mtf_curve_tabs: dict[str, ttk.Frame] = {}
+        self._mtf_curve_tab_ids: dict[str, str] = {}
         self._mtf_graph_group: ttk.LabelFrame | None = None
         self._mtf_right_frame: ttk.Frame | None = None
         self._mtf_notebook: ttk.Notebook | None = None
@@ -1294,6 +1296,7 @@ class DicomViewer:
         for key, title in (("mtf", "MTF"), ("esf", "ESF"), ("lsf", "LSF")):
             tab = ttk.Frame(curve_notebook, padding=(2, 2, 2, 2))
             curve_notebook.add(tab, text=title)
+            self._mtf_curve_tab_ids[str(tab)] = key
             tab.grid_columnconfigure(0, weight=1)
             tab.grid_rowconfigure(0, weight=1)
             canvas = tk.Canvas(tab, width=360, height=180, bg="#FFFFFF", highlightthickness=1, highlightbackground=self.ui_colors["border"])
@@ -1311,6 +1314,10 @@ class DicomViewer:
         ttk.Label(summary_group_right, textvariable=self._mtf_graph_status_var).grid(row=0, column=0, sticky="w")
         ttk.Label(summary_group_right, textvariable=self._mtf_esf_status_var).grid(row=1, column=0, sticky="w")
         ttk.Label(summary_group_right, textvariable=self._mtf_lsf_status_var).grid(row=2, column=0, sticky="w")
+        controls_row = ttk.Frame(graph_group)
+        controls_row.grid(row=2, column=0, sticky="e", pady=(6, 0))
+        ttk.Button(controls_row, text="Copy Graph", command=self._copy_active_mtf_curve_graph).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(controls_row, text="Save Graph", command=self._save_active_mtf_curve_graph).grid(row=0, column=1)
         graph_group.grid_columnconfigure(0, weight=1)
         graph_group.grid_rowconfigure(0, weight=1, minsize=300)
         left_frame.grid_columnconfigure(0, weight=1)
@@ -3753,6 +3760,17 @@ class DicomViewer:
             points.extend([px, py])
         if len(points) >= 4:
             canvas.create_line(*points, fill="#0A84FF", width=2, smooth=True)
+        self._draw_axis_ticks(
+            canvas=canvas,
+            pad_l=pad_l,
+            pad_t=pad_t,
+            plot_w=plot_w,
+            plot_h=plot_h,
+            x_min=0.0,
+            x_max=xmax,
+            y_min=0.0,
+            y_max=1.2,
+        )
         show_nyquist_legend = self._render_mtf_reference_markers(canvas, key_metrics=self._last_mtf_key_metrics, xmax=xmax, pad_l=pad_l, pad_t=pad_t, plot_w=plot_w, plot_h=plot_h)
         self._render_mtf_legend(canvas, width=width, pad_t=pad_t, include_nyquist=show_nyquist_legend)
         canvas.create_text(pad_l + plot_w / 2, height - 10, text="Frequency (cy/pixel)", fill="#334155")
@@ -3855,8 +3873,175 @@ class DicomViewer:
             points.extend([px, py])
         if len(points) >= 4:
             canvas.create_line(*points, fill="#0A84FF", width=2, smooth=True)
+        self._draw_axis_ticks(
+            canvas=canvas,
+            pad_l=pad_l,
+            pad_t=pad_t,
+            plot_w=plot_w,
+            plot_h=plot_h,
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+        )
         canvas.create_text(pad_l + plot_w / 2, height - 10, text=x_label, fill="#334155")
         canvas.create_text(12, pad_t + plot_h / 2, text=curve_name, fill="#334155", angle=90)
+
+    @staticmethod
+    def _draw_axis_ticks(
+        canvas: tk.Canvas,
+        pad_l: int,
+        pad_t: int,
+        plot_w: int,
+        plot_h: int,
+        x_min: float,
+        x_max: float,
+        y_min: float,
+        y_max: float,
+    ) -> None:
+        if not np.isfinite(x_min) or not np.isfinite(x_max) or not np.isfinite(y_min) or not np.isfinite(y_max):
+            return
+        x_span = (x_max - x_min) if x_max > x_min else 1.0
+        y_span = (y_max - y_min) if y_max > y_min else 1.0
+        x_ticks = MaxNLocator(nbins=6, min_n_ticks=4).tick_values(x_min, x_max)
+        y_ticks = MaxNLocator(nbins=5, min_n_ticks=4).tick_values(y_min, y_max)
+        for tick in x_ticks:
+            if tick < x_min - 1e-9 or tick > x_max + 1e-9:
+                continue
+            px = pad_l + ((float(tick) - x_min) / x_span) * plot_w
+            canvas.create_line(px, pad_t + plot_h, px, pad_t + plot_h + 4, fill="#64748B")
+            canvas.create_text(px, pad_t + plot_h + 10, text=f"{tick:.3g}", fill="#334155", anchor="n")
+        for tick in y_ticks:
+            if tick < y_min - 1e-9 or tick > y_max + 1e-9:
+                continue
+            py = pad_t + plot_h - ((float(tick) - y_min) / y_span) * plot_h
+            canvas.create_line(pad_l - 4, py, pad_l, py, fill="#64748B")
+            canvas.create_text(pad_l - 6, py, text=f"{tick:.3g}", fill="#334155", anchor="e")
+
+    def _get_active_mtf_curve_key(self) -> str | None:
+        notebook = self._mtf_curve_notebook
+        if notebook is None:
+            return None
+        try:
+            selected_tab = notebook.select()
+        except Exception:
+            return None
+        return self._mtf_curve_tab_ids.get(str(selected_tab))
+
+    def _copy_active_mtf_curve_graph(self) -> None:
+        # Tkinter clipboard image support is platform-dependent and not reliable
+        # without optional OS-specific dependencies; provide a safe fallback.
+        messagebox.showinfo(
+            "Copy Graph",
+            "Copy Graph is not supported in this environment. Please use Save Graph.",
+        )
+
+    def _save_active_mtf_curve_graph(self) -> None:
+        curve_key = self._get_active_mtf_curve_key()
+        if curve_key is None:
+            messagebox.showwarning("Save Graph", "Unable to detect active curve tab.")
+            return
+        default_names = {
+            "mtf": "moduba_mtf_curve.png",
+            "esf": "moduba_esf_curve.png",
+            "lsf": "moduba_lsf_curve.png",
+        }
+        path = filedialog.asksaveasfilename(
+            title="Save Graph",
+            defaultextension=".png",
+            initialfile=default_names.get(curve_key, "moduba_curve.png"),
+            filetypes=[
+                ("PNG image", "*.png"),
+                ("SVG vector", "*.svg"),
+                ("PDF document", "*.pdf"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            self._export_active_curve_figure(curve_key=curve_key, output_path=path)
+        except Exception as exc:
+            messagebox.showerror("Save Graph", f"Failed to save graph: {exc}")
+            return
+        messagebox.showinfo("Save Graph", f"Graph saved:\n{path}")
+
+    def _export_active_curve_figure(self, curve_key: str, output_path: str) -> None:
+        fig, ax = plt.subplots(figsize=(6.4, 3.6))
+        try:
+            if curve_key == "mtf":
+                self._plot_export_mtf(ax)
+            elif curve_key == "esf":
+                self._plot_export_xy(ax, self._last_esf_curve_payload, "ESF", "x")
+            elif curve_key == "lsf":
+                self._plot_export_xy(ax, self._last_lsf_curve_payload, "LSF", "x")
+            else:
+                raise ValueError("Unsupported curve tab.")
+            output = Path(output_path)
+            suffix = output.suffix.lower()
+            dpi = 300 if suffix == ".png" else None
+            fig.tight_layout()
+            fig.savefig(output, dpi=dpi, bbox_inches="tight")
+        finally:
+            plt.close(fig)
+
+    def _plot_export_mtf(self, ax: Any) -> None:
+        freqs = np.asarray(self._last_mtf_curve_payload.get("frequency_cy_per_pixel", []), dtype=np.float64)
+        mtf = np.asarray(self._last_mtf_curve_payload.get("mtf", []), dtype=np.float64)
+        valid = np.isfinite(freqs) & np.isfinite(mtf)
+        freqs = freqs[valid]
+        mtf = mtf[valid]
+        if freqs.size < 2:
+            raise ValueError("No MTF curve data available.")
+        xmax = float(np.max(freqs))
+        xmax = xmax if xmax > 0 else 1.0
+        mtf = np.clip(mtf, 0.0, 1.2)
+        ax.plot(freqs, mtf, color="#0A84FF", linewidth=2.0)
+        ax.set_xlim(0.0, xmax)
+        ax.set_ylim(0.0, 1.2)
+        for key, color, label in (("mtf50", "#DC2626", "MTF50"), ("mtf10", "#16A34A", "MTF10")):
+            value = self._last_mtf_key_metrics.get(key)
+            if self._is_finite_number(value):
+                freq = float(value)
+                if 0 <= freq <= xmax:
+                    ax.axvline(freq, color=color, linestyle=(0, (4, 3)), linewidth=1.0, label=label)
+        nyquist = self._last_mtf_key_metrics.get("nyquist_frequency_cy_per_pixel")
+        if not self._is_finite_number(nyquist):
+            nyquist = 0.5
+        nyquist_freq = float(nyquist)
+        if 0 <= nyquist_freq <= xmax:
+            ax.axvline(nyquist_freq, color="#7C3AED", linestyle=(0, (2, 4)), linewidth=1.0, label="Nyquist")
+        ax.set_xlabel("Frequency (cy/pixel)")
+        ax.set_ylabel("MTF")
+        ax.tick_params(axis="both", which="major", labelsize=9)
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=6, min_n_ticks=4))
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=5, min_n_ticks=4))
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(loc="upper right", frameon=False)
+
+    def _plot_export_xy(self, ax: Any, curve: dict[str, Any], curve_name: str, x_label: str) -> None:
+        xs = np.asarray(curve.get("x", []), dtype=np.float64)
+        ys = np.asarray(curve.get("y", []), dtype=np.float64)
+        valid = np.isfinite(xs) & np.isfinite(ys)
+        xs = xs[valid]
+        ys = ys[valid]
+        if xs.size < 2:
+            raise ValueError(f"No {curve_name} curve data available.")
+        x_min = float(np.min(xs))
+        x_max = float(np.max(xs))
+        y_min = float(np.min(ys))
+        y_max = float(np.max(ys))
+        if x_max <= x_min:
+            x_max = x_min + 1.0
+        if y_max <= y_min:
+            y_max = y_min + 1.0
+        ax.plot(xs, ys, color="#0A84FF", linewidth=2.0)
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(curve_name)
+        ax.tick_params(axis="both", which="major", labelsize=9)
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=6, min_n_ticks=4))
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=5, min_n_ticks=4))
 
     def _show_mtf_details(self) -> None:
         mtf_payload = (self._select_analysis_last_run("mtf") or {}).get("result")
