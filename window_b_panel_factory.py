@@ -202,8 +202,28 @@ def build_window_b_analysis_panel(
         return False
 
     def _scroll_outer_canvas(units: int) -> None:
-        if units != 0:
-            outer_canvas.yview_scroll(units, "units")
+        if units == 0:
+            return
+        top, bottom = outer_canvas.yview()
+        viewport_span = bottom - top
+        if viewport_span >= 1.0:
+            return
+        if units < 0 and top <= 0.0:
+            return
+        if units > 0 and bottom >= 1.0:
+            return
+        outer_canvas.yview_scroll(units, "units")
+
+        clamped_top, clamped_bottom = outer_canvas.yview()
+        if clamped_top < 0.0:
+            outer_canvas.yview_moveto(0.0)
+        elif clamped_bottom > 1.0:
+            clamped_span = clamped_bottom - clamped_top
+            outer_canvas.yview_moveto(max(0.0, 1.0 - clamped_span))
+
+        content_coords = outer_canvas.coords(content_window)
+        if len(content_coords) >= 2 and content_coords[1] > 0.0:
+            outer_canvas.coords(content_window, content_coords[0], 0.0)
 
     def _on_outer_mousewheel(event: tk.Event) -> str | None:
         if not _is_descendant_of_content(event.widget):
