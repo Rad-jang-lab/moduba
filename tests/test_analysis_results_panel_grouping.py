@@ -68,7 +68,7 @@ def test_group_analysis_rows_for_panel_builds_roi_analysis_metric_hierarchy():
     assert grouped[5]["metric_name"] == "ROI_STATS"
 
 
-def test_group_analysis_rows_for_panel_falls_back_to_flat_when_analysis_missing():
+def test_group_analysis_rows_for_panel_defaults_to_other_analysis_when_analysis_missing():
     rows = [
         {
             "metric_name": "",
@@ -82,8 +82,10 @@ def test_group_analysis_rows_for_panel_falls_back_to_flat_when_analysis_missing(
         }
     ]
     grouped = DicomViewer._group_analysis_rows_for_panel(rows)
-    assert len(grouped) == 1
-    assert grouped[0]["category"] == "METRIC_FLAT"
+    assert grouped[0]["category"] == "ROI"
+    assert grouped[1]["category"] == "ANALYSIS"
+    assert grouped[1]["item_name"] == "Other"
+    assert grouped[2]["category"] == "METRIC"
 
 
 def test_group_analysis_rows_for_panel_uses_roi1_when_roi_is_missing():
@@ -107,7 +109,7 @@ def test_group_analysis_rows_for_panel_uses_roi1_when_roi_is_missing():
     assert grouped[1]["item_name"] == "MTF"
 
 
-def test_group_analysis_rows_for_panel_moves_validation_summary_to_analysis_node():
+def test_group_analysis_rows_for_panel_keeps_hierarchy_for_validation_rows():
     rows = [
         {
             "metric_name": "MTF",
@@ -123,9 +125,7 @@ def test_group_analysis_rows_for_panel_moves_validation_summary_to_analysis_node
     ]
     grouped = DicomViewer._group_analysis_rows_for_panel(rows)
     assert grouped[1]["category"] == "ANALYSIS"
-    assert grouped[1]["note_text"].startswith("Questionable")
     assert grouped[2]["category"] == "METRIC"
-    assert grouped[2]["note_text"] == ""
 
 
 def test_filter_analysis_rows_for_selected_tab_keeps_only_active_analysis():

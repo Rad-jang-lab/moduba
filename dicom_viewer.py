@@ -1513,8 +1513,8 @@ class DicomViewer:
         header.columnconfigure(1, weight=0, minsize=190)
         header.columnconfigure(2, weight=0, minsize=130)
         ttk.Label(header, text="ROI / Analysis / Metric", anchor="w").grid(row=0, column=0, sticky="ew", padx=(2, 8))
-        ttk.Label(header, text="Result", anchor="w").grid(row=0, column=1, sticky="ew", padx=(0, 8))
-        ttk.Label(header, text="Status / Remark", anchor="w").grid(row=0, column=2, sticky="ew")
+        ttk.Label(header, text="Formula / Calculation", anchor="w").grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        ttk.Label(header, text="Result", anchor="w").grid(row=0, column=2, sticky="ew")
 
         canvas = tk.Canvas(
             panel,
@@ -5097,18 +5097,18 @@ class DicomViewer:
             if not roi_label:
                 roi_label = "ROI 1"
             if not analysis_type:
-                return [{**dict(item), "category": "METRIC_FLAT"} for item in filtered_rows]
+                analysis_type = "Other"
             analysis_type = DicomViewer._normalize_analysis_tab_name(analysis_type)
             if not analysis_type:
-                return [{**dict(item), "category": "METRIC_FLAT"} for item in filtered_rows]
+                analysis_type = "Other"
             merged["resolved_roi_label"] = roi_label
             merged["resolved_analysis_type"] = analysis_type if analysis_type in analysis_priority else (analysis_type or "Other")
             normalized_rows.append(merged)
 
         if any(not row.get("resolved_roi_label") for row in normalized_rows):
-            return [{**dict(item), "category": "METRIC_FLAT"} for item in filtered_rows]
+            return []
         if any(not row.get("resolved_analysis_type") for row in normalized_rows):
-            return [{**dict(item), "category": "METRIC_FLAT"} for item in filtered_rows]
+            return []
 
         grouped: dict[str, dict[str, list[dict[str, Any]]]] = {}
         roi_order: list[str] = []
@@ -5187,30 +5187,130 @@ class DicomViewer:
             return list(rows)
         return [row for row in rows if cls._resolve_analysis_tab_for_row(row) == active_tab]
 
-    def _build_analysis_panel_remark_text(self, row: dict[str, Any], category: str) -> str:
-        if category == "ANALYSIS":
-            return str(row.get("note_text", "")).strip()
-        if category != "METRIC":
-            return ""
-        candidates = [
-            row.get("remark"),
-            row.get("status"),
-            row.get("note_text"),
-            (row.get("stats") or {}).get("status"),
-            (row.get("stats") or {}).get("reason"),
-        ]
-        result_text = str(row.get("result_text", "")).strip()
-        for candidate in candidates:
-            text = str(candidate or "").strip()
-            lowered = text.lower()
-            if not text:
+    @staticmethod
+    def _value_or_na(value: Any, digits: int = 2) -> str:
+        if isinstance(value, (int, float)) and np.isfinite(float(value)):
+            return f"{float(value):.{digits}f}"
+        text = str(value or "").strip()
+        return text if text else "N/A"
+
+    @staticmethod
+    def _truncate_formula_text(text: str, max_chars: int = 34) -> str:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return "N/A"
+        if len(normalized) <= max_chars:
+            return normalized
+        return f"{normalized[: max_chars - 3].rstrip()}..."
+
+    def _build_metric_formula_payload(self, row: dict[str, Any], analysis_type: str) -> tuple[str, str, str]:
+        stats = dict(row.get("stats") or {})
+        result_text = self._value_or_na(row.get("result_value"))
+        metric = str(row.get("item_name", row.get("metric_name", ""))).strip() or "Metric"
+        analysis = self._normalize_analysis_tab_name(analysis_type)
+
+        if analysis == "SNR":
+            signal_text = self._value_or_na(stats.get("mean_signal"))
+            noise_text = self._value_or_na(stats.get("std_noise"))
+            if metric == "Signal Mean":
+                return ("mean(signal ROI)", "Signal Mean = mean(signal ROI)", signal_text)
+            if metric == "Noise SD":
+                return ("std(background ROI)", "Noise SD = std(background ROI)", noise_text)
+            display = f"{signal_text} / {noise_text}"
+            full = f"SNR = {signal_text} / {noise_text} = {result_text}"
+            return (display, full, result_text)
+
+        if analysis == "CNR":
+            signal = self._value_or_na(stats.get("target_mean"))
+            background = self._value_or_na(stats.get("reference_mean"))
+            noise = self._value_or_na(stats.get("noise_std"))
+            display = f"|{signal} - {background}| / {noise}"
+            full = f"CNR = |{signal} - {background}| / {noise} = {result_text}"
+            return (display, full, result_text)
+
+        if analysis == "Uniformity":
+            max_value = self._value_or_na(stats.get("max_value"))
+            min_value = self._value_or_na(stats.get("min_value"))
+            display = "100 × (1 - (max - min)/(max + min))"
+            full = f"Uniformity = 100 × (1 - ({max_value} - {min_value}) / ({max_value} + {min_value})) = {result_text}"
+            return (display, full, result_text)
+
+        if analysis == "Line Profile":
+            line_stats = dict(stats)
+            metric_key = metric.lower()
+            if "distance" in metric_key:
+                value = self._value_or_na(line_stats.get("length_px"))
+                return ("distance between sampled points", "Distance = line length along selected segment", value)
+            if "std" in metric_key:
+                value = self._value_or_na(line_stats.get("std_intensity"))
+                return ("std(intensity(x))", "Std = standard deviation of sampled line intensity", value)
+            if "fwhm" in metric_key:
+                value = self._value_or_na(line_stats.get("fwhm"))
+                return ("width at 50% of peak", "FWHM = distance between half-maximum crossings", value)
+            if "mean" in metric_key:
+                value = self._value_or_na(line_stats.get("mean_intensity"))
+                return ("mean(intensity(x))", "Mean = average sampled line intensity", value)
+            return ("intensity(x) sampled along selected line", "Line profile sampled along selected line", result_text)
+
+        if analysis == "MTF":
+            metric_key = metric.lower()
+            mapping = {
+                "mtf50": ("f where MTF(f) = 0.5", "MTF50 is the spatial frequency where MTF(f) reaches 0.5"),
+                "mtf10": ("f where MTF(f) = 0.1", "MTF10 is the spatial frequency where MTF(f) reaches 0.1"),
+                "nyquist mtf": ("MTF(f_Nyquist)", "Nyquist MTF is MTF at detector Nyquist frequency"),
+                "edge snr": ("edge contrast / noise", "Edge SNR = edge contrast divided by noise"),
+                "iec compliance": ("IEC validation outcome", "IEC compliance = structured validation result"),
+                "qa grade": ("quality grade from metrics", "QA grade = mapped rating from MTF quality metrics"),
+            }
+            display, full = mapping.get(metric_key, ("slanted-edge definition", "MTF computed from slanted-edge ESF/LSF/MTF pipeline"))
+            return (display, full, result_text)
+
+        display = str(row.get("formula_mode", "")).strip() or "N/A"
+        full = f"{metric} = {display} = {result_text}" if display != "N/A" else f"{metric} = {result_text}"
+        return (display, full, result_text)
+
+    def _expand_analysis_metric_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        expanded: list[dict[str, Any]] = []
+        for row in rows:
+            analysis_type = self._resolve_analysis_tab_for_row(row)
+            if not analysis_type:
                 continue
-            if lowered in {"derived metric", "= n/a", "n/a", "-"}:
+            base = dict(row)
+            base["analysis_type"] = analysis_type
+            if analysis_type == "SNR":
+                stats = dict(base.get("stats") or {})
+                for metric_name, result_value in (
+                    ("Signal Mean", stats.get("mean_signal")),
+                    ("Noise SD", stats.get("std_noise")),
+                    ("SNR", base.get("result_value")),
+                ):
+                    metric_row = dict(base)
+                    metric_row["item_name"] = metric_name
+                    metric_row["metric_name"] = metric_name
+                    metric_row["result_value"] = result_value
+                    metric_row["result_text"] = self._value_or_na(result_value)
+                    expanded.append(metric_row)
                 continue
-            if text == result_text:
+            if analysis_type == "Line Profile" and str(base.get("metric_name", "")).upper() == "LINE_PROFILE_SUMMARY":
+                stats = dict(base.get("stats") or {})
+                for metric_name, result_value in (
+                    ("Distance", stats.get("length_px")),
+                    ("Mean", stats.get("mean_intensity")),
+                    ("Std", stats.get("std_intensity")),
+                    ("FWHM", stats.get("fwhm")),
+                ):
+                    metric_row = dict(base)
+                    metric_row["item_name"] = metric_name
+                    metric_row["metric_name"] = metric_name
+                    metric_row["result_value"] = result_value
+                    metric_row["result_text"] = self._value_or_na(result_value)
+                    expanded.append(metric_row)
                 continue
-            return text
-        return ""
+            if analysis_type == "Uniformity":
+                base["item_name"] = "Uniformity"
+                base["metric_name"] = "Uniformity"
+            expanded.append(base)
+        return expanded
 
     def _refresh_analysis_results_panel(self) -> None:
         rows_container = getattr(self, "analysis_results_rows_container", None)
@@ -5224,10 +5324,12 @@ class DicomViewer:
         self._active_signal_analysis_tab = active_tab
         rows = self._build_analysis_result_rows()
         filtered_rows = self._filter_analysis_rows_for_selected_tab(rows, active_tab)
-        grouped_rows = self._group_analysis_rows_for_panel(filtered_rows)
+        expanded_rows = self._expand_analysis_metric_rows(filtered_rows)
+        grouped_rows = self._group_analysis_rows_for_panel(expanded_rows)
         if not grouped_rows:
             grouped_rows = [{"category": "ROI", "item_name": "No results for selected analysis", "result_text": "", "note_text": ""}]
         data_row_index = 0
+        self._analysis_result_popup_payloads = {}
         for row_index, row in enumerate(grouped_rows):
             category = str(row.get("category", "METRIC"))
             item_text = row.get("item_name", row.get("metric_name", ""))
@@ -5236,10 +5338,14 @@ class DicomViewer:
             elif category == "METRIC":
                 item_text = f"    {item_text}"
             value_text = self._format_analysis_value_text(row) if category in {"METRIC", "METRIC_FLAT"} else ""
-            note_text = self._build_analysis_panel_remark_text(row, category)
+            display_formula = ""
+            full_formula = ""
+            if category in {"METRIC", "METRIC_FLAT"}:
+                display_formula, full_formula, value_text = self._build_metric_formula_payload(row, str(row.get("resolved_analysis_type", "")))
+                display_formula = self._truncate_formula_text(display_formula)
             item_value = self._sanitize_ui_text(str(item_text))
+            formula_value = self._sanitize_ui_text(display_formula)
             value_value = self._sanitize_ui_text("" if value_text is None else str(value_text))
-            note_value = note_text
             if category in {"ROI", "ANALYSIS"}:
                 background = "#F8FAFC"
                 font = ("TkDefaultFont", 10, "bold")
@@ -5254,11 +5360,11 @@ class DicomViewer:
             row_frame.grid_columnconfigure(2, weight=0, minsize=130)
 
             item_label = tk.Label(row_frame, text=item_value, anchor="w", justify="left", bg=background, fg=self.ui_colors["text_primary"], font=font, padx=8, pady=4)
+            formula_label = tk.Label(row_frame, text=formula_value, anchor="w", justify="left", bg=background, fg=self.ui_colors["text_primary"], font=("TkDefaultFont", 9), padx=6, pady=4)
             value_label = tk.Label(row_frame, text=value_value, anchor="w", justify="left", bg=background, fg=self.ui_colors["text_primary"], font=font, padx=6, pady=4)
-            note_label = tk.Label(row_frame, text=note_value, anchor="w", justify="left", bg=background, fg=self.ui_colors["text_primary"], font=("TkDefaultFont", 9), padx=6, pady=4)
             item_label.grid(row=0, column=0, sticky="nsew")
-            value_label.grid(row=0, column=1, sticky="nsew")
-            note_label.grid(row=0, column=2, sticky="nsew")
+            formula_label.grid(row=0, column=1, sticky="nsew")
+            value_label.grid(row=0, column=2, sticky="nsew")
 
             separator = tk.Frame(rows_container, height=1, bg=self.ui_colors["border"])
             separator.grid(row=(row_index * 2) + 1, column=0, sticky="ew")
@@ -5266,13 +5372,22 @@ class DicomViewer:
 
             row_widgets = {
                 "frame": row_frame,
-                "labels": (item_label, value_label, note_label),
+                "labels": (item_label, formula_label, value_label),
                 "base_bg": background,
                 "is_section": category in {"ROI", "ANALYSIS"},
             }
             self._analysis_results_row_widgets.append(row_widgets)
-            for widget in (row_frame, item_label, value_label, note_label):
+            if category in {"METRIC", "METRIC_FLAT"}:
+                self._analysis_result_popup_payloads[row_index] = {
+                    "metric": str(row.get("item_name", row.get("metric_name", ""))),
+                    "definition": display_formula,
+                    "calculation": full_formula or display_formula,
+                    "result": str(value_text or "N/A"),
+                }
+            for widget in (row_frame, item_label, formula_label, value_label):
                 widget.bind("<Button-1>", lambda _event, idx=row_index: self._select_analysis_results_row(idx))
+                if category in {"METRIC", "METRIC_FLAT"}:
+                    widget.bind("<Double-Button-1>", lambda _event, idx=row_index: self._show_analysis_formula_detail(idx))
 
         rows_container.grid_columnconfigure(0, weight=1)
         self._relayout_analysis_result_rows()
@@ -5296,12 +5411,28 @@ class DicomViewer:
         width = max(int(container.winfo_width()), 400)
         item_width = 220
         value_width = 180
-        note_width = max(240, width - item_width - value_width - 40)
+        formula_width = max(220, width - item_width - value_width - 40)
         for row in self._analysis_results_row_widgets:
             labels = row["labels"]
             labels[0].configure(wraplength=item_width - 16)
-            labels[1].configure(wraplength=value_width - 12)
-            labels[2].configure(wraplength=note_width - 12)
+            labels[1].configure(wraplength=formula_width - 12)
+            labels[2].configure(wraplength=value_width - 12)
+
+    def _show_analysis_formula_detail(self, row_index: int) -> None:
+        payload = getattr(self, "_analysis_result_popup_payloads", {}).get(row_index)
+        if not payload:
+            return
+        messagebox.showinfo(
+            "Formula Details",
+            "\n".join(
+                (
+                    f"Metric: {payload.get('metric', 'N/A')}",
+                    f"Definition: {payload.get('definition', 'N/A')}",
+                    f"Calculation: {payload.get('calculation', 'N/A')}",
+                    f"Result: {payload.get('result', 'N/A')}",
+                )
+            ),
+        )
 
     def _build_analysis_export_payload(self) -> dict[str, Any]:
         rows = self._build_analysis_result_rows()
