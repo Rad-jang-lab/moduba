@@ -111,6 +111,47 @@ def build_window_b_analysis_panel(
     rows_container.bind("<Configure>", _sync_scroll_region)
     canvas.bind("<Configure>", _sync_row_container_width)
 
+    def _is_descendant_of_results_panel(widget: tk.Misc | None) -> bool:
+        current = widget
+        while current is not None:
+            if current == results_panel:
+                return True
+            current = current.master
+        return False
+
+    def _scroll_results_canvas(units: int) -> None:
+        if units != 0:
+            canvas.yview_scroll(units, "units")
+
+    def _on_results_mousewheel(event: tk.Event) -> str | None:
+        if not _is_descendant_of_results_panel(event.widget):
+            return None
+        delta = int(event.delta)
+        if delta == 0:
+            return "break"
+        _scroll_results_canvas(int(-delta / 120))
+        return "break"
+
+    def _on_results_button4(_event: tk.Event) -> str | None:
+        _scroll_results_canvas(-1)
+        return "break"
+
+    def _on_results_button5(_event: tk.Event) -> str | None:
+        _scroll_results_canvas(1)
+        return "break"
+
+    canvas.bind_all("<MouseWheel>", _on_results_mousewheel, add="+")
+    rows_container.bind_all(
+        "<Button-4>",
+        lambda event: _on_results_button4(event) if _is_descendant_of_results_panel(event.widget) else None,
+        add="+",
+    )
+    rows_container.bind_all(
+        "<Button-5>",
+        lambda event: _on_results_button5(event) if _is_descendant_of_results_panel(event.widget) else None,
+        add="+",
+    )
+
     # [viewer_adapter 의존]
     # 목적: 기존 export callback 의미를 변경 없이 전달
     # 분류: report/export callback
@@ -121,7 +162,7 @@ def build_window_b_analysis_panel(
     results_panel.grid_columnconfigure(1, weight=1)
     results_panel.grid_rowconfigure(1, weight=1)
     panel.grid_columnconfigure(0, weight=1)
-    panel.grid_rowconfigure(0, weight=1)
+    panel.grid_rowconfigure(0, weight=0)
     panel.grid_rowconfigure(1, weight=1)
     # [viewer_adapter 의존]
     # 목적: 기존 viewer 기반 refresh 루프에서 참조하는 widget 핸들 등록
