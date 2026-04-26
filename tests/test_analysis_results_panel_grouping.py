@@ -84,3 +84,45 @@ def test_group_analysis_rows_for_panel_falls_back_to_flat_when_analysis_missing(
     grouped = DicomViewer._group_analysis_rows_for_panel(rows)
     assert len(grouped) == 1
     assert grouped[0]["category"] == "METRIC_FLAT"
+
+
+def test_group_analysis_rows_for_panel_uses_roi1_when_roi_is_missing():
+    rows = [
+        {
+            "metric_name": "MTF",
+            "item_name": "MTF50",
+            "formula_mode": "slanted_edge",
+            "roi_ids": [],
+            "roles": [],
+            "stats": {},
+            "result_value": 0.1,
+            "result_text": "0.1000",
+            "note_text": "",
+        }
+    ]
+    grouped = DicomViewer._group_analysis_rows_for_panel(rows)
+    assert grouped[0]["category"] == "ROI"
+    assert grouped[0]["item_name"] == "ROI 1"
+    assert grouped[1]["category"] == "ANALYSIS"
+    assert grouped[1]["item_name"] == "MTF"
+
+
+def test_group_analysis_rows_for_panel_moves_validation_summary_to_analysis_node():
+    rows = [
+        {
+            "metric_name": "MTF",
+            "item_name": "MTF50",
+            "formula_mode": "slanted_edge",
+            "roi_ids": ["roi_1"],
+            "roles": [],
+            "stats": {},
+            "result_value": 0.1,
+            "result_text": "0.1000",
+            "note_text": "Validity=valid; reason_codes=[NONMONOTONIC_TAIL, POSSIBLE_ALIASING, EDGE_SNR_LOW, RESULT_QUESTIONABLE]",
+        }
+    ]
+    grouped = DicomViewer._group_analysis_rows_for_panel(rows)
+    assert grouped[1]["category"] == "ANALYSIS"
+    assert grouped[1]["note_text"].startswith("Questionable")
+    assert grouped[2]["category"] == "METRIC"
+    assert grouped[2]["note_text"] == ""

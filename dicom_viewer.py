@@ -4119,7 +4119,7 @@ class DicomViewer:
                     "roles": [] if role is None else [role],
                     "stats": stats,
                     "result_value": float(stats["mean"]),
-                    "item_name": self._display_name_for_roi_id(measurement.id),
+                    "item_name": "Current frame ROI statistics",
                     "note_text": "Current frame ROI statistics",
                     "result_text": f"Mean: {stats['mean']:.2f}, SD: {stats['std']:.2f}",
                     "developer_meta": {
@@ -4311,7 +4311,7 @@ class DicomViewer:
                     "roles": [],
                     "stats": line_stats,
                     "result_value": float(line_stats["mean_intensity"]),
-                    "item_name": "Line Profile",
+                    "item_name": "Summary",
                     "note_text": line_note,
                     "result_text": f"{line_stats['mean_intensity']:.2f}",
                     "developer_meta": line,
@@ -4350,7 +4350,7 @@ class DicomViewer:
                 "roi_ids": mtf_row["roi_ids"],
                 "roles": [],
                 "stats": mtf_row["stats"],
-                "note_text": mtf_row["note_text"],
+                "note_text": "",
                 "developer_meta": mtf,
             }
             for metric_name, value in (
@@ -4648,6 +4648,17 @@ class DicomViewer:
 
     @staticmethod
     def _group_analysis_rows_for_panel(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        def _is_placeholder_text(value: Any) -> bool:
+            text = str(value or "").strip()
+            return text in {"", "-", "N/A", "n/a"}
+
+        def _is_meaningless_metric_row(row: dict[str, Any]) -> bool:
+            metric_name = str(row.get("metric_name", "")).strip()
+            item_name = str(row.get("item_name", "")).strip()
+            result_text = str(row.get("result_text", "")).strip()
+            note_text = str(row.get("note_text", "")).strip()
+            return _is_placeholder_text(metric_name) and _is_placeholder_text(item_name) and _is_placeholder_text(result_text) and _is_placeholder_text(note_text)
+
         def _normalize_analysis_name(value: str) -> str:
             if not value:
                 return ""
@@ -4666,6 +4677,33 @@ class DicomViewer:
             if "line" in lowered or "profile" in lowered:
                 return "Line Profile"
             return normalized
+
+        def _summarize_validation_text(value: Any) -> str:
+            text = str(value or "").strip()
+            if not text:
+                return ""
+            lowered = text.lower()
+            if "validity=valid" not in lowered and "reason_codes=" not in lowered:
+                return ""
+            code_text = ""
+            if "reason_codes=[" in text:
+                code_text = text.split("reason_codes=[", 1)[1].split("]", 1)[0]
+            codes = [str(item).strip().upper() for item in code_text.split(",") if str(item).strip()]
+            if not codes:
+                return ""
+            risks: list[str] = []
+            if any(code in {"EDGE_SNR_LOW", "EDGE_SNR_BORDERLINE"} for code in codes):
+                risks.append("low edge SNR")
+            if any(code in {"POSSIBLE_ALIASING", "NONMONOTONIC_TAIL"} for code in codes):
+                risks.append("aliasing risk")
+            if "HIGH_FREQUENCY_NOISE_BIAS_RISK" in codes:
+                risks.append("high-frequency noise risk")
+            if "EDGE_CLIPPING_DETECTED" in codes:
+                risks.append("edge clipping risk")
+            prefix = "Questionable" if "RESULT_QUESTIONABLE" in codes else "Review"
+            if not risks:
+                return prefix
+            return f"{prefix}: {' / '.join(dict.fromkeys(risks))}"
 
         def _resolve_analysis_type(row: dict[str, Any]) -> str:
             candidates = [
@@ -4701,26 +4739,30 @@ class DicomViewer:
             "Other": 5,
         }
 
+        filtered_rows = [row for row in rows if not _is_meaningless_metric_row(row)]
+        if not filtered_rows:
+            return []
+
         normalized_rows: list[dict[str, Any]] = []
-        for row in rows:
+        for row in filtered_rows:
             merged = dict(row)
             analysis_type = _resolve_analysis_type(merged)
             roi_label = _resolve_roi_label(merged)
             if not roi_label:
-                roi_label = "ROI 1" if len(rows) == 1 else "ROI Unknown"
+                roi_label = "ROI 1"
             if not analysis_type:
-                return [{**dict(item), "category": "METRIC_FLAT"} for item in rows]
+                return [{**dict(item), "category": "METRIC_FLAT"} for item in filtered_rows]
             analysis_type = _normalize_analysis_name(analysis_type)
             if not analysis_type:
-                return [{**dict(item), "category": "METRIC_FLAT"} for item in rows]
+                return [{**dict(item), "category": "METRIC_FLAT"} for item in filtered_rows]
             merged["resolved_roi_label"] = roi_label
             merged["resolved_analysis_type"] = analysis_type if analysis_type in analysis_priority else (analysis_type or "Other")
             normalized_rows.append(merged)
 
         if any(not row.get("resolved_roi_label") for row in normalized_rows):
-            return [{**dict(item), "category": "METRIC_FLAT"} for item in rows]
+            return [{**dict(item), "category": "METRIC_FLAT"} for item in filtered_rows]
         if any(not row.get("resolved_analysis_type") for row in normalized_rows):
-            return [{**dict(item), "category": "METRIC_FLAT"} for item in rows]
+            return [{**dict(item), "category": "METRIC_FLAT"} for item in filtered_rows]
 
         grouped: dict[str, dict[str, list[dict[str, Any]]]] = {}
         roi_order: list[str] = []
@@ -4740,8 +4782,13 @@ class DicomViewer:
             analysis_nodes = grouped[roi_key]
             analysis_keys = sorted(analysis_nodes.keys(), key=lambda key: (analysis_priority.get(key, 5), key))
             for analysis_key in analysis_keys:
-                ordered.append({"category": "ANALYSIS", "item_name": analysis_key, "result_text": "", "note_text": ""})
                 metric_rows = analysis_nodes.get(analysis_key, [])
+                analysis_note = ""
+                for metric_row in metric_rows:
+                    analysis_note = _summarize_validation_text(metric_row.get("note_text", ""))
+                    if analysis_note:
+                        break
+                ordered.append({"category": "ANALYSIS", "item_name": analysis_key, "result_text": "", "note_text": analysis_note})
                 metric_rows_sorted = sorted(
                     metric_rows,
                     key=lambda item: (
@@ -4750,10 +4797,14 @@ class DicomViewer:
                     ),
                 )
                 for metric_row in metric_rows_sorted:
+                    if _summarize_validation_text(metric_row.get("note_text", "")):
+                        metric_row = {**metric_row, "note_text": ""}
                     ordered.append({**metric_row, "category": "METRIC"})
         return ordered
 
     def _build_analysis_panel_remark_text(self, row: dict[str, Any], category: str) -> str:
+        if category == "ANALYSIS":
+            return str(row.get("note_text", "")).strip()
         if category != "METRIC":
             return ""
         candidates = [
