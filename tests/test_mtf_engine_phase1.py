@@ -13,6 +13,7 @@ from mtf_engine import (
     REJECTION_CLIPPING,
     REJECTION_CONTRAST,
     REJECTION_NONLINEAR,
+    calculate_matlab_reference_mtf,
     calculate_slanted_edge_mtf,
 )
 
@@ -78,3 +79,30 @@ def test_rejects_for_obviously_nonlinear_metadata():
     result = calculate_slanted_edge_mtf(roi, metadata={"voi_lut_applied": True})
     assert result["calculation_status"] == "reject"
     assert result["rejection_reason"] == REJECTION_NONLINEAR
+
+
+def test_matlab_reference_mode_returns_curves_and_metrics():
+    roi = _make_slanted_edge(size=96, angle_deg=8.0)
+    result = calculate_matlab_reference_mtf(roi, pixel_spacing_mm=0.1988)
+
+    assert result["calculation_status"] == "pass"
+    assert isinstance(result["mtf50"], float)
+    assert isinstance(result["mtf10"], float)
+    assert result["mtf_curve"] is not None
+    diag = result.get("diagnostics") or {}
+    assert diag.get("fft", {}).get("window_function") == "hamming"
+    assert diag.get("fft", {}).get("nfft") == 4096
+    interpolation = diag.get("interpolation", {})
+    assert interpolation.get("interpolation_method_used") in {"pchip", "linear", "linear_fallback_after_pchip_error"}
+    assert isinstance(interpolation.get("pchip_available"), bool)
+    if not interpolation.get("pchip_available"):
+        assert interpolation.get("warning") == "PCHIP unavailable: using linear fallback; result may differ from MATLAB."
+        assert interpolation.get("matlab_equivalence_flag") == "not fully MATLAB-equivalent"
+    assert diag.get("gaussian_smoothing", {}).get("gaussian_kernel_size") == 5
+    assert diag.get("gaussian_smoothing", {}).get("gaussian_boundary_mode") == "numpy_convolve_same_zero_padding"
+
+
+def test_matlab_reference_mode_rejects_without_pixel_spacing():
+    roi = _make_slanted_edge(size=96, angle_deg=8.0)
+    result = calculate_matlab_reference_mtf(roi, pixel_spacing_mm=None)
+    assert result["calculation_status"] == "reject"
