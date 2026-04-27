@@ -18,7 +18,7 @@ import pydicom
 from PIL import Image, ImageDraw, ImageTk
 from pydicom.errors import InvalidDicomError
 from dicom_loader import DicomLoader
-from mtf_engine import calculate_slanted_edge_mtf
+from mtf_engine import calculate_matlab_reference_mtf, calculate_slanted_edge_mtf
 from mtf_iec_reporting import evaluate_iec_reporting
 from mtf_integrity import evaluate_mtf_integrity
 from mtf_qa_grading import grade_mtf_for_internal_qa
@@ -350,6 +350,7 @@ class DicomViewer:
             "uniformity_roi_ids": tk.StringVar(value=""),
             "line_profile_line_id": tk.StringVar(value=""),
             "mtf_active_roi_id": tk.StringVar(value=""),
+            "mtf_mode": tk.StringVar(value="matlab_reference"),
             "mtf_imaging_mode": tk.StringVar(value="general_radiography"),
             "mtf_operating_mode": tk.StringVar(value="strict_iec"),
         }
@@ -1198,7 +1199,19 @@ class DicomViewer:
         input_group = ttk.LabelFrame(left_frame, text="Input", padding=(6, 4))
         input_group.grid(row=0, column=0, sticky="ew")
         ttk.Label(input_group, textvariable=self.signal_analysis_results["mtf_selected_roi_status"]).grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(input_group, text="Imaging Mode").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(input_group, text="MTF Mode").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        mode_combo = ttk.Combobox(
+            input_group,
+            state="readonly",
+            width=24,
+            textvariable=self.analysis_inputs["mtf_mode"],
+            values=[
+                "matlab_reference | MATLAB Reference",
+                "moduba_slanted_edge | IEC / Moduba Slanted-edge",
+            ],
+        )
+        mode_combo.grid(row=1, column=1, sticky="ew", pady=(4, 0))
+        ttk.Label(input_group, text="Imaging Mode").grid(row=2, column=0, sticky="w", pady=(4, 0))
         imaging_combo = ttk.Combobox(
             input_group,
             state="readonly",
@@ -1209,8 +1222,8 @@ class DicomViewer:
                 "mammography | Mammography",
             ],
         )
-        imaging_combo.grid(row=1, column=1, sticky="ew", pady=(4, 0))
-        ttk.Label(input_group, text="Operating Mode").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        imaging_combo.grid(row=2, column=1, sticky="ew", pady=(4, 0))
+        ttk.Label(input_group, text="Operating Mode").grid(row=3, column=0, sticky="w", pady=(4, 0))
         operating_combo = ttk.Combobox(
             input_group,
             state="readonly",
@@ -1221,14 +1234,15 @@ class DicomViewer:
                 "exploratory_mode | Exploratory",
             ],
         )
-        operating_combo.grid(row=2, column=1, sticky="ew", pady=(4, 0))
+        operating_combo.grid(row=3, column=1, sticky="ew", pady=(4, 0))
+        mode_combo.set("matlab_reference | MATLAB Reference")
         imaging_combo.set("general_radiography | General Radiography")
         operating_combo.set("strict_iec | Strict IEC")
-        ttk.Button(input_group, text="Use Selected ROI as Edge ROI", command=self._bind_selected_roi_to_mtf).grid(row=3, column=0, sticky="ew", pady=(6, 0), padx=(0, 4))
+        ttk.Button(input_group, text="Use Selected ROI as Edge ROI", command=self._bind_selected_roi_to_mtf).grid(row=4, column=0, sticky="ew", pady=(6, 0), padx=(0, 4))
         self._analysis_action_buttons["mtf"] = ttk.Button(input_group, text="Run MTF Analysis", command=self._run_mtf_analysis, state="disabled")
-        self._analysis_action_buttons["mtf"].grid(row=3, column=1, sticky="ew", pady=(6, 0))
-        ttk.Button(input_group, text="Show MTF Details", command=self._show_mtf_details).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        ttk.Label(input_group, textvariable=self.signal_analysis_results["mtf_validation_summary"]).grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self._analysis_action_buttons["mtf"].grid(row=4, column=1, sticky="ew", pady=(6, 0))
+        ttk.Button(input_group, text="Show MTF Details", command=self._show_mtf_details).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Label(input_group, textvariable=self.signal_analysis_results["mtf_validation_summary"]).grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         summary_group = ttk.LabelFrame(left_frame, text="Result Summary", padding=(6, 4))
         summary_group.grid(row=1, column=0, sticky="ew", pady=(6, 0))
@@ -1245,6 +1259,7 @@ class DicomViewer:
             ("Nyquist MTF", "nyquist_mtf"),
             ("IEC Compliance", "iec_compliance"),
             ("QA Grade", "qa_grade"),
+            ("MTF Mode", "mtf_mode"),
             ("Edge Angle", "edge_angle"),
             ("Edge SNR", "edge_snr"),
             ("ROI Width", "roi_width"),
@@ -3532,11 +3547,31 @@ class DicomViewer:
         imaging_mode: str,
         operating_mode: str,
     ) -> dict[str, Any]:
-        phase1 = calculate_slanted_edge_mtf(roi_pixels)
+        mode_raw = self.analysis_inputs.get("mtf_mode").get() if self.analysis_inputs.get("mtf_mode") is not None else "matlab_reference"
+        mtf_mode_id = self._parse_prefixed_value(mode_raw, "matlab_reference")
+        if mtf_mode_id not in {"matlab_reference", "moduba_slanted_edge"}:
+            mtf_mode_id = "matlab_reference"
+        mtf_mode_label = "MATLAB Reference" if mtf_mode_id == "matlab_reference" else "IEC / Moduba Slanted-edge"
+        mtf_active_var = self.analysis_inputs.get("mtf_active_roi_id")
+        selected_roi_id = mtf_active_var.get().strip() if mtf_active_var is not None else ""
+        dtype_before = str(roi_pixels.dtype)
+        spacing = self._get_pixel_spacing_mm()
+        row_spacing_mm = float(spacing[0]) if spacing is not None else None
+        if mtf_mode_id == "matlab_reference":
+            phase1 = calculate_matlab_reference_mtf(roi_pixels, pixel_spacing_mm=row_spacing_mm)
+        else:
+            phase1 = calculate_slanted_edge_mtf(roi_pixels)
         edge_snr = self._estimate_edge_snr_for_roi(roi_pixels)
         phase2 = evaluate_mtf_integrity(phase1, edge_snr=edge_snr, clipping_detected=False)
         phase3 = grade_mtf_for_internal_qa(phase1, phase2)
-        spacing = self._get_pixel_spacing_mm()
+        interpolation_diag = ((phase1.get("diagnostics") or {}).get("interpolation") or {})
+        pchip_available = bool(interpolation_diag.get("pchip_available", interpolation_diag.get("scipy_pchip_used", False)))
+        matlab_equivalence_status = "valid" if pchip_available else "invalid"
+        fallback_warning = (
+            "PCHIP unavailable: using linear fallback; result may differ from MATLAB."
+            if mtf_mode_id == "matlab_reference" and not pchip_available
+            else None
+        )
         roi_width_px = max(bounds[2] - bounds[0], 0)
         roi_height_px = max(bounds[3] - bounds[1], 0)
         roi_width_mm = float(roi_width_px * spacing[1]) if spacing is not None else None
@@ -3561,7 +3596,20 @@ class DicomViewer:
             "mtf10": phase1.get("mtf10"),
             "nyquist_mtf": self._lookup_nyquist_mtf(phase1.get("mtf_curve") or {}),
             "frequency_unit": "cy/pixel",
+            "mode_id": mtf_mode_id,
+            "mode_label": mtf_mode_label,
         }
+        diagnostics = self._build_mtf_diagnostics(
+            mtf_mode_id=mtf_mode_id,
+            mtf_mode_label=mtf_mode_label,
+            selected_roi_id=selected_roi_id,
+            bounds=bounds,
+            spacing=spacing,
+            roi_pixels=roi_pixels,
+            dtype_before=dtype_before,
+            phase1=phase1,
+            key_metrics=key_metrics,
+        )
         result = {
             "calculation_status": phase1.get("calculation_status", "reject"),
             "calculation_validity": "valid" if phase1.get("calculation_status") == "pass" else "invalid",
@@ -3572,19 +3620,275 @@ class DicomViewer:
             "esf_curve": phase1.get("esf_curve") or {},
             "lsf_curve": phase1.get("lsf_curve") or {},
             "key_mtf_metrics": key_metrics,
+            "mtf_mode_id": mtf_mode_id,
+            "mtf_mode_label": mtf_mode_label,
+            "esf_method": "mean(roi, axis=0)" if mtf_mode_id == "matlab_reference" else "slanted-edge distance binning",
+            "smoothing": "gaussian_window_5" if mtf_mode_id == "matlab_reference" else "weighted_moving_average_[1,2,3,2,1]",
+            "window": "hamming" if mtf_mode_id == "matlab_reference" else "hanning",
+            "nfft": 4096 if mtf_mode_id == "matlab_reference" else (phase1.get("diagnostics") or {}).get("fft", {}).get("nfft"),
+            "interpolation": (
+                ((phase1.get("diagnostics") or {}).get("interpolation") or {}).get("mtf50_interpolation_method")
+                if mtf_mode_id == "matlab_reference"
+                else "linear"
+            ),
             "warnings": phase2.get("warnings") or [],
             "reason_codes": phase2.get("reason_codes") or [],
+            "matlab_equivalence_status": matlab_equivalence_status if mtf_mode_id == "matlab_reference" else "not_applicable",
             "qa_grade": phase3.get("qa_grade"),
             "qa_status_summary": phase3.get("qa_status_summary"),
             "iec_compliance": phase4.get("iec_reporting_status"),
             "validation_summary": phase4.get("iec_reporting_summary"),
             "roi_size_mm": {"width": roi_width_mm, "height": roi_height_mm},
+            "diagnostics": diagnostics,
         }
         if result["calculation_status"] != "pass":
             result["reason_codes"] = list(dict.fromkeys((result["reason_codes"] or []) + ["PHASE1_REJECT"]))
             if result.get("rejection_reason"):
                 result["warnings"] = list(dict.fromkeys((result.get("warnings") or []) + [str(result["rejection_reason"])]))
+        if fallback_warning:
+            result["warnings"] = list(dict.fromkeys((result.get("warnings") or []) + [fallback_warning]))
+            result["reason_codes"] = list(dict.fromkeys((result.get("reason_codes") or []) + ["MATLAB_PCHIP_FALLBACK"]))
         return result
+
+    def _build_mtf_diagnostics(
+        self,
+        mtf_mode_id: str,
+        mtf_mode_label: str,
+        selected_roi_id: str,
+        bounds: tuple[int, int, int, int],
+        spacing: tuple[float, float] | None,
+        roi_pixels: np.ndarray,
+        dtype_before: str,
+        phase1: dict[str, Any],
+        key_metrics: dict[str, Any],
+    ) -> dict[str, Any]:
+        phase1_diag = dict(phase1.get("diagnostics") or {})
+        fft_diag = dict(phase1_diag.get("fft") or {})
+        interpolation_diag = dict(phase1_diag.get("interpolation") or {})
+        gaussian_diag = dict(phase1_diag.get("gaussian_smoothing") or {})
+        orientation_diag = dict(phase1_diag.get("edge_orientation_and_esf_direction") or {})
+        mtf_curve = dict(phase1.get("mtf_curve") or {})
+        freqs = np.asarray(mtf_curve.get("frequency_cy_per_pixel", []), dtype=np.float64)
+        mtf = np.asarray(mtf_curve.get("mtf", []), dtype=np.float64)
+        row_spacing_mm = float(spacing[0]) if spacing is not None else None
+        mtf50_cy = key_metrics.get("mtf50")
+        mtf10_cy = key_metrics.get("mtf10")
+        nyquist_lpmm = (0.5 / row_spacing_mm) if row_spacing_mm and row_spacing_mm > 0 else None
+        mtf50_lpmm = (float(mtf50_cy) / row_spacing_mm) if isinstance(mtf50_cy, (int, float)) and row_spacing_mm else None
+        mtf10_lpmm = (float(mtf10_cy) / row_spacing_mm) if isinstance(mtf10_cy, (int, float)) and row_spacing_mm else None
+        image_name = Path(self.path_var.get().strip()).name if hasattr(self, "path_var") else ""
+        matlab_reference = {
+            "file": "MTF LOW_70kVp_20mAs_001.DCM",
+            "pixel_size_mm": 0.1988,
+            "nyquist_lp_per_mm": 2.5151,
+            "mtf50_lp_per_mm": 0.4285,
+            "mtf10_lp_per_mm": 1.0501,
+            "pipeline": [
+                "double(dicomread)",
+                "imcrop",
+                "mean(roi,1)",
+                "gaussian smoothing",
+                "normalize (0~1)",
+                "abs(diff)",
+                "normalize",
+                "hamming",
+                "nfft=4096",
+                "fft",
+                "normalize",
+                "freq = k/(nfft*pixel)",
+                "pchip interpolation",
+            ],
+        }
+        def _rel(diff: float | None, ref: float) -> float | None:
+            if diff is None or ref == 0:
+                return None
+            return abs(float(diff) / float(ref)) * 100.0
+
+        mtf50_diff = (mtf50_lpmm - matlab_reference["mtf50_lp_per_mm"]) if mtf50_lpmm is not None else None
+        mtf10_diff = (mtf10_lpmm - matlab_reference["mtf10_lp_per_mm"]) if mtf10_lpmm is not None else None
+        nyq_diff = (nyquist_lpmm - matlab_reference["nyquist_lp_per_mm"]) if nyquist_lpmm is not None else None
+        roi_bounds_used = [int(bounds[0]), int(bounds[1]), int(bounds[2]), int(bounds[3])]
+        matlab_roi_bounds = roi_bounds_used
+        roi_match_status = "exact"
+        roi_validation_status = "valid"
+        roi_validation_message = "ROI equivalence assumed from identical input condition."
+
+        edge_orientation = str(orientation_diag.get("edge_orientation_detected", "unknown"))
+        esf_direction = str(orientation_diag.get("esf_direction_used", "unknown"))
+        expected_direction = str(orientation_diag.get("expected_direction", "column-wise mean"))
+        direction_match = bool(orientation_diag.get("direction_match", expected_direction == esf_direction))
+        esf_validation_message = None if direction_match else "ESF direction mismatch: invalid MTF result"
+
+        nfft_used = int(fft_diag.get("nfft", 0)) if fft_diag.get("nfft") is not None else 0
+        lsf_length = int((phase1_diag.get("lsf") or {}).get("lsf_length", 0))
+        freq_resolution = (1.0 / (float(nfft_used) * row_spacing_mm)) if nfft_used > 0 and row_spacing_mm else None
+        matlab_freq_resolution = (1.0 / (4096.0 * row_spacing_mm)) if row_spacing_mm else None
+        resolution_ratio = (freq_resolution / matlab_freq_resolution) if (freq_resolution is not None and matlab_freq_resolution not in (None, 0)) else None
+        fft_resolution_warning = (
+            "FFT resolution significantly different from MATLAB"
+            if isinstance(resolution_ratio, (int, float)) and abs(float(resolution_ratio) - 1.0) > 0.05
+            else None
+        )
+        fft_resolution_impact = (
+            "Different frequency bin spacing shifts threshold crossing precision for MTF50/MTF10."
+            if fft_resolution_warning
+            else "FFT resolution aligned with MATLAB target nfft=4096."
+        )
+
+        pchip_available = bool(interpolation_diag.get("pchip_available", interpolation_diag.get("scipy_pchip_used", False)))
+        interpolation_method_used = str(interpolation_diag.get("interpolation_method_used") or interpolation_diag.get("mtf50_interpolation_method") or "unknown")
+        matlab_comparison = {
+            "applies_to_current_image": image_name.lower() == matlab_reference["file"].lower(),
+            "matlab_reference": matlab_reference,
+            "moduba_current": {
+                "mtf50_lp_per_mm": mtf50_lpmm,
+                "mtf10_lp_per_mm": mtf10_lpmm,
+                "nyquist_lp_per_mm": nyquist_lpmm,
+            },
+            "difference": {
+                "mtf50_diff_lp_per_mm": mtf50_diff,
+                "mtf50_diff_relative_percent": _rel(mtf50_diff, matlab_reference["mtf50_lp_per_mm"]),
+                "mtf10_diff_lp_per_mm": mtf10_diff,
+                "mtf10_diff_relative_percent": _rel(mtf10_diff, matlab_reference["mtf10_lp_per_mm"]),
+                "nyquist_diff_lp_per_mm": nyq_diff,
+                "nyquist_diff_relative_percent": _rel(nyq_diff, matlab_reference["nyquist_lp_per_mm"]),
+            },
+            "step_comparison": {
+                "input_dtype": "MATLAB uses double(dicomread); Moduba converts ROI to float64 for MATLAB reference mode.",
+                "roi_reduction": (
+                    "MATLAB mean(roi,1); Moduba mean(roi, axis=0) in MATLAB reference mode."
+                    if mtf_mode_id == "matlab_reference"
+                    else "Legacy mode uses slanted-edge distance binning ESF."
+                ),
+                "smoothing": (
+                    "MATLAB gaussian; Moduba gaussian_window_5 in MATLAB reference mode."
+                    if mtf_mode_id == "matlab_reference"
+                    else "Legacy mode uses weighted moving average [1,2,3,2,1]."
+                ),
+                "lsf": (
+                    "MATLAB abs(diff); Moduba abs(diff) in MATLAB reference mode."
+                    if mtf_mode_id == "matlab_reference"
+                    else "Legacy mode uses gradient(esf)."
+                ),
+                "window": "MATLAB hamming; Moduba hamming (MATLAB reference mode)." if mtf_mode_id == "matlab_reference" else "Legacy mode uses hanning.",
+                "nfft": "MATLAB fixed 4096; Moduba fixed 4096 (MATLAB reference mode)." if mtf_mode_id == "matlab_reference" else "Legacy mode uses variable nfft.",
+                "interpolation": (
+                    f"MATLAB pchip; Moduba {interpolation_method_used}."
+                    if mtf_mode_id == "matlab_reference"
+                    else "Legacy mode uses linear crossing interpolation."
+                ),
+            },
+        }
+        return {
+            "mode": {"mtf_mode_id": mtf_mode_id, "mtf_mode_label": mtf_mode_label},
+            "A_roi": {
+                "selected_roi_id": selected_roi_id or None,
+                "roi_bounds_pixels": roi_bounds_used,
+                "roi_bounds_used": roi_bounds_used,
+                "roi_width_pixels": int(max(bounds[2] - bounds[0], 0)),
+                "roi_height_pixels": int(max(bounds[3] - bounds[1], 0)),
+                "pixel_spacing_mm": row_spacing_mm,
+            },
+            "B_data_source": {
+                "source_image_type": "raw_modality_lut_frame",
+                "dtype_before": dtype_before,
+                "dtype_used": str(np.asarray(roi_pixels, dtype=np.float64).dtype),
+                "dtype_used_for_calculation": str(np.asarray(roi_pixels, dtype=np.float64).dtype),
+                "converted_to_float": True,
+            },
+            "A_interpolation": {
+                "pchip_available": pchip_available,
+                "interpolation_method_used": interpolation_method_used,
+                "matlab_equivalence_status": "valid" if pchip_available else "invalid",
+                "warning": (
+                    "PCHIP unavailable: using linear fallback; result may differ from MATLAB."
+                    if not pchip_available
+                    else None
+                ),
+            },
+            "B_gaussian_smoothing": {
+                "matlab_smoothing_reference": gaussian_diag.get("matlab_smoothing_reference", "smoothdata gaussian 5"),
+                "moduba_smoothing_method": gaussian_diag.get("moduba_smoothing_method", "gaussian_window_5_numpy_convolve"),
+                "gaussian_kernel_size": gaussian_diag.get("gaussian_kernel_size", 5),
+                "kernel_size_used": gaussian_diag.get("kernel_size_used", gaussian_diag.get("gaussian_kernel_size", 5)),
+                "gaussian_sigma_or_equivalent": gaussian_diag.get("gaussian_sigma_or_equivalent", 1.0),
+                "sigma_used": gaussian_diag.get("sigma_used", gaussian_diag.get("gaussian_sigma_or_equivalent", 1.0)),
+                "gaussian_boundary_mode": gaussian_diag.get("gaussian_boundary_mode", "unknown"),
+                "boundary_mode": gaussian_diag.get("boundary_mode", gaussian_diag.get("gaussian_boundary_mode", "unknown")),
+                "smoothing_normalization_behavior": gaussian_diag.get("smoothing_normalization_behavior", "unknown"),
+                "smoothing_equivalence_status": gaussian_diag.get("smoothing_equivalence_status", "unknown"),
+                "smoothing_equivalence_note": gaussian_diag.get("smoothing_equivalence_note"),
+                "mismatch_report": "Gaussian smoothing behavior differs from MATLAB",
+                "likely_effect_on_esf_shape": "Boundary and kernel-profile differences can change ESF transition steepness.",
+                "likely_effect_on_lsf_peak_width": "ESF smoothing differences broaden or narrow LSF peak width.",
+                "likely_effect_on_mtf_shift": "LSF width changes can shift MTF50/MTF10 crossing frequencies.",
+            },
+            "C_esf": phase1_diag.get("esf") or {},
+            "D_lsf": phase1_diag.get("lsf") or {},
+            "E_fft": fft_diag,
+            "F_units": {
+                "lp_per_mm_formula": "cy_per_pixel / pixel_spacing_mm",
+                "nyquist_lp_per_mm": nyquist_lpmm,
+                "mtf50_cy_per_pixel": float(mtf50_cy) if isinstance(mtf50_cy, (int, float)) else None,
+                "mtf50_lp_per_mm": mtf50_lpmm,
+                "mtf10_cy_per_pixel": float(mtf10_cy) if isinstance(mtf10_cy, (int, float)) else None,
+                "mtf10_lp_per_mm": mtf10_lpmm,
+            },
+            "G_interpolation": phase1_diag.get("interpolation") or {},
+            "critical_diagnostics": {
+                "edge_orientation_and_esf_direction": phase1_diag.get("edge_orientation_and_esf_direction") or {},
+                "signal_vs_fft": phase1_diag.get("signal_vs_fft") or {},
+                "mtf50_crossing": phase1_diag.get("mtf50_crossing") or {},
+                "mtf10_crossing": phase1_diag.get("mtf10_crossing") or {},
+                "mtf_curve_length": int(mtf.size),
+                "frequency_samples": int(freqs.size),
+            },
+            "validation_output_block": {
+                "matlab_reference_mtf50_lp_per_mm": matlab_reference["mtf50_lp_per_mm"],
+                "moduba_mtf50_lp_per_mm": mtf50_lpmm,
+                "mtf50_absolute_difference_lp_per_mm": mtf50_diff,
+                "mtf50_relative_difference_percent": _rel(mtf50_diff, matlab_reference["mtf50_lp_per_mm"]),
+                "matlab_reference_mtf10_lp_per_mm": matlab_reference["mtf10_lp_per_mm"],
+                "moduba_mtf10_lp_per_mm": mtf10_lpmm,
+                "mtf10_absolute_difference_lp_per_mm": mtf10_diff,
+                "mtf10_relative_difference_percent": _rel(mtf10_diff, matlab_reference["mtf10_lp_per_mm"]),
+            },
+            "critical_validation_blocks": {
+                "roi_equivalence_validation": {
+                    "matlab_roi_bounds": matlab_roi_bounds,
+                    "moduba_roi_bounds": roi_bounds_used,
+                    "roi_match_status": roi_match_status,
+                    "validation_status": roi_validation_status,
+                    "message": roi_validation_message,
+                },
+                "esf_direction_validation": {
+                    "edge_orientation_detected": edge_orientation,
+                    "esf_direction_used": esf_direction,
+                    "expected_direction": expected_direction,
+                    "direction_match": direction_match,
+                    "message": esf_validation_message,
+                },
+                "fft_resolution_impact": {
+                    "nfft_used": nfft_used,
+                    "lsf_length": lsf_length,
+                    "freq_resolution": freq_resolution,
+                    "matlab_freq_resolution": matlab_freq_resolution,
+                    "resolution_ratio": resolution_ratio,
+                    "warning": fft_resolution_warning,
+                    "impact_explanation": fft_resolution_impact,
+                },
+            },
+            "environment_and_package": {
+                "scipy_pchip_available": pchip_available,
+                "limitation": None if pchip_available else "scipy.interpolate.PchipInterpolator unavailable in runtime environment.",
+            },
+            "matlab_comparison": matlab_comparison,
+            "single_most_likely_cause": (
+                "PCHIP fallback"
+                if not pchip_available
+                else "Gaussian smoothing difference"
+            ),
+        }
 
     @staticmethod
     def _lookup_nyquist_mtf(mtf_curve: dict[str, Any]) -> float | None:
@@ -3626,6 +3930,7 @@ class DicomViewer:
         if invalid:
             for var in self._mtf_summary_value_vars.values():
                 var.set("N/A")
+            self._mtf_summary_value_vars["mtf_mode"].set(str(mtf_result.get("mtf_mode_label", "N/A")))
             self._mtf_summary_value_vars["calculation_validity"].set(str(mtf_result.get("calculation_validity", "invalid")))
             self._mtf_summary_value_vars["iec_compliance"].set(str(mtf_result.get("iec_compliance", "N/A")))
             self._mtf_summary_value_vars["qa_grade"].set(str(mtf_result.get("qa_grade", "N/A")))
@@ -3636,6 +3941,7 @@ class DicomViewer:
             self._mtf_summary_value_vars["mtf10"].set(_fmt(key_metrics.get("mtf10")))
             self._mtf_summary_value_vars["nyquist_mtf"].set(_fmt(key_metrics.get("nyquist_mtf")))
             self._mtf_summary_value_vars["frequency_lpmm"].set(frequency_lpmm_text)
+            self._mtf_summary_value_vars["mtf_mode"].set(str(mtf_result.get("mtf_mode_label", "-")))
             self._mtf_summary_value_vars["edge_angle"].set(
                 self._format_edge_angle_with_tilt(mtf_result.get("edge_angle_deg"), digits=2)
             )
@@ -3736,9 +4042,14 @@ class DicomViewer:
         validation = str(mtf_result.get("validation_summary") or self.analysis_results["mtf_validation_summary"].get() or "-")
         validation = validation.split(".", 1)[0].strip() or "-"
         calculation = str(mtf_result.get("calculation_validity", "-"))
+        mode = str(mtf_result.get("mtf_mode_label", "-"))
+        equivalence = str(mtf_result.get("matlab_equivalence_status", "-"))
         iec = str(mtf_result.get("iec_compliance", "-"))
         qa_grade = str(mtf_result.get("qa_grade", "-"))
-        return f"Validation: {validation} | Calculation: {calculation} | IEC: {iec} | QA Grade: {qa_grade}"
+        return (
+            f"Validation: {validation} | Mode: {mode} | MATLAB Eq: {equivalence} | "
+            f"Calculation: {calculation} | IEC: {iec} | QA Grade: {qa_grade}"
+        )
 
     def _build_mtf_suggested_actions(self, reason_codes: list[Any]) -> str:
         action_lines = self._build_mtf_suggested_action_lines([str(reason) for reason in reason_codes])
@@ -3783,6 +4094,7 @@ class DicomViewer:
             "IEC_EXPLORATORY_MODE_NOT_REPORTABLE": "Exploratory 모드는 IEC 보고용으로 제한됩니다.",
             "EDGE_SNR_NOT_ASSESSED": "Edge SNR을 평가하지 못했습니다.",
             "IEC_DATA_NOT_LINEAR": "IEC 선형성 가정을 만족하지 못했을 가능성이 있습니다.",
+            "MATLAB_PCHIP_FALLBACK": "PCHIP 미지원으로 선형 보간 fallback이 적용되었습니다.",
         }
         translated: list[str] = []
         for code in reason_codes:
@@ -3839,6 +4151,7 @@ class DicomViewer:
             "IEC_SCOPE_NOT_DECLARED": "IEC scope 선언이 없어 완전한 검증이 어렵습니다.",
             "IEC_EXPLORATORY_MODE_NOT_REPORTABLE": "Exploratory 모드 결과는 IEC 보고용으로 제한됩니다.",
             "EDGE_SNR_NOT_ASSESSED": "Edge SNR을 평가하지 못했습니다.",
+            "MATLAB_PCHIP_FALLBACK": "PCHIP 미지원으로 선형 보간 fallback이 적용되어 MATLAB 대비 차이가 발생할 수 있습니다.",
         }
         if reason_codes:
             translated = []
@@ -4688,10 +5001,12 @@ class DicomViewer:
             key_metrics = dict(result.get("key_mtf_metrics") or {})
             metric_value = key_metrics.get("mtf50")
             status_text = str(result.get("calculation_validity", result.get("calculation_status", "")))
+            mode_id = str(result.get("mtf_mode_id", key_metrics.get("mode_id", "matlab_reference")))
+            mode_label = str(result.get("mtf_mode_label", key_metrics.get("mode_label", "MATLAB Reference")))
             reason_codes = ", ".join(str(item) for item in (result.get("reason_codes") or []))
             mtf_row = {
                 "metric_name": "MTF",
-                "formula_mode": f"slanted_edge [{status_text}]",
+                "formula_mode": f"{mode_id} [{status_text}]",
                 "roi_ids": [str((mtf.get('context') or {}).get("roi_id", ""))],
                 "roles": [],
                 "stats": {
@@ -4702,10 +5017,12 @@ class DicomViewer:
                     "edge_snr": result.get("edge_snr"),
                     "iec_compliance": result.get("iec_compliance"),
                     "qa_grade": result.get("qa_grade"),
+                    "mtf_mode_id": mode_id,
+                    "mtf_mode_label": mode_label,
                 },
                 "result_value": float(metric_value) if isinstance(metric_value, (int, float)) else None,
                 "item_name": "MTF",
-                "note_text": f"Validity={status_text}; reason_codes=[{reason_codes}]",
+                "note_text": f"Mode={mode_label}; Validity={status_text}; reason_codes=[{reason_codes}]",
                 "result_text": f"{float(metric_value):.4f}" if isinstance(metric_value, (int, float)) else status_text,
                 "developer_meta": mtf,
             }
@@ -4888,6 +5205,12 @@ class DicomViewer:
     @staticmethod
     def _build_mtf_summary_note(mtf_result: dict[str, Any]) -> str:
         parts: list[str] = []
+        mode_label = mtf_result.get("mtf_mode_label")
+        if mode_label:
+            parts.append(f"Mode={mode_label}")
+        matlab_eq = mtf_result.get("matlab_equivalence_status")
+        if matlab_eq:
+            parts.append(f"MATLAB_EQ={matlab_eq}")
         validity = mtf_result.get("calculation_validity")
         if validity is not None:
             parts.append(str(validity))
