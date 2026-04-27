@@ -58,6 +58,8 @@ def calculate_matlab_reference_mtf(roi: np.ndarray, pixel_spacing_mm: float | No
     edge_orientation = _determine_edge_orientation(edge.angle_deg) if edge is not None else "unknown"
     esf_raw = np.mean(roi_f64, axis=0)
     esf_smooth, gaussian_kernel = _smooth_gaussian_window_5(esf_raw)
+    esf_monotonic_before = _is_monotonic_profile(esf_raw)
+    esf_monotonic_after = _is_monotonic_profile(esf_smooth)
     esf = _normalize_01(esf_smooth)
     lsf_raw = np.abs(np.diff(esf))
     if lsf_raw.size < 4:
@@ -90,6 +92,16 @@ def calculate_matlab_reference_mtf(roi: np.ndarray, pixel_spacing_mm: float | No
     else:
         expected_direction = "unknown"
     direction_match = expected_direction == "unknown" or expected_direction == esf_direction_used
+    roi_is_valid_for_matlab_esf = bool(
+        edge_orientation == "vertical"
+        and esf_monotonic_before
+        and esf_monotonic_after
+    )
+    roi_validity_reason = (
+        "ROI valid for MATLAB-style ESF extraction."
+        if roi_is_valid_for_matlab_esf
+        else "Invalid ROI for MATLAB-style ESF extraction: ROI orientation or crop does not match the MATLAB reference condition."
+    )
 
     diagnostics = {
         "interpolation": {
@@ -121,6 +133,8 @@ def calculate_matlab_reference_mtf(roi: np.ndarray, pixel_spacing_mm: float | No
         },
         "esf": {
             "esf_length": int(esf.size),
+            "esf_axis_used": "axis=0",
+            "matlab_esf_axis_equivalent": True,
             "esf_min_raw": float(np.min(esf_raw)),
             "esf_max_raw": float(np.max(esf_raw)),
             "esf_min_norm": float(np.min(esf)),
@@ -155,6 +169,15 @@ def calculate_matlab_reference_mtf(roi: np.ndarray, pixel_spacing_mm: float | No
             "expected_direction": expected_direction,
             "direction_match": bool(direction_match),
             "match_status": "match" if direction_match else "mismatch",
+        },
+        "matlab_esf_validity": {
+            "esf_axis_used": "axis=0",
+            "matlab_esf_axis_equivalent": True,
+            "detected_edge_orientation": edge_orientation,
+            "roi_is_valid_for_matlab_esf": roi_is_valid_for_matlab_esf,
+            "roi_validity_reason": roi_validity_reason,
+            "esf_monotonic_before_smoothing": esf_monotonic_before,
+            "esf_monotonic_after_smoothing": esf_monotonic_after,
         },
         "signal_vs_fft": {
             "esf_length": int(esf.size),
@@ -568,6 +591,14 @@ def _normalize_01(values: np.ndarray) -> np.ndarray:
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
         return np.zeros_like(arr)
     return (arr - lo) / (hi - lo)
+
+
+def _is_monotonic_profile(values: np.ndarray, tolerance: float = 1e-9) -> bool:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size < 2:
+        return True
+    diff = np.diff(arr)
+    return bool(np.all(diff >= -tolerance) or np.all(diff <= tolerance))
 
 
 def _determine_edge_orientation(angle_deg: float) -> str:

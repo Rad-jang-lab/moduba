@@ -3516,15 +3516,32 @@ class DicomViewer:
             self.analysis_results["mtf_validation_summary"].set("Validation: no bound ROI")
             messagebox.showinfo("MTF Analysis", "먼저 사각형 ROI를 선택하고 바인딩하세요.")
             return
+        mode_raw = self.analysis_inputs.get("mtf_mode").get() if self.analysis_inputs.get("mtf_mode") is not None else "matlab_reference"
+        mtf_mode_id = self._parse_prefixed_value(mode_raw, "matlab_reference")
+        crop_semantics = "matlab_imcrop" if mtf_mode_id == "matlab_reference" else "default"
         frame = self._get_frame_pixel_array(measurement.frame_index)
-        roi_pixels, bounds = self._extract_roi_pixels(frame, measurement.start, measurement.end, ensure_non_empty=True)
+        roi_pixels, bounds = self._extract_roi_pixels(
+            frame,
+            measurement.start,
+            measurement.end,
+            ensure_non_empty=True,
+            semantics=crop_semantics,
+        )
         if roi_pixels.size == 0:
             self.analysis_results["mtf_validation_summary"].set("Validation: ROI pixels unavailable")
             messagebox.showwarning("MTF Analysis", "ROI 픽셀을 추출할 수 없습니다.")
             return
         imaging_mode = self._parse_prefixed_value(self.analysis_inputs["mtf_imaging_mode"].get(), "general_radiography")
         operating_mode = self._parse_prefixed_value(self.analysis_inputs["mtf_operating_mode"].get(), "strict_iec")
-        mtf_result = self._execute_mtf_pipeline(roi_pixels, bounds, imaging_mode, operating_mode)
+        mtf_result = self._execute_mtf_pipeline(
+            roi_pixels,
+            bounds,
+            imaging_mode,
+            operating_mode,
+            roi_start=measurement.start,
+            roi_end=measurement.end,
+            crop_semantics=crop_semantics,
+        )
         context = self._build_mtf_run_context(measurement)
         self.complete_mtf_analysis(mtf_result, context)
         self._update_mtf_analysis_ui(mtf_result)
@@ -3546,6 +3563,9 @@ class DicomViewer:
         bounds: tuple[int, int, int, int],
         imaging_mode: str,
         operating_mode: str,
+        roi_start: tuple[int | float, int | float] | None = None,
+        roi_end: tuple[int | float, int | float] | None = None,
+        crop_semantics: str = "default",
     ) -> dict[str, Any]:
         mode_raw = self.analysis_inputs.get("mtf_mode").get() if self.analysis_inputs.get("mtf_mode") is not None else "matlab_reference"
         mtf_mode_id = self._parse_prefixed_value(mode_raw, "matlab_reference")
@@ -3572,8 +3592,12 @@ class DicomViewer:
             if mtf_mode_id == "matlab_reference" and not pchip_available
             else None
         )
-        roi_width_px = max(bounds[2] - bounds[0], 0)
-        roi_height_px = max(bounds[3] - bounds[1], 0)
+        if mtf_mode_id == "matlab_reference" and crop_semantics == "matlab_imcrop":
+            roi_width_px = max(bounds[2] - bounds[0] + 1, 0)
+            roi_height_px = max(bounds[3] - bounds[1] + 1, 0)
+        else:
+            roi_width_px = max(bounds[2] - bounds[0], 0)
+            roi_height_px = max(bounds[3] - bounds[1], 0)
         roi_width_mm = float(roi_width_px * spacing[1]) if spacing is not None else None
         roi_height_mm = float(roi_height_px * spacing[0]) if spacing is not None else None
         phase4 = evaluate_iec_reporting(
@@ -3609,6 +3633,15 @@ class DicomViewer:
             dtype_before=dtype_before,
             phase1=phase1,
             key_metrics=key_metrics,
+            roi_start=roi_start,
+            roi_end=roi_end,
+            crop_semantics=crop_semantics,
+        )
+        matlab_esf_validity = ((phase1.get("diagnostics") or {}).get("matlab_esf_validity") or {})
+        invalid_roi_for_matlab_esf = bool(
+            mtf_mode_id == "matlab_reference"
+            and matlab_esf_validity
+            and not bool(matlab_esf_validity.get("roi_is_valid_for_matlab_esf", False))
         )
         result = {
             "calculation_status": phase1.get("calculation_status", "reject"),
@@ -3633,13 +3666,18 @@ class DicomViewer:
             ),
             "warnings": phase2.get("warnings") or [],
             "reason_codes": phase2.get("reason_codes") or [],
-            "matlab_equivalence_status": matlab_equivalence_status if mtf_mode_id == "matlab_reference" else "not_applicable",
+            "matlab_equivalence_status": (
+                "invalid_roi_for_matlab_esf"
+                if invalid_roi_for_matlab_esf
+                else (matlab_equivalence_status if mtf_mode_id == "matlab_reference" else "not_applicable")
+            ),
             "qa_grade": phase3.get("qa_grade"),
             "qa_status_summary": phase3.get("qa_status_summary"),
             "iec_compliance": phase4.get("iec_reporting_status"),
             "validation_summary": phase4.get("iec_reporting_summary"),
             "roi_size_mm": {"width": roi_width_mm, "height": roi_height_mm},
             "diagnostics": diagnostics,
+            "roi_equivalence_comparison_block": (diagnostics.get("roi_equivalence_comparison_block") or {}),
         }
         if result["calculation_status"] != "pass":
             result["reason_codes"] = list(dict.fromkeys((result["reason_codes"] or []) + ["PHASE1_REJECT"]))
@@ -3648,6 +3686,13 @@ class DicomViewer:
         if fallback_warning:
             result["warnings"] = list(dict.fromkeys((result.get("warnings") or []) + [fallback_warning]))
             result["reason_codes"] = list(dict.fromkeys((result.get("reason_codes") or []) + ["MATLAB_PCHIP_FALLBACK"]))
+        if invalid_roi_for_matlab_esf:
+            roi_warning = str(
+                matlab_esf_validity.get("roi_validity_reason")
+                or "Invalid ROI for MATLAB-style ESF extraction: ROI orientation or crop does not match the MATLAB reference condition."
+            )
+            result["warnings"] = list(dict.fromkeys((result.get("warnings") or []) + [roi_warning]))
+            result["reason_codes"] = list(dict.fromkeys((result.get("reason_codes") or []) + ["INVALID_ROI_FOR_MATLAB_ESF"]))
         return result
 
     def _build_mtf_diagnostics(
@@ -3661,6 +3706,9 @@ class DicomViewer:
         dtype_before: str,
         phase1: dict[str, Any],
         key_metrics: dict[str, Any],
+        roi_start: tuple[int | float, int | float] | None = None,
+        roi_end: tuple[int | float, int | float] | None = None,
+        crop_semantics: str = "default",
     ) -> dict[str, Any]:
         phase1_diag = dict(phase1.get("diagnostics") or {})
         fft_diag = dict(phase1_diag.get("fft") or {})
@@ -3708,10 +3756,45 @@ class DicomViewer:
         mtf10_diff = (mtf10_lpmm - matlab_reference["mtf10_lp_per_mm"]) if mtf10_lpmm is not None else None
         nyq_diff = (nyquist_lpmm - matlab_reference["nyquist_lp_per_mm"]) if nyquist_lpmm is not None else None
         roi_bounds_used = [int(bounds[0]), int(bounds[1]), int(bounds[2]), int(bounds[3])]
+        roi_bounds_input = (
+            [float(roi_start[0]), float(roi_start[1]), float(roi_end[0]), float(roi_end[1])]
+            if roi_start is not None and roi_end is not None
+            else None
+        )
         matlab_roi_bounds = roi_bounds_used
-        roi_match_status = "exact"
+        matlab_roi_crop_equivalence = bool(mtf_mode_id == "matlab_reference" and crop_semantics == "matlab_imcrop")
+        roi_match_status = "exact" if matlab_roi_crop_equivalence else "unknown"
         roi_validation_status = "valid"
-        roi_validation_message = "ROI equivalence assumed from identical input condition."
+        roi_validation_message = (
+            "MATLAB reference crop uses imcrop-like inclusive rectangle semantics (floor(min), ceil(max), inclusive bounds)."
+            if matlab_roi_crop_equivalence
+            else "ROI crop semantics are not in MATLAB-imcrop-equivalent mode."
+        )
+        roi_definition_source = "two_corner_points:start_end"
+        if crop_semantics == "matlab_imcrop":
+            roi_coordinate_transform_chain = [
+                "input start/end (float-capable)",
+                "x0=min(start.x,end.x), y0=min(start.y,end.y), x1=max(...), y1=max(...)",
+                "x0,y0=floor(min corner), x1,y1=ceil(max corner)",
+                "clip to [0,width-1] and [0,height-1]",
+                "inclusive crop slice: image[y0:y1+1, x0:x1+1]",
+            ]
+        else:
+            roi_coordinate_transform_chain = [
+                "input start/end (float-capable)",
+                "round start/end to nearest integer",
+                "reorder corners with min/max",
+                "clip to [0,width] and [0,height]",
+                "end-exclusive crop slice: image[y0:y1, x0:x1]",
+            ]
+        roi_summary_line = (
+            f"x0={roi_bounds_used[0]}, y0={roi_bounds_used[1]}, "
+            f"x1={roi_bounds_used[2]}, y1={roi_bounds_used[3]}, "
+            f"width={int(roi_pixels.shape[1]) if roi_pixels.ndim == 2 else 0}, "
+            f"height={int(roi_pixels.shape[0]) if roi_pixels.ndim == 2 else 0}"
+        )
+        matlab_esf_validity_diag = dict(phase1_diag.get("matlab_esf_validity") or {})
+        matlab_imcrop_equivalence_status = "equivalent" if matlab_roi_crop_equivalence else "not_equivalent"
 
         edge_orientation = str(orientation_diag.get("edge_orientation_detected", "unknown"))
         esf_direction = str(orientation_diag.get("esf_direction_used", "unknown"))
@@ -3783,10 +3866,20 @@ class DicomViewer:
             "mode": {"mtf_mode_id": mtf_mode_id, "mtf_mode_label": mtf_mode_label},
             "A_roi": {
                 "selected_roi_id": selected_roi_id or None,
+                "matlab_roi_crop_equivalence": matlab_roi_crop_equivalence,
+                "matlab_imcrop_equivalence_status": matlab_imcrop_equivalence_status,
+                "roi_definition_source": roi_definition_source,
+                "roi_input_coordinates": roi_bounds_input,
+                "roi_crop_bounds_used": roi_bounds_used,
+                "roi_bounds_input": roi_bounds_input,
                 "roi_bounds_pixels": roi_bounds_used,
                 "roi_bounds_used": roi_bounds_used,
-                "roi_width_pixels": int(max(bounds[2] - bounds[0], 0)),
-                "roi_height_pixels": int(max(bounds[3] - bounds[1], 0)),
+                "roi_width_pixels": int(roi_pixels.shape[1]) if roi_pixels.ndim == 2 else int(max(bounds[2] - bounds[0], 0)),
+                "roi_height_pixels": int(roi_pixels.shape[0]) if roi_pixels.ndim == 2 else int(max(bounds[3] - bounds[1], 0)),
+                "roi_shape_used": [int(roi_pixels.shape[0]), int(roi_pixels.shape[1])] if roi_pixels.ndim == 2 else None,
+                "crop_semantics_note": roi_validation_message,
+                "roi_coordinate_transform_chain": roi_coordinate_transform_chain,
+                "roi_summary_line": roi_summary_line,
                 "pixel_spacing_mm": row_spacing_mm,
             },
             "B_data_source": {
@@ -3825,6 +3918,7 @@ class DicomViewer:
             },
             "C_esf": phase1_diag.get("esf") or {},
             "D_lsf": phase1_diag.get("lsf") or {},
+            "C_matlab_esf_validity": matlab_esf_validity_diag,
             "E_fft": fft_diag,
             "F_units": {
                 "lp_per_mm_formula": "cy_per_pixel / pixel_spacing_mm",
@@ -3884,10 +3978,27 @@ class DicomViewer:
             },
             "matlab_comparison": matlab_comparison,
             "single_most_likely_cause": (
-                "PCHIP fallback"
-                if not pchip_available
-                else "Gaussian smoothing difference"
+                "Invalid ROI for MATLAB-style ESF extraction"
+                if bool((phase1_diag.get("matlab_esf_validity") or {}).get("roi_is_valid_for_matlab_esf")) is False
+                else ("PCHIP fallback" if not pchip_available else "Gaussian smoothing difference")
             ),
+            "most_likely_current_issue": (
+                "Invalid ROI for MATLAB-style ESF extraction"
+                if bool(matlab_esf_validity_diag.get("roi_is_valid_for_matlab_esf")) is False
+                else "MATLAB-reference interpolation differences or smoothing boundary behavior"
+            ),
+            "next_recommended_fix": (
+                "Verify same ROI rectangle in MATLAB and Moduba, then re-check ESF monotonicity before changing smoothing/FFT/interpolation."
+            ),
+            "roi_equivalence_comparison_block": {
+                "roi_definition_source": roi_definition_source,
+                "roi_input_coordinates": roi_bounds_input,
+                "roi_crop_bounds_used": roi_bounds_used,
+                "roi_shape_used": [int(roi_pixels.shape[0]), int(roi_pixels.shape[1])] if roi_pixels.ndim == 2 else None,
+                "matlab_imcrop_equivalence_status": matlab_imcrop_equivalence_status,
+                "roi_is_valid_for_matlab_esf": matlab_esf_validity_diag.get("roi_is_valid_for_matlab_esf"),
+                "roi_summary_line": roi_summary_line,
+            },
         }
 
     @staticmethod
@@ -9690,15 +9801,53 @@ class DicomViewer:
                     y1 = min(y0 + 1, height)
         return x0, y0, x1, y1
 
+    def _normalize_roi_bounds_matlab_imcrop(
+        self,
+        image_shape: tuple[int, ...],
+        start: tuple[int | float, int | float],
+        end: tuple[int | float, int | float],
+        ensure_non_empty: bool = True,
+    ) -> tuple[int, int, int, int]:
+        if len(image_shape) < 2:
+            return 0, 0, 0, 0
+        height = int(image_shape[0])
+        width = int(image_shape[1])
+        if width <= 0 or height <= 0:
+            return 0, 0, 0, 0
+        x0_raw = min(float(start[0]), float(end[0]))
+        y0_raw = min(float(start[1]), float(end[1]))
+        x1_raw = max(float(start[0]), float(end[0]))
+        y1_raw = max(float(start[1]), float(end[1]))
+        x0 = int(np.floor(x0_raw))
+        y0 = int(np.floor(y0_raw))
+        x1 = int(np.ceil(x1_raw))
+        y1 = int(np.ceil(y1_raw))
+        x0 = int(np.clip(x0, 0, max(width - 1, 0)))
+        y0 = int(np.clip(y0, 0, max(height - 1, 0)))
+        x1 = int(np.clip(x1, 0, max(width - 1, 0)))
+        y1 = int(np.clip(y1, 0, max(height - 1, 0)))
+        if ensure_non_empty:
+            if x1 < x0:
+                x1 = x0
+            if y1 < y0:
+                y1 = y0
+        return x0, y0, x1, y1
+
     def _extract_roi_pixels(
         self,
         image_array: np.ndarray | None,
         start: tuple[int | float, int | float],
         end: tuple[int | float, int | float],
         ensure_non_empty: bool = True,
+        semantics: str = "default",
     ) -> tuple[np.ndarray, tuple[int, int, int, int]]:
         if image_array is None or image_array.ndim < 2:
             return np.array([]), (0, 0, 0, 0)
+        if semantics == "matlab_imcrop":
+            x0, y0, x1, y1 = self._normalize_roi_bounds_matlab_imcrop(image_array.shape, start, end, ensure_non_empty=ensure_non_empty)
+            if x1 < x0 or y1 < y0:
+                return np.array([]), (x0, y0, x1, y1)
+            return image_array[y0 : y1 + 1, x0 : x1 + 1], (x0, y0, x1, y1)
         x0, y0, x1, y1 = self._normalize_roi_bounds(image_array.shape, start, end, ensure_non_empty=ensure_non_empty)
         if x1 <= x0 or y1 <= y0:
             return np.array([]), (x0, y0, x1, y1)
