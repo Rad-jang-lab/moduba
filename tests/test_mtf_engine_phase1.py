@@ -99,7 +99,20 @@ def test_matlab_reference_mode_returns_curves_and_metrics():
         assert interpolation.get("warning") == "PCHIP unavailable: using linear fallback; result may differ from MATLAB."
         assert interpolation.get("matlab_equivalence_flag") == "not fully MATLAB-equivalent"
     assert diag.get("gaussian_smoothing", {}).get("gaussian_kernel_size") == 5
-    assert diag.get("gaussian_smoothing", {}).get("gaussian_boundary_mode") == "numpy_convolve_same_zero_padding"
+    assert diag.get("gaussian_smoothing", {}).get("gaussian_boundary_mode") == "edge_padding_valid_convolution"
+
+
+def test_matlab_reference_mode_avoids_endpoint_lsf_spikes_from_smoothing_boundary():
+    roi = np.ones((96, 96), dtype=np.float64) * 100.0
+    roi[:, 56:] = 400.0
+    result = calculate_matlab_reference_mtf(roi, pixel_spacing_mm=0.1988)
+    assert result["calculation_status"] == "pass"
+
+    lsf = np.asarray((result.get("lsf_curve") or {}).get("y") or [], dtype=np.float64)
+    assert lsf.size > 10
+    edge_band = lsf[50:70]
+    boundary_peaks = np.array([lsf[0], lsf[-1]], dtype=np.float64)
+    assert float(np.max(boundary_peaks)) < float(np.max(edge_band)) * 0.2
 
 
 def test_matlab_reference_mode_rejects_without_pixel_spacing():

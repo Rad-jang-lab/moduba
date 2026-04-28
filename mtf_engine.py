@@ -120,13 +120,13 @@ def calculate_matlab_reference_mtf(roi: np.ndarray, pixel_spacing_mm: float | No
         },
         "gaussian_smoothing": {
             "matlab_smoothing_reference": "smoothdata gaussian 5",
-            "moduba_smoothing_method": "gaussian_window_5_numpy_convolve",
+            "moduba_smoothing_method": "gaussian_window_5_numpy_convolve_edge_padded",
             "gaussian_kernel_size": int(gaussian_kernel.size),
             "kernel_size_used": int(gaussian_kernel.size),
             "gaussian_sigma_or_equivalent": 1.0,
             "sigma_used": 1.0,
-            "gaussian_boundary_mode": "numpy_convolve_same_zero_padding",
-            "boundary_mode": "numpy_convolve_same_zero_padding",
+            "gaussian_boundary_mode": "edge_padding_valid_convolution",
+            "boundary_mode": "edge_padding_valid_convolution",
             "smoothing_normalization_behavior": "kernel normalized to sum=1 before convolution",
             "smoothing_equivalence_status": "unknown",
             "smoothing_equivalence_note": "Gaussian smoothing behavior differs from MATLAB unless smoothdata boundary handling is replicated exactly.",
@@ -630,7 +630,10 @@ def _smooth_gaussian_window_5(values: np.ndarray) -> Tuple[np.ndarray, np.ndarra
     x = np.arange(-radius, radius + 1, dtype=np.float64)
     kernel = np.exp(-(x**2) / (2.0 * sigma * sigma))
     kernel /= np.sum(kernel)
-    smoothed = np.convolve(arr, kernel, mode="same")
+    if arr.size == 1:
+        return arr.copy(), kernel
+    padded = np.pad(arr, pad_width=radius, mode="edge")
+    smoothed = np.convolve(padded, kernel, mode="valid")
     return smoothed, kernel
 
 
