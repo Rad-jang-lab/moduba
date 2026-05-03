@@ -3615,11 +3615,30 @@ class DicomViewer:
                 "reason_codes": phase2.get("reason_codes", []),
             }
         )
+        mtf50_cy = phase1.get("mtf50")
+        mtf10_cy = phase1.get("mtf10")
+        mtf50_lp = (
+            float(mtf50_cy) / float(row_spacing_mm)
+            if isinstance(mtf50_cy, (int, float)) and isinstance(row_spacing_mm, (int, float)) and row_spacing_mm > 0
+            else None
+        )
+        mtf10_lp = (
+            float(mtf10_cy) / float(row_spacing_mm)
+            if isinstance(mtf10_cy, (int, float)) and isinstance(row_spacing_mm, (int, float)) and row_spacing_mm > 0
+            else None
+        )
+        nyquist_lp = (0.5 / float(row_spacing_mm)) if isinstance(row_spacing_mm, (int, float)) and row_spacing_mm > 0 else None
         key_metrics = {
-            "mtf50": phase1.get("mtf50"),
-            "mtf10": phase1.get("mtf10"),
+            "mtf50": mtf50_lp if mtf50_lp is not None else mtf50_cy,
+            "mtf10": mtf10_lp if mtf10_lp is not None else mtf10_cy,
+            "mtf50_cy_per_pixel": mtf50_cy,
+            "mtf10_cy_per_pixel": mtf10_cy,
+            "mtf50_lp_per_mm": mtf50_lp,
+            "mtf10_lp_per_mm": mtf10_lp,
             "nyquist_mtf": self._lookup_nyquist_mtf(phase1.get("mtf_curve") or {}),
-            "frequency_unit": "cy/pixel",
+            "nyquist_frequency_cy_per_pixel": 0.5,
+            "nyquist_frequency_lp_per_mm": nyquist_lp,
+            "frequency_unit": "lp/mm" if nyquist_lp is not None else "cy/pixel",
             "mode_id": mtf_mode_id,
             "mode_label": mtf_mode_label,
         }
@@ -3719,11 +3738,19 @@ class DicomViewer:
         freqs = np.asarray(mtf_curve.get("frequency_cy_per_pixel", []), dtype=np.float64)
         mtf = np.asarray(mtf_curve.get("mtf", []), dtype=np.float64)
         row_spacing_mm = float(spacing[0]) if spacing is not None else None
-        mtf50_cy = key_metrics.get("mtf50")
-        mtf10_cy = key_metrics.get("mtf10")
+        mtf50_cy = key_metrics.get("mtf50_cy_per_pixel")
+        if not isinstance(mtf50_cy, (int, float)):
+            mtf50_cy = key_metrics.get("mtf50")
+        mtf10_cy = key_metrics.get("mtf10_cy_per_pixel")
+        if not isinstance(mtf10_cy, (int, float)):
+            mtf10_cy = key_metrics.get("mtf10")
         nyquist_lpmm = (0.5 / row_spacing_mm) if row_spacing_mm and row_spacing_mm > 0 else None
-        mtf50_lpmm = (float(mtf50_cy) / row_spacing_mm) if isinstance(mtf50_cy, (int, float)) and row_spacing_mm else None
-        mtf10_lpmm = (float(mtf10_cy) / row_spacing_mm) if isinstance(mtf10_cy, (int, float)) and row_spacing_mm else None
+        mtf50_lpmm = key_metrics.get("mtf50_lp_per_mm")
+        if not isinstance(mtf50_lpmm, (int, float)):
+            mtf50_lpmm = (float(mtf50_cy) / row_spacing_mm) if isinstance(mtf50_cy, (int, float)) and row_spacing_mm else None
+        mtf10_lpmm = key_metrics.get("mtf10_lp_per_mm")
+        if not isinstance(mtf10_lpmm, (int, float)):
+            mtf10_lpmm = (float(mtf10_cy) / row_spacing_mm) if isinstance(mtf10_cy, (int, float)) and row_spacing_mm else None
         image_name = Path(self.path_var.get().strip()).name if hasattr(self, "path_var") else ""
         matlab_reference = {
             "file": "MTF LOW_70kVp_20mAs_001.DCM",
@@ -4130,6 +4157,10 @@ class DicomViewer:
             numbered = [f"{idx}. {line}" for idx, line in enumerate(reason_lines, start=1)]
             sections.append(["[주요 원인]", *numbered])
 
+        evidence_lines = self._build_mtf_evidence_lines(mtf_result)
+        if evidence_lines:
+            sections.append(["[검증 근거]", *[f"- {line}" for line in evidence_lines]])
+
         interpretation_lines = self._build_mtf_interpretation_lines(reason_codes)
         if interpretation_lines:
             sections.append(["[해석]", *[f"- {line}" for line in interpretation_lines]])
@@ -4174,6 +4205,7 @@ class DicomViewer:
             "EDGE_SNR_BORDERLINE": ["고주파 구간 해석을 보수적으로 수행하세요.", "가능하면 edge 대비를 개선한 후 재측정하세요."],
             "POSSIBLE_ALIASING": ["edge 방향과 샘플링 조건을 재확인하세요.", "리샘플링 영향이 적은 위치로 ROI를 이동해 재측정하세요."],
             "NONMONOTONIC_TAIL": ["ROI 위치와 edge 품질을 재확인하세요.", "안정적인 edge로 반복 측정을 권장합니다."],
+            "INVALID_ROI_FOR_MATLAB_ESF": ["MATLAB 기준에서는 수직 edge ROI가 필요합니다.", "ROI를 edge 진행 방향 기준으로 다시 지정하세요."],
             "IEC_EDGE_GEOMETRY_NONCOMPLIANT": ["ROI 크기/각도를 IEC 기하 조건에 맞게 조정하세요.", "IEC 엄격 모드에서 다시 계산하세요."],
             "IEC_ROI_NONCOMPLIANT": ["ROI 크기를 IEC 최소 조건 이상으로 확대하세요.", "에지 위치가 유효한지 다시 확인하세요."],
             "PHASE1_REJECT": ["ROI 위치와 edge 방향을 우선 확인하세요.", "SNR이 충분한지 점검한 뒤 재측정하세요."],
@@ -4206,6 +4238,7 @@ class DicomViewer:
             "EDGE_SNR_NOT_ASSESSED": "Edge SNR을 평가하지 못했습니다.",
             "IEC_DATA_NOT_LINEAR": "IEC 선형성 가정을 만족하지 못했을 가능성이 있습니다.",
             "MATLAB_PCHIP_FALLBACK": "PCHIP 미지원으로 선형 보간 fallback이 적용되었습니다.",
+            "INVALID_ROI_FOR_MATLAB_ESF": "MATLAB 기준 ESF ROI 조건(수직 edge/크롭)에 맞지 않습니다.",
         }
         translated: list[str] = []
         for code in reason_codes:
@@ -4221,12 +4254,56 @@ class DicomViewer:
             "EDGE_SNR_BORDERLINE": "고주파 성능 해석은 보수적으로 판단하는 것이 좋습니다.",
             "RESULT_QUESTIONABLE": "최종 결과를 단독 근거로 사용하기 어렵습니다.",
             "EDGE_CLIPPING_DETECTED": "LSF/MTF 형상이 왜곡되었을 수 있습니다.",
+            "INVALID_ROI_FOR_MATLAB_ESF": "현재 ROI는 MATLAB 기준 ESF 유효 조건을 충족하지 않습니다.",
             "PHASE1_REJECT": "현재 ROI 조건에서는 신뢰 가능한 MTF 산출이 어렵습니다.",
         }
         lines = [interpretation_by_reason[code] for code in reason_codes if code in interpretation_by_reason]
         return list(dict.fromkeys(lines))
 
+    @staticmethod
+    def _build_mtf_evidence_lines(mtf_result: dict[str, Any]) -> list[str]:
+        key_metrics = dict(mtf_result.get("key_mtf_metrics") or {})
+        diagnostics = dict(mtf_result.get("diagnostics") or {})
+        lines: list[str] = []
+
+        edge_snr = mtf_result.get("edge_snr")
+        if isinstance(edge_snr, (int, float)):
+            lines.append(f"Edge SNR={float(edge_snr):.2f}")
+
+        mtf50 = key_metrics.get("mtf50")
+        mtf10 = key_metrics.get("mtf10")
+        unit = str(key_metrics.get("frequency_unit") or "").strip()
+        if isinstance(mtf50, (int, float)):
+            suffix = f" {unit}" if unit else ""
+            lines.append(f"MTF50={float(mtf50):.4f}{suffix}")
+        if isinstance(mtf10, (int, float)):
+            suffix = f" {unit}" if unit else ""
+            lines.append(f"MTF10={float(mtf10):.4f}{suffix}")
+
+        critical = dict(diagnostics.get("critical_validation_blocks") or {})
+        tail_block = dict(critical.get("fft_resolution_impact") or {})
+        if tail_block.get("warning"):
+            lines.append(str(tail_block.get("warning")))
+
+        roi_block = dict(diagnostics.get("C_matlab_esf_validity") or {})
+        roi_valid = roi_block.get("roi_is_valid_for_matlab_esf")
+        if isinstance(roi_valid, bool):
+            lines.append(f"MATLAB ESF ROI 유효성={'valid' if roi_valid else 'invalid'}")
+
+        return list(dict.fromkeys(lines))
+
     def _format_mtf_frequency_lpmm_summary(self, key_metrics: dict[str, Any]) -> str:
+        frequency_unit = str(key_metrics.get("frequency_unit", "")).strip().lower()
+        if frequency_unit == "lp/mm":
+            entries: list[str] = []
+            for key in ("mtf50", "mtf10"):
+                value = key_metrics.get(key)
+                if isinstance(value, (int, float)):
+                    entries.append(f"{key.upper()}={float(value):.4f}")
+            nyquist_lpmm = key_metrics.get("nyquist_frequency_lp_per_mm")
+            if isinstance(nyquist_lpmm, (int, float)):
+                entries.append(f"Nyquist={float(nyquist_lpmm):.4f}")
+            return ", ".join(entries) if entries else "lp/mm unavailable"
         spacing = self._get_pixel_spacing_mm()
         if spacing is None:
             return "lp/mm unavailable: missing PixelSpacing"
@@ -4528,7 +4605,14 @@ class DicomViewer:
         canvas.create_rectangle(pad_l, pad_t, pad_l + plot_w, pad_t + plot_h, outline="#CBD5E1")
         canvas.create_line(pad_l, pad_t + plot_h, pad_l + plot_w, pad_t + plot_h, fill="#64748B")
         canvas.create_line(pad_l, pad_t, pad_l, pad_t + plot_h, fill="#64748B")
-        freqs = np.asarray(mtf_curve.get("frequency_cy_per_pixel", []), dtype=np.float64)
+        frequency_unit = self._resolve_mtf_frequency_unit(getattr(self, "_last_mtf_result", {}) or {})
+        raw_freqs = np.asarray(mtf_curve.get("frequency_cy_per_pixel", []), dtype=np.float64)
+        freqs = raw_freqs
+        if frequency_unit == "lp/mm":
+            spacing = self._get_pixel_spacing_mm()
+            row_spacing_mm = float(spacing[0]) if spacing is not None else None
+            if isinstance(row_spacing_mm, (int, float)) and row_spacing_mm > 0:
+                freqs = raw_freqs / row_spacing_mm
         mtf = np.asarray(mtf_curve.get("mtf", []), dtype=np.float64)
         if freqs.size < 2 or mtf.size < 2 or freqs.size != mtf.size:
             self._mtf_graph_status_var.set("MTF curve: unavailable")
@@ -4560,9 +4644,18 @@ class DicomViewer:
             y_min=0.0,
             y_max=1.2,
         )
-        show_nyquist_legend = self._render_mtf_reference_markers(canvas, key_metrics=self._last_mtf_key_metrics, xmax=xmax, pad_l=pad_l, pad_t=pad_t, plot_w=plot_w, plot_h=plot_h)
+        show_nyquist_legend = self._render_mtf_reference_markers(
+            canvas,
+            key_metrics=self._last_mtf_key_metrics,
+            xmax=xmax,
+            pad_l=pad_l,
+            pad_t=pad_t,
+            plot_w=plot_w,
+            plot_h=plot_h,
+            frequency_unit=frequency_unit,
+        )
         self._render_mtf_legend(canvas, width=width, pad_t=pad_t, include_nyquist=show_nyquist_legend)
-        canvas.create_text(pad_l + plot_w / 2, height - 10, text="Frequency (cy/pixel)", fill="#334155")
+        canvas.create_text(pad_l + plot_w / 2, height - 10, text=f"Frequency ({frequency_unit})", fill="#334155")
         canvas.create_text(12, pad_t + plot_h / 2, text="MTF", fill="#334155", angle=90)
         self._mtf_graph_status_var.set(f"MTF curve: {freqs.size} points")
 
@@ -4579,6 +4672,7 @@ class DicomViewer:
         pad_t: int,
         plot_w: int,
         plot_h: int,
+        frequency_unit: str,
     ) -> bool:
         marker_specs = [
             ("mtf50", "#DC2626", "MTF50"),
@@ -4594,10 +4688,12 @@ class DicomViewer:
             px = pad_l + (freq / xmax) * plot_w
             canvas.create_line(px, pad_t, px, pad_t + plot_h, fill=color, dash=(4, 3), width=1)
             canvas.create_text(px + 4, pad_t + 10, text=f"{label}={freq:.4f}", fill=color, anchor="w")
-        nyquist = key_metrics.get("nyquist_frequency_cy_per_pixel")
+        nyquist = key_metrics.get("nyquist_frequency_lp_per_mm") if frequency_unit == "lp/mm" else key_metrics.get("nyquist_frequency_cy_per_pixel")
         reliable_nyquist = self._is_finite_number(key_metrics.get("nyquist_mtf"))
         if not self._is_finite_number(nyquist):
-            nyquist = 0.5
+            nyquist = 0.5 if frequency_unit == "cy/pixel" else None
+        if nyquist is None:
+            return False
         nyquist_freq = float(nyquist)
         if 0 <= nyquist_freq <= xmax:
             px = pad_l + (nyquist_freq / xmax) * plot_w
@@ -4774,7 +4870,14 @@ class DicomViewer:
             plt.close(fig)
 
     def _plot_export_mtf(self, ax: Any) -> None:
-        freqs = np.asarray(self._last_mtf_curve_payload.get("frequency_cy_per_pixel", []), dtype=np.float64)
+        frequency_unit = self._resolve_mtf_frequency_unit(getattr(self, "_last_mtf_result", {}) or {})
+        raw_freqs = np.asarray(self._last_mtf_curve_payload.get("frequency_cy_per_pixel", []), dtype=np.float64)
+        freqs = raw_freqs
+        if frequency_unit == "lp/mm":
+            spacing = self._get_pixel_spacing_mm()
+            row_spacing_mm = float(spacing[0]) if spacing is not None else None
+            if isinstance(row_spacing_mm, (int, float)) and row_spacing_mm > 0:
+                freqs = raw_freqs / row_spacing_mm
         mtf = np.asarray(self._last_mtf_curve_payload.get("mtf", []), dtype=np.float64)
         valid = np.isfinite(freqs) & np.isfinite(mtf)
         freqs = freqs[valid]
@@ -4793,13 +4896,17 @@ class DicomViewer:
                 freq = float(value)
                 if 0 <= freq <= xmax:
                     ax.axvline(freq, color=color, linestyle=(0, (4, 3)), linewidth=1.0, label=label)
-        nyquist = self._last_mtf_key_metrics.get("nyquist_frequency_cy_per_pixel")
+        nyquist = (
+            self._last_mtf_key_metrics.get("nyquist_frequency_lp_per_mm")
+            if frequency_unit == "lp/mm"
+            else self._last_mtf_key_metrics.get("nyquist_frequency_cy_per_pixel")
+        )
         if not self._is_finite_number(nyquist):
-            nyquist = 0.5
-        nyquist_freq = float(nyquist)
-        if 0 <= nyquist_freq <= xmax:
+            nyquist = 0.5 if frequency_unit == "cy/pixel" else None
+        if self._is_finite_number(nyquist) and 0 <= float(nyquist) <= xmax:
+            nyquist_freq = float(nyquist)
             ax.axvline(nyquist_freq, color="#7C3AED", linestyle=(0, (2, 4)), linewidth=1.0, label="Nyquist")
-        ax.set_xlabel("Frequency (cy/pixel)")
+        ax.set_xlabel(f"Frequency ({frequency_unit})")
         ax.set_ylabel("MTF")
         ax.tick_params(axis="both", which="major", labelsize=9)
         ax.xaxis.set_major_locator(MaxNLocator(nbins=6, min_n_ticks=4))
