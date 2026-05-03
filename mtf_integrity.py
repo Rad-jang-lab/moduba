@@ -112,11 +112,12 @@ def _assess_tail_behavior(freq: np.ndarray, mtf: np.ndarray) -> Tuple[str, List[
 
     tail = mtf[tail_idx]
     diffs = np.diff(tail)
+    tail_span = float(np.max(tail) - np.min(tail)) if tail.size else 0.0
 
-    positive_jumps = int(np.count_nonzero(diffs > 0.03))
+    positive_jumps = int(np.count_nonzero(diffs > 0.05))
     sign_changes = int(np.count_nonzero(np.signbit(diffs[1:]) != np.signbit(diffs[:-1]))) if diffs.size >= 2 else 0
 
-    if positive_jumps >= 1 or sign_changes >= 2:
+    if tail_span > 0.05 and (positive_jumps >= 1 or sign_changes >= 3):
         return "nonmonotonic", ["NONMONOTONIC_TAIL", "POSSIBLE_ALIASING", "HIGH_FREQUENCY_NOISE_BIAS_RISK"]
 
     return "stable", []
@@ -125,8 +126,14 @@ def _assess_tail_behavior(freq: np.ndarray, mtf: np.ndarray) -> Tuple[str, List[
 def _tail_indices(freq: np.ndarray) -> np.ndarray:
     if freq.size < 8:
         return np.array([], dtype=int)
+    max_freq = float(np.max(freq))
+    if not np.isfinite(max_freq) or max_freq <= 0:
+        return np.array([], dtype=int)
+    nyquist_band = np.flatnonzero(freq >= (0.8 * max_freq))
+    if nyquist_band.size >= 3:
+        return nyquist_band.astype(int)
     n = freq.size
-    start = int(np.floor(0.6 * n))
+    start = int(np.floor(0.8 * n))
     return np.arange(start, n, dtype=int)
 
 

@@ -4157,6 +4157,10 @@ class DicomViewer:
             numbered = [f"{idx}. {line}" for idx, line in enumerate(reason_lines, start=1)]
             sections.append(["[주요 원인]", *numbered])
 
+        evidence_lines = self._build_mtf_evidence_lines(mtf_result)
+        if evidence_lines:
+            sections.append(["[검증 근거]", *[f"- {line}" for line in evidence_lines]])
+
         interpretation_lines = self._build_mtf_interpretation_lines(reason_codes)
         if interpretation_lines:
             sections.append(["[해석]", *[f"- {line}" for line in interpretation_lines]])
@@ -4201,6 +4205,7 @@ class DicomViewer:
             "EDGE_SNR_BORDERLINE": ["고주파 구간 해석을 보수적으로 수행하세요.", "가능하면 edge 대비를 개선한 후 재측정하세요."],
             "POSSIBLE_ALIASING": ["edge 방향과 샘플링 조건을 재확인하세요.", "리샘플링 영향이 적은 위치로 ROI를 이동해 재측정하세요."],
             "NONMONOTONIC_TAIL": ["ROI 위치와 edge 품질을 재확인하세요.", "안정적인 edge로 반복 측정을 권장합니다."],
+            "INVALID_ROI_FOR_MATLAB_ESF": ["MATLAB 기준에서는 수직 edge ROI가 필요합니다.", "ROI를 edge 진행 방향 기준으로 다시 지정하세요."],
             "IEC_EDGE_GEOMETRY_NONCOMPLIANT": ["ROI 크기/각도를 IEC 기하 조건에 맞게 조정하세요.", "IEC 엄격 모드에서 다시 계산하세요."],
             "IEC_ROI_NONCOMPLIANT": ["ROI 크기를 IEC 최소 조건 이상으로 확대하세요.", "에지 위치가 유효한지 다시 확인하세요."],
             "PHASE1_REJECT": ["ROI 위치와 edge 방향을 우선 확인하세요.", "SNR이 충분한지 점검한 뒤 재측정하세요."],
@@ -4233,6 +4238,7 @@ class DicomViewer:
             "EDGE_SNR_NOT_ASSESSED": "Edge SNR을 평가하지 못했습니다.",
             "IEC_DATA_NOT_LINEAR": "IEC 선형성 가정을 만족하지 못했을 가능성이 있습니다.",
             "MATLAB_PCHIP_FALLBACK": "PCHIP 미지원으로 선형 보간 fallback이 적용되었습니다.",
+            "INVALID_ROI_FOR_MATLAB_ESF": "MATLAB 기준 ESF ROI 조건(수직 edge/크롭)에 맞지 않습니다.",
         }
         translated: list[str] = []
         for code in reason_codes:
@@ -4248,9 +4254,42 @@ class DicomViewer:
             "EDGE_SNR_BORDERLINE": "고주파 성능 해석은 보수적으로 판단하는 것이 좋습니다.",
             "RESULT_QUESTIONABLE": "최종 결과를 단독 근거로 사용하기 어렵습니다.",
             "EDGE_CLIPPING_DETECTED": "LSF/MTF 형상이 왜곡되었을 수 있습니다.",
+            "INVALID_ROI_FOR_MATLAB_ESF": "현재 ROI는 MATLAB 기준 ESF 유효 조건을 충족하지 않습니다.",
             "PHASE1_REJECT": "현재 ROI 조건에서는 신뢰 가능한 MTF 산출이 어렵습니다.",
         }
         lines = [interpretation_by_reason[code] for code in reason_codes if code in interpretation_by_reason]
+        return list(dict.fromkeys(lines))
+
+    @staticmethod
+    def _build_mtf_evidence_lines(mtf_result: dict[str, Any]) -> list[str]:
+        key_metrics = dict(mtf_result.get("key_mtf_metrics") or {})
+        diagnostics = dict(mtf_result.get("diagnostics") or {})
+        lines: list[str] = []
+
+        edge_snr = mtf_result.get("edge_snr")
+        if isinstance(edge_snr, (int, float)):
+            lines.append(f"Edge SNR={float(edge_snr):.2f}")
+
+        mtf50 = key_metrics.get("mtf50")
+        mtf10 = key_metrics.get("mtf10")
+        unit = str(key_metrics.get("frequency_unit") or "").strip()
+        if isinstance(mtf50, (int, float)):
+            suffix = f" {unit}" if unit else ""
+            lines.append(f"MTF50={float(mtf50):.4f}{suffix}")
+        if isinstance(mtf10, (int, float)):
+            suffix = f" {unit}" if unit else ""
+            lines.append(f"MTF10={float(mtf10):.4f}{suffix}")
+
+        critical = dict(diagnostics.get("critical_validation_blocks") or {})
+        tail_block = dict(critical.get("fft_resolution_impact") or {})
+        if tail_block.get("warning"):
+            lines.append(str(tail_block.get("warning")))
+
+        roi_block = dict(diagnostics.get("C_matlab_esf_validity") or {})
+        roi_valid = roi_block.get("roi_is_valid_for_matlab_esf")
+        if isinstance(roi_valid, bool):
+            lines.append(f"MATLAB ESF ROI 유효성={'valid' if roi_valid else 'invalid'}")
+
         return list(dict.fromkeys(lines))
 
     def _format_mtf_frequency_lpmm_summary(self, key_metrics: dict[str, Any]) -> str:
