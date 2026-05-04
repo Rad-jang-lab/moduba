@@ -12448,11 +12448,11 @@ class DicomViewer:
         return frame
 
     @staticmethod
-    def _compute_simple_ssim(reference: np.ndarray, target: np.ndarray) -> float:
+    def _compute_simple_ssim(reference: np.ndarray, target: np.ndarray, *, data_range: float = 255.0, k1: float = 0.01, k2: float = 0.03) -> float:
         ref = reference.astype(np.float64)
         tar = target.astype(np.float64)
-        c1 = (0.01 * 255) ** 2
-        c2 = (0.03 * 255) ** 2
+        c1 = (k1 * data_range) ** 2
+        c2 = (k2 * data_range) ** 2
         mu_x = float(np.mean(ref))
         mu_y = float(np.mean(tar))
         sigma_x = float(np.var(ref))
@@ -12463,6 +12463,20 @@ class DicomViewer:
         if denominator == 0:
             return 0.0
         return float(numerator / denominator)
+
+    @staticmethod
+    def _resolve_data_range(reference: np.ndarray, target: np.ndarray) -> tuple[float, str, list[str]]:
+        warnings: list[str] = []
+        if np.issubdtype(reference.dtype, np.integer) and np.issubdtype(target.dtype, np.integer):
+            info = np.iinfo(reference.dtype)
+            return float(info.max - info.min), "dtype", warnings
+        min_val = float(min(np.min(reference), np.min(target)))
+        max_val = float(max(np.max(reference), np.max(target)))
+        data_range = max_val - min_val
+        if data_range <= 0:
+            warnings.append("data_range_ambiguous")
+            return 1.0, "fallback", warnings
+        return float(data_range), "minmax", warnings
 
     def calculate_image_comparison_metrics(self) -> None:
         reference_id = self._resolve_image_analysis_selection("reference_image_id", "reference_image", "image")
@@ -12475,6 +12489,11 @@ class DicomViewer:
         if reference is None or target is None:
             self.image_analysis_results["image_result"].set("Result: Failed to load image pair")
             return
+        original_reference_shape = tuple(reference.shape)
+        original_target_shape = tuple(target.shape)
+        warnings: list[str] = []
+        if original_reference_shape != original_target_shape:
+            warnings.append("shape_mismatch")
         min_h = min(reference.shape[0], target.shape[0])
         min_w = min(reference.shape[1], target.shape[1])
         reference = reference[:min_h, :min_w]
@@ -12491,18 +12510,43 @@ class DicomViewer:
                 return
             reference = reference[y0:y1, x0:x1]
             target = target[y0:y1, x0:x1]
-        diff = reference - target
+        diff = reference.astype(np.float64) - target.astype(np.float64)
         mse = float(np.mean(diff**2))
-        max_val = float(max(np.max(reference), np.max(target), 1.0))
-        psnr = float("inf") if mse <= 0 else float(20 * np.log10(max_val / np.sqrt(mse)))
-        ssim = self._compute_simple_ssim(reference, target)
-        hist_ref, _ = np.histogram(reference, bins=64, range=(np.min(reference), np.max(reference) + 1e-6), density=True)
-        hist_tar, _ = np.histogram(target, bins=64, range=(np.min(target), np.max(target) + 1e-6), density=True)
+        data_range, data_range_policy, range_warnings = self._resolve_data_range(reference, target)
+        warnings.extend(range_warnings)
+        psnr = float("inf") if mse <= 0 else float(20 * np.log10(max(data_range, 1e-12) / np.sqrt(mse)))
+        ssim_k1 = 0.01
+        ssim_k2 = 0.03
+        ssim = self._compute_simple_ssim(reference, target, data_range=max(data_range, 1e-12), k1=ssim_k1, k2=ssim_k2)
+        hist_bins = 64
+        hist_min = float(min(np.min(reference), np.min(target)))
+        hist_max = float(max(np.max(reference), np.max(target))) + 1e-6
+        hist_ref, _ = np.histogram(reference, bins=hist_bins, range=(hist_min, hist_max), density=True)
+        hist_tar, _ = np.histogram(target, bins=hist_bins, range=(hist_min, hist_max), density=True)
         hist_corr = float(np.corrcoef(hist_ref, hist_tar)[0, 1]) if np.std(hist_ref) > 0 and np.std(hist_tar) > 0 else 0.0
         scope_text = "Full Image" if self.image_analysis_inputs["scope_type"].get() == "full" else "Selected ROI"
-        self.image_analysis_results["image_formula"].set(f"Formula: scope={scope_text}, SSIM/PSNR/MSE/HIST")
+        bits_stored_text = "unknown"
+        if hasattr(self, "dicom_datasets") and isinstance(self.dicom_datasets, list):
+            try:
+                ds = self.dicom_datasets[self.current_file_index]
+                bits_stored_text = str(getattr(ds, "BitsStored", "unknown"))
+            except Exception:
+                bits_stored_text = "unknown"
+        conditions = [
+            "input=raw_dicom",
+            f"scope={scope_text}",
+            f"shape={original_reference_shape}->{original_target_shape}",
+            f"bits={bits_stored_text}",
+            f"pixel_minmax=({float(np.min(reference)):.3f},{float(np.max(reference)):.3f})/({float(np.min(target)):.3f},{float(np.max(target)):.3f})",
+            f"data_range_policy={data_range_policy}",
+            f"data_range={data_range:.6f}",
+            f"ssim=(k1={ssim_k1},k2={ssim_k2})",
+            f"hist=(bins={hist_bins},range=({hist_min:.3f},{hist_max:.3f}))",
+        ]
+        self.image_analysis_results["image_formula"].set("Formula: " + " | ".join(conditions))
+        warn_text = (" | Warnings=" + ",".join(sorted(set(warnings)))) if warnings else ""
         self.image_analysis_results["image_result"].set(
-            f"Result: MSE={mse:.4f} | PSNR={psnr:.4f} | SSIM={ssim:.4f} | HIST corr={hist_corr:.4f}"
+            f"Result: MSE={mse:.4f} | PSNR={psnr:.4f} | SSIM={ssim:.4f} | HIST corr={hist_corr:.4f}{warn_text}"
         )
 
     def assign_roi_role(self) -> None:
