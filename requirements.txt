@@ -2,3 +2,5 @@ numpy
 pillow
 pydicom
 scipy
+matplotlib
+pytest

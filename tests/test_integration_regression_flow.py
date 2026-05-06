@@ -6,28 +6,6 @@ from types import SimpleNamespace
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-if "matplotlib" not in sys.modules:
-    matplotlib_stub = types.ModuleType("matplotlib")
-    pyplot_stub = types.ModuleType("matplotlib.pyplot")
-
-    def _noop(*_args, **_kwargs):
-        return None
-
-    pyplot_stub.figure = _noop
-    pyplot_stub.plot = _noop
-    pyplot_stub.xlabel = _noop
-    pyplot_stub.ylabel = _noop
-    pyplot_stub.title = _noop
-    pyplot_stub.tight_layout = _noop
-    pyplot_stub.show = _noop
-    matplotlib_stub.pyplot = pyplot_stub
-    sys.modules["matplotlib"] = matplotlib_stub
-    sys.modules["matplotlib.pyplot"] = pyplot_stub
-
 from dicom_viewer import DicomViewer, Measurement, ResultHistoryEntry, ResultHistoryStore
 
 
@@ -68,6 +46,8 @@ def _build_viewer() -> DicomViewer:
     viewer.dataset = SimpleNamespace(PixelSpacing=[0.5, 0.5])
     viewer.persistent_measurements = []
     viewer.analysis_last_run = {}
+    viewer.active_study_id = ""
+    viewer.active_group_id = ""
     viewer.line_profile_series_cache = {}
     viewer.result_history_store = ResultHistoryStore()
     viewer.result_history_table = None
@@ -102,8 +82,22 @@ def _build_viewer() -> DicomViewer:
         "line_profile_line_id": DummyVar(""),
     }
     viewer.analysis_results = {"line_info": DummyVar("-")}
+    viewer.image_analysis_results = {"image_result": DummyVar(""), "image_formula": DummyVar("")}
     viewer.measurement_mode = DummyVar("pan")
     viewer.root = SimpleNamespace(clipboard_clear=lambda: None, clipboard_append=lambda _s: None)
+    viewer.iqa_ui_state = SimpleNamespace(
+        reference_id="",
+        reference_label="",
+        target_id="",
+        target_label="",
+        input_mode="raw_dicom_pixel",
+        scope="full_image",
+        data_range_mode="auto",
+        photometric_invert=False,
+        selected_roi_id="",
+        selected_roi_label="",
+        roi_bbox=None,
+    )
 
     # Headless-safe no-op hooks used by session/preset apply flows.
     viewer._refresh_analysis_selectors = lambda: None
@@ -209,6 +203,67 @@ def test_session_save_load_integration_round_trip(monkeypatch, tmp_path):
     assert len(viewer.result_history_store.entries()) == 2
     assert viewer._session_compare_state["selected_entry_ids"] == entry_ids[:1]
     assert viewer._session_compare_state["baseline_index"] == 0
+
+
+def test_session_round_trip_restores_iqa_history_and_state(monkeypatch, tmp_path):
+    viewer = _build_viewer()
+    monkeypatch.setattr("dicom_viewer.messagebox.showwarning", lambda *_args, **_kwargs: None)
+    source_path = tmp_path / "sample2.dcm"
+    source_path.write_text("stub", encoding="utf-8")
+    viewer.file_paths = [str(source_path)]
+    viewer.current_file_index = 0
+    viewer.iqa_ui_state.reference_id = "ref_1"
+    viewer.iqa_ui_state.reference_label = "Reference A"
+    viewer.iqa_ui_state.target_id = "tar_1"
+    viewer.iqa_ui_state.target_label = "Target B"
+    viewer.iqa_ui_state.scope = "roi"
+    viewer.iqa_ui_state.selected_roi_id = "roi_1"
+    viewer.iqa_ui_state.selected_roi_label = "Lung ROI"
+    viewer.iqa_ui_state.roi_bbox = (1, 1, 4, 4)
+    viewer.iqa_history = [
+        {
+            "history_id": "iqa_1",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "analysis_type": "iqa",
+            "reference_id": "ref_1",
+            "reference_label": "Reference A",
+            "target_id": "tar_1",
+            "target_label": "Target B",
+            "scope": "roi",
+            "status": "success",
+            "display_summary": "Histogram stable",
+            "export_record": {"analysis_type": "iqa", "metric_psnr": "inf"},
+            "context": {"scope": "roi", "histogram": {"histogram_bins": 64}},
+            "histogram": {"histogram_bins": 64},
+            "metrics": {"mse": 0.0, "rmse": 0.0, "psnr": "inf", "ssim": 1.0, "hist_corr": 1.0},
+            "warnings": [],
+        }
+    ]
+    payload = viewer.serialize_session()
+    restored = viewer.deserialize_session(payload)
+    viewer.apply_session(restored)
+    assert viewer.iqa_history
+    assert viewer.iqa_history[-1]["reference_label"] == "Reference A"
+    assert viewer.iqa_ui_state.target_label == "Target B"
+    assert viewer.iqa_ui_state.selected_roi_id == "roi_1"
+    assert viewer.analysis_last_run["iqa"]["analysis_type"] == "iqa"
+    assert "자동 재계산하지 않았습니다" in viewer.image_analysis_results["image_result"].get()
+    assert "iqa_report_text" in viewer.analysis_last_run
+
+
+def test_legacy_session_without_iqa_history_is_compatible(monkeypatch, tmp_path):
+    viewer = _build_viewer()
+    monkeypatch.setattr("dicom_viewer.messagebox.showwarning", lambda *_args, **_kwargs: None)
+    source_path = tmp_path / "legacy.dcm"
+    source_path.write_text("stub", encoding="utf-8")
+    viewer.file_paths = [str(source_path)]
+    viewer.current_file_index = 0
+    payload = viewer.serialize_session()
+    payload.pop("iqa_history", None)
+    payload.pop("iqa_ui_state", None)
+    restored = viewer.deserialize_session(payload)
+    viewer.apply_session(restored)
+    assert isinstance(getattr(viewer, "iqa_history", []), list)
 
 
 def test_preset_save_load_integration_keeps_session_objects_and_history():

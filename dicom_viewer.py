@@ -25,6 +25,47 @@ from mtf_qa_grading import grade_mtf_for_internal_qa
 from domain_store import DomainStore
 from window_b_services import AnalysisResultController, HistoryController, SessionController, ReportExportController
 from window_b_manager import WindowBManager
+from iqa_metrics import calculate_iqa_metrics
+from iqa_dicom_adapter import calculate_dicom_iqa
+from iqa_export import iqa_result_to_analysis_record
+from iqa_display import WARNING_MESSAGE_MAP, build_iqa_display_model, format_iqa_display_text
+from iqa_history import (
+    append_iqa_history,
+    build_iqa_history_entry,
+    get_latest_iqa_history,
+    restore_iqa_history_entry,
+    summarize_iqa_history_entry,
+)
+from iqa_histogram import (
+    build_histogram_preview_model,
+    calculate_histogram_data,
+    format_histogram_preview_text,
+    resolve_histogram_range,
+    summarize_histogram_difference,
+)
+from iqa_report import build_iqa_report, format_iqa_report_text
+from iqa_report_export_ui import normalize_iqa_report_export_format, resolve_latest_iqa_report_for_export, save_iqa_report_by_format
+from iqa_ui_state import (
+    clear_iqa_selection,
+    create_default_iqa_state,
+    resolve_iqa_run_state,
+    set_iqa_reference_from_current,
+    set_iqa_input_mode,
+    set_iqa_scope,
+    set_iqa_data_range_mode,
+    set_iqa_photometric_invert,
+    set_iqa_target_from_current,
+    swap_iqa_reference_target,
+)
+
+IQA_BUTTON_LABELS = {
+    "set_ref": "Set Ref",
+    "set_target": "Set Target",
+    "swap": "Swap",
+    "clear": "Clear",
+    "run": "Run IQA",
+    "save_report": "Save Report",
+}
 
 
 @dataclass
@@ -373,12 +414,18 @@ class DicomViewer:
         self.image_analysis_inputs: dict[str, tk.StringVar] = {
             "reference_image_id": tk.StringVar(value=""),
             "target_image_id": tk.StringVar(value=""),
-            "scope_type": tk.StringVar(value="full"),
+            "scope_type": tk.StringVar(value="full_image"),
             "scope_roi_id": tk.StringVar(value=""),
+            "iqa_input_mode": tk.StringVar(value="raw_dicom_pixel"),
+            "iqa_data_range_mode": tk.StringVar(value="auto"),
+            "iqa_photometric_invert": tk.BooleanVar(value=False),
+            "iqa_report_export_format": tk.StringVar(value="txt"),
         }
         self.image_analysis_results: dict[str, tk.StringVar] = {
             "image_formula": tk.StringVar(value="Formula: MSE/PSNR/SSIM/Histogram"),
             "image_result": tk.StringVar(value="Result: -"),
+            "iqa_pair_status": tk.StringVar(value="Pair: Reference=None | Target=None | Ready=False"),
+            "iqa_export_status": tk.StringVar(value="IQA report export ready"),
         }
         self.analysis_inputs = self.signal_analysis_inputs
         self.analysis_results = self.signal_analysis_results
@@ -1508,16 +1555,41 @@ class DicomViewer:
 
         scope_group = ttk.LabelFrame(frame, text="Scope", padding=(8, 6))
         scope_group.pack(side="left", padx=(0, 8), fill="y")
-        ttk.Radiobutton(scope_group, text="Full Image", value="full", variable=self.image_analysis_inputs["scope_type"]).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(scope_group, text="Full Image", value="full_image", variable=self.image_analysis_inputs["scope_type"]).grid(row=0, column=0, sticky="w")
         ttk.Radiobutton(scope_group, text="Selected ROI", value="roi", variable=self.image_analysis_inputs["scope_type"]).grid(row=1, column=0, sticky="w")
         self._image_analysis_comboboxes["scope_roi"] = ttk.Combobox(scope_group, state="readonly", width=42)
         self._image_analysis_comboboxes["scope_roi"].grid(row=2, column=0, sticky="ew", pady=(6, 0))
 
         result_group = ttk.LabelFrame(frame, text="Image Metrics", padding=(8, 6))
         result_group.pack(side="left", padx=(0, 8), fill="y")
-        ttk.Label(result_group, textvariable=self.image_analysis_results["image_formula"]).grid(row=0, column=0, sticky="w")
-        ttk.Label(result_group, textvariable=self.image_analysis_results["image_result"]).grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Button(result_group, text="Calculate SSIM / PSNR / MSE / HIST", command=self.calculate_image_comparison_metrics).grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(result_group, textvariable=self.image_analysis_results["iqa_pair_status"]).grid(row=0, column=0, sticky="w")
+        option_row = ttk.Frame(result_group)
+        option_row.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        ttk.Label(option_row, text="Input").grid(row=0, column=0, sticky="w")
+        iqa_mode_combo = ttk.Combobox(option_row, state="readonly", width=16, values=("raw_dicom_pixel", "modality_lut", "windowed_display"), textvariable=self.image_analysis_inputs["iqa_input_mode"])
+        iqa_mode_combo.grid(row=0, column=1, padx=(4, 6))
+        ttk.Label(option_row, text="DataRange").grid(row=0, column=2, sticky="w")
+        iqa_scope_combo = ttk.Combobox(option_row, state="readonly", width=12, values=("full_image", "roi"), textvariable=self.image_analysis_inputs["scope_type"])
+        iqa_scope_combo.grid(row=0, column=3, padx=(4, 6))
+        ttk.Label(option_row, text="Range").grid(row=0, column=4, sticky="w")
+        iqa_range_combo = ttk.Combobox(option_row, state="readonly", width=10, values=("auto", "bits", "actual_union"), textvariable=self.image_analysis_inputs["iqa_data_range_mode"])
+        iqa_range_combo.grid(row=0, column=5, padx=(4, 6))
+        ttk.Checkbutton(option_row, text="Photometric Invert", variable=self.image_analysis_inputs["iqa_photometric_invert"]).grid(row=0, column=6, sticky="w")
+        ttk.Label(result_group, textvariable=self.image_analysis_results["image_formula"]).grid(row=5, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(result_group, textvariable=self.image_analysis_results["image_result"]).grid(row=6, column=0, sticky="w", pady=(4, 0))
+        action_row = ttk.Frame(result_group)
+        action_row.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        ttk.Button(action_row, text=IQA_BUTTON_LABELS["set_ref"], command=self._set_iqa_reference_from_current).grid(row=0, column=0, padx=(0, 4))
+        ttk.Button(action_row, text=IQA_BUTTON_LABELS["set_target"], command=self._set_iqa_target_from_current).grid(row=0, column=1, padx=(0, 4))
+        ttk.Button(action_row, text=IQA_BUTTON_LABELS["swap"], command=self._swap_iqa_reference_target).grid(row=0, column=2, padx=(0, 4))
+        ttk.Button(action_row, text=IQA_BUTTON_LABELS["clear"], command=self._clear_iqa_selection).grid(row=0, column=3, padx=(0, 4))
+        export_row = ttk.Frame(result_group)
+        export_row.grid(row=4, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(export_row, text="Export Format").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(export_row, state="readonly", width=8, values=("txt", "json", "csv", "all"), textvariable=self.image_analysis_inputs["iqa_report_export_format"]).grid(row=0, column=1, padx=(4, 6))
+        ttk.Button(export_row, text=IQA_BUTTON_LABELS["save_report"], command=self._save_latest_iqa_report).grid(row=0, column=2, padx=(0, 6))
+        ttk.Label(export_row, textvariable=self.image_analysis_results["iqa_export_status"]).grid(row=0, column=3, sticky="w")
+        ttk.Button(result_group, text=IQA_BUTTON_LABELS["run"], command=self.calculate_image_comparison_metrics).grid(row=5, column=0, sticky="ew", pady=(8, 0))
 
     def _build_analysis_results_panel(self, strip: ttk.Frame) -> None:
         panel = ttk.LabelFrame(strip, text="Analysis Results", padding=(8, 6))
@@ -2323,8 +2395,12 @@ class DicomViewer:
             return "N/A"
         return f"{((current - baseline) / baseline) * 100.0:.2f}%"
 
-    def _line_profile_cache_key(self, source_image_path: str, frame_index: int, target_id: str) -> str:
-        return f"{source_image_path}|{int(frame_index)}|{target_id}"
+    @staticmethod
+    def normalize_source_image_path(source_image_path: str | None) -> str:
+        return str(source_image_path or "")
+
+    def _line_profile_cache_key(self, source_image_path: str | None, frame_index: int, target_id: str) -> str:
+        return f"{self.normalize_source_image_path(source_image_path)}|{int(frame_index)}|{target_id}"
 
     def resolve_line_profile_series(self, entry: ResultHistoryEntry) -> dict[str, Any] | None:
         if entry.measurement_type != "Line Profile" or not entry.target_id:
@@ -2332,6 +2408,9 @@ class DicomViewer:
         cache_key = self._line_profile_cache_key(entry.source_image_path, entry.frame_index, entry.target_id)
         if cache_key in self.line_profile_series_cache:
             return self.line_profile_series_cache[cache_key]
+        fallback_key = self._line_profile_cache_key("", entry.frame_index, entry.target_id)
+        if fallback_key in self.line_profile_series_cache:
+            return self.line_profile_series_cache[fallback_key]
         latest_line_profile = self._select_analysis_last_run("line_profile")
         latest_inputs = latest_line_profile.get("inputs", {})
         latest_result = latest_line_profile.get("result", {})
@@ -3313,55 +3392,165 @@ class DicomViewer:
         if "uniformity_result" in self.analysis_results:
             self.analysis_results["uniformity_result"].set("Result: -")
 
+    def _analysis_input_value(self, input_key: str) -> str:
+        input_store = self.analysis_inputs if input_key in self.analysis_inputs else self.image_analysis_inputs
+        var = input_store.get(input_key)
+        return str(var.get()).strip() if var is not None else ""
+
+    def _set_analysis_input_value(self, input_key: str, value: str) -> None:
+        input_store = self.analysis_inputs if input_key in self.analysis_inputs else self.image_analysis_inputs
+        var = input_store.get(input_key)
+        if var is not None:
+            var.set(value)
+
+    def _resolve_combobox_measurement_id(self, kind: str, combobox_key: str) -> tuple[str, str]:
+        combo = self._analysis_comboboxes.get(combobox_key)
+        option_map = self._analysis_option_maps.get(kind, {})
+        if combo is None:
+            combo = self._image_analysis_comboboxes.get(combobox_key)
+            option_map = self._image_analysis_option_maps.get(kind, {})
+        if combo is None:
+            return "", ""
+        selected = str(combo.get()).strip()
+        if not selected:
+            return "", ""
+        return str(option_map.get(selected) or selected), selected
+
+    def _resolve_signal_analysis_slot(
+        self,
+        *,
+        slot_name: str,
+        input_key: str,
+        combobox_key: str,
+        role_names: tuple[str, ...],
+    ) -> dict[str, Any]:
+        warnings: list[str] = []
+        direct_id = self._analysis_input_value(input_key)
+        if direct_id:
+            measurement = self._find_measurement_by_id(direct_id, expected_kind="roi")
+            if measurement is not None and self._is_analysis_compatible_measurement(measurement):
+                return {"id": measurement.id, "measurement": measurement, "source": "direct", "warnings": warnings}
+            warnings.append(f"{slot_name}: direct/manual ROI id is invalid: {direct_id}")
+
+        combobox_id, selected_label = self._resolve_combobox_measurement_id("roi", combobox_key)
+        if combobox_id:
+            measurement = self._find_measurement_by_id(combobox_id, expected_kind="roi")
+            if measurement is not None and self._is_analysis_compatible_measurement(measurement):
+                self._set_analysis_input_value(input_key, measurement.id)
+                return {"id": measurement.id, "measurement": measurement, "source": "combobox", "warnings": warnings}
+            warnings.append(f"{slot_name}: combobox selection is invalid: {selected_label}")
+
+        for role_name in role_names:
+            measurement = self._find_roi_by_role(role_name)
+            if measurement is not None and self._is_analysis_compatible_measurement(measurement):
+                self._set_analysis_input_value(input_key, measurement.id)
+                return {"id": measurement.id, "measurement": measurement, "source": "role", "warnings": warnings}
+
+        return {"id": "", "measurement": None, "source": "invalid", "warnings": warnings}
+
+    def resolve_signal_analysis_inputs(self, analysis_type: str | None = None) -> dict[str, Any]:
+        formula_var = self.analysis_inputs.get("cnr_formula")
+        formula = formula_var.get() if formula_var is not None else "standard_noise"
+        requested = {analysis_type} if analysis_type in {"snr", "cnr"} else {"snr", "cnr"}
+        resolved: dict[str, Any] = {}
+
+        if "snr" in requested:
+            signal = self._resolve_signal_analysis_slot(
+                slot_name="snr_signal",
+                input_key="snr_signal_roi_id",
+                combobox_key="snr_signal",
+                role_names=("signal",),
+            )
+            background = self._resolve_signal_analysis_slot(
+                slot_name="snr_background",
+                input_key="snr_background_roi_id",
+                combobox_key="snr_noise",
+                role_names=("background", "noise"),
+            )
+            warnings = [*signal["warnings"], *background["warnings"]]
+            missing = []
+            if signal["measurement"] is None:
+                missing.append("signal ROI")
+            if background["measurement"] is None:
+                missing.append("background/noise ROI")
+            is_valid = not missing
+            resolved["snr"] = {
+                "is_valid": is_valid,
+                "signal_roi_id": signal["id"],
+                "background_roi_id": background["id"],
+                "noise_roi_id": background["id"],
+                "source": {"signal": signal["source"], "background": background["source"]},
+                "warnings": warnings,
+                "reason": "" if is_valid else "Missing " + ", ".join(missing),
+                "resolved_measurements": {"signal": signal["measurement"], "background": background["measurement"], "noise": background["measurement"]},
+            }
+
+        if "cnr" in requested:
+            target = self._resolve_signal_analysis_slot(
+                slot_name="cnr_target",
+                input_key="cnr_target_roi_id",
+                combobox_key="cnr_target",
+                role_names=("target",),
+            )
+            reference = self._resolve_signal_analysis_slot(
+                slot_name="cnr_reference",
+                input_key="cnr_reference_roi_id",
+                combobox_key="cnr_reference",
+                role_names=("reference",),
+            )
+            noise = self._resolve_signal_analysis_slot(
+                slot_name="cnr_noise",
+                input_key="cnr_noise_roi_id",
+                combobox_key="cnr_noise",
+                role_names=("noise",),
+            ) if formula == "standard_noise" else {"id": "", "measurement": None, "source": "not_required", "warnings": []}
+            warnings = [*target["warnings"], *reference["warnings"], *noise["warnings"]]
+            missing = []
+            if target["measurement"] is None:
+                missing.append("target ROI")
+            if reference["measurement"] is None:
+                missing.append("reference ROI")
+            if formula == "standard_noise" and noise["measurement"] is None:
+                missing.append("noise ROI")
+            is_valid = not missing
+            resolved["cnr"] = {
+                "is_valid": is_valid,
+                "formula": formula,
+                "target_roi_id": target["id"],
+                "reference_roi_id": reference["id"],
+                "noise_roi_id": noise["id"],
+                "source": {"target": target["source"], "reference": reference["source"], "noise": noise["source"]},
+                "warnings": warnings,
+                "reason": "" if is_valid else "Missing " + ", ".join(missing),
+                "resolved_measurements": {"target": target["measurement"], "reference": reference["measurement"], "noise": noise["measurement"]},
+            }
+        if analysis_type in {"snr", "cnr"}:
+            return resolved[analysis_type]
+        return resolved
+
     def _update_analysis_action_button_state(self) -> None:
         action_buttons = getattr(self, "_analysis_action_buttons", {})
         snr_button = action_buttons.get("snr")
         cnr_button = action_buttons.get("cnr")
-        signal_roi = self._find_roi_by_role("signal")
-        snr_noise_roi = self._find_roi_by_role("background") or self._find_roi_by_role("noise")
-        manual_signal_roi = self._peek_selected_measurement_from_analysis("roi", "snr_signal_roi_id", "snr_signal")
-        manual_snr_noise_roi = self._peek_selected_measurement_from_analysis("roi", "snr_background_roi_id", "snr_noise")
-        cnr_target_roi = self._find_roi_by_role("target")
-        cnr_reference_roi = self._find_roi_by_role("reference")
-        cnr_noise_roi = self._find_roi_by_role("noise")
-        manual_cnr_target_roi = self._peek_selected_measurement_from_analysis("roi", "cnr_target_roi_id", "cnr_target")
-        manual_cnr_reference_roi = self._peek_selected_measurement_from_analysis("roi", "cnr_reference_roi_id", "cnr_reference")
-        manual_cnr_noise_roi = self._peek_selected_measurement_from_analysis("roi", "cnr_noise_roi_id", "cnr_noise")
-        formula_var = self.analysis_inputs.get("cnr_formula")
-        formula = formula_var.get() if formula_var is not None else "standard_noise"
+        resolved = self.resolve_signal_analysis_inputs()
 
         if snr_button is not None:
-            role_ready = signal_roi is not None and snr_noise_roi is not None
-            manual_ready = manual_signal_roi is not None and manual_snr_noise_roi is not None
-            snr_ready = role_ready or manual_ready
+            snr = resolved.get("snr", {})
+            snr_ready = bool(snr.get("is_valid"))
             snr_button.configure(state="normal" if snr_ready else "disabled")
             snr_reason_var = self.analysis_results.get("snr_ready_reason")
             if snr_reason_var is not None:
-                missing_reasons: list[str] = []
-                if signal_roi is None and manual_signal_roi is None:
-                    missing_reasons.append("signal ROI 미선택")
-                if snr_noise_roi is None and manual_snr_noise_roi is None:
-                    missing_reasons.append("background/noise ROI 미선택")
                 if snr_ready:
-                    source_text = "role-based measurement" if role_ready else "manual measurement"
+                    sources = (snr.get("source") or {}).values()
+                    source_text = "manual measurement" if "direct" in sources or "combobox" in sources else "role-based measurement"
                     snr_reason_var.set(f"Ready: {source_text}")
                 else:
-                    if len(missing_reasons) == 2:
-                        snr_reason_var.set("Select Signal ROI and Noise ROI")
-                    elif "signal ROI 미선택" in missing_reasons:
-                        snr_reason_var.set("Signal ROI not selected")
-                    elif "background/noise ROI 미선택" in missing_reasons:
-                        snr_reason_var.set("Noise ROI not selected")
-                    else:
-                        snr_reason_var.set("ROI selection required")
+                    snr_reason_var.set(str(snr.get("reason") or "ROI selection required"))
+
         if cnr_button is not None:
-            needs_noise = formula == "standard_noise"
-            role_ready = cnr_target_roi is not None and cnr_reference_roi is not None and (cnr_noise_roi is not None or not needs_noise)
-            manual_ready = manual_cnr_target_roi is not None and manual_cnr_reference_roi is not None and (
-                manual_cnr_noise_roi is not None or not needs_noise
-            )
-            cnr_ready = role_ready or manual_ready
-            cnr_button.configure(state="normal" if cnr_ready else "disabled")
+            cnr = resolved.get("cnr", {})
+            cnr_button.configure(state="normal" if bool(cnr.get("is_valid")) else "disabled")
+
         mtf_button = action_buttons.get("mtf")
         if mtf_button is not None:
             mtf_active_var = self.analysis_inputs.get("mtf_active_roi_id")
@@ -10547,6 +10736,11 @@ class DicomViewer:
             )
             for item in store_measurements
         ]
+        legacy_measurements = list(getattr(self, "persistent_measurements", []) or [])
+        if frame_index is not None:
+            legacy_measurements = [item for item in legacy_measurements if int(item.frame_index) == int(frame_index)]
+        seen_ids = {item.id for item in filtered}
+        filtered.extend(item for item in legacy_measurements if item.id not in seen_ids)
         if kind is not None:
             filtered = [item for item in filtered if item.kind == kind]
         return filtered
@@ -10610,11 +10804,17 @@ class DicomViewer:
     def _action_update_measurement_in_store(self, measurement: Measurement) -> None:
         self._ensure_domain_store()
         role = self._get_measurement_roi_role(measurement)
-        self.domain_store.update_measurement(
-            measurement.id,
+        self.domain_store.update_or_add_measurement(
+            image_id=self._store_image_id,
+            kind=measurement.kind,
+            start=(float(measurement.start[0]), float(measurement.start[1])),
+            end=(float(measurement.end[0]), float(measurement.end[1])),
+            frame_index=int(measurement.frame_index),
+            geometry_key=measurement.geometry_key,
             summary_text=measurement.summary_text,
             role=role,
             meta=dict(measurement.meta or {}),
+            measurement_id=measurement.id,
         )
 
     def _action_commit_frame_change(self, frame_index: int) -> None:
@@ -10739,7 +10939,10 @@ class DicomViewer:
 
     def _select_analysis_last_run(self, key: str) -> dict[str, Any]:
         self._ensure_domain_store()
-        return self.domain_store.select_analysis_last_run(key)
+        payload = self.domain_store.select_analysis_last_run(key)
+        if payload:
+            return payload
+        return dict(getattr(self, "analysis_last_run", {}).get(key) or {})
 
     def _select_result_history_entries(self) -> list[ResultHistoryEntry]:
         self._ensure_domain_store()
@@ -10834,6 +11037,9 @@ class DicomViewer:
         measurement.summary_text = metrics["summary"]
         measurement.meta = self._canonicalize_measurement_meta(measurement, metrics)
         self._action_add_measurement_to_store(measurement)
+        legacy_measurements = getattr(self, "persistent_measurements", None)
+        if legacy_measurements is not None:
+            legacy_measurements.append(measurement)
         self._append_measurement_history_entries(measurement, metrics)
         return measurement
 
@@ -11374,6 +11580,7 @@ class DicomViewer:
     def serialize_session(self) -> dict[str, Any]:
         self._ensure_window_b_services()
         current_path = self._get_current_image_path()
+        self._sync_domain_store_from_persistent_measurements()
         all_measurements = self._selector_measurements_for_image()
         roi_items = [item for item in all_measurements if item.kind == "roi"]
         line_items = [item for item in all_measurements if item.kind == "line"]
@@ -11405,6 +11612,11 @@ class DicomViewer:
                 "baseline_index": int(self._session_compare_state.get("baseline_index", 0)),
             },
                 "store_snapshot": store_snapshot,
+                "iqa_history": list(getattr(self, "iqa_history", []) or []),
+                "latest_iqa_history_index": (len(getattr(self, "iqa_history", []) or []) - 1) if getattr(self, "iqa_history", None) else None,
+                "iqa_ui_state": self._serialize_iqa_ui_state_snapshot(),
+                "last_iqa_export_record": dict(((self.analysis_last_run or {}).get("iqa") or {})),
+                "last_iqa_display_summary": str((get_latest_iqa_history(getattr(self, "iqa_history", []) or []) or {}).get("display_summary", "")),
             }
         )
 
@@ -11431,7 +11643,49 @@ class DicomViewer:
             "active_group_id": str(payload.get("active_group_id", "")),
             "compare_state": dict(payload.get("compare_state") or {}),
             "store_snapshot": dict(payload.get("store_snapshot") or {}),
+            "iqa_history": list(payload.get("iqa_history") or []),
+            "latest_iqa_history_index": payload.get("latest_iqa_history_index"),
+            "iqa_ui_state": dict(payload.get("iqa_ui_state") or {}),
+            "last_iqa_export_record": dict(payload.get("last_iqa_export_record") or {}),
+            "last_iqa_display_summary": str(payload.get("last_iqa_display_summary", "")),
         }
+
+    def _serialize_iqa_ui_state_snapshot(self) -> dict[str, Any]:
+        state = getattr(self, "iqa_ui_state", None)
+        if state is None:
+            return {}
+        return {
+            "reference_id": getattr(state, "reference_id", ""),
+            "reference_label": getattr(state, "reference_label", ""),
+            "target_id": getattr(state, "target_id", ""),
+            "target_label": getattr(state, "target_label", ""),
+            "input_mode": getattr(state, "input_mode", "raw_dicom_pixel"),
+            "scope": getattr(state, "scope", "full_image"),
+            "data_range_mode": getattr(state, "data_range_mode", "auto"),
+            "photometric_invert": bool(getattr(state, "photometric_invert", False)),
+            "selected_roi_id": getattr(state, "selected_roi_id", ""),
+            "selected_roi_label": getattr(state, "selected_roi_label", ""),
+            "roi_bbox": getattr(state, "roi_bbox", None),
+        }
+
+    def _restore_iqa_ui_state_snapshot(self, snapshot: dict[str, Any]) -> None:
+        if not hasattr(self, "iqa_ui_state") or self.iqa_ui_state is None:
+            self.iqa_ui_state = create_default_iqa_state()
+        for key in (
+            "reference_id",
+            "reference_label",
+            "target_id",
+            "target_label",
+            "input_mode",
+            "scope",
+            "data_range_mode",
+            "selected_roi_id",
+            "selected_roi_label",
+        ):
+            if key in snapshot:
+                setattr(self.iqa_ui_state, key, snapshot.get(key))
+        self.iqa_ui_state.photometric_invert = bool(snapshot.get("photometric_invert", False))
+        self.iqa_ui_state.roi_bbox = snapshot.get("roi_bbox")
 
     def _migrate_legacy_session_to_store_snapshot(self, session_data: dict[str, Any]) -> dict[str, Any]:
         migrated = DomainStore()
@@ -11496,6 +11750,28 @@ class DicomViewer:
                 return replacement
         return ""
 
+    def _rebuild_persistent_measurements_from_domain_store(self) -> None:
+        self._ensure_domain_store()
+        rebuilt_measurements = [
+            Measurement(
+                id=item.measurement_id,
+                kind=item.kind,
+                start=(float(item.start[0]), float(item.start[1])),
+                end=(float(item.end[0]), float(item.end[1])),
+                frame_index=int(item.frame_index),
+                geometry_key=item.geometry_key,
+                summary_text=item.summary_text,
+                meta=dict(item.meta or {}),
+            )
+            for item in self.domain_store.select_measurements_for_image(self._store_image_id)
+        ]
+        setattr(self, "persistent_measurements", rebuilt_measurements)
+
+    def _sync_domain_store_from_persistent_measurements(self) -> None:
+        self._ensure_domain_store()
+        for measurement in list(getattr(self, "persistent_measurements", []) or []):
+            self._action_update_measurement_in_store(measurement)
+
     def apply_session(self, session_data: dict[str, Any]) -> None:
         source_image_path = self._resolve_session_image_path(session_data.get("source_image_path", ""))
         self._reset_analysis_session_state()
@@ -11512,7 +11788,10 @@ class DicomViewer:
                 self.current_frame = requested_frame
 
         store_snapshot = dict(session_data.get("store_snapshot") or {})
-        if not (store_snapshot.get("state") is not None and store_snapshot.get("snapshot_timestamp")):
+        snapshot_state = store_snapshot.get("state")
+        snapshot_has_measurements = bool(getattr(snapshot_state, "measurements", {}) if snapshot_state is not None else {})
+        legacy_has_measurements = bool(session_data.get("roi_list") or session_data.get("line_list"))
+        if not (store_snapshot.get("state") is not None and store_snapshot.get("snapshot_timestamp")) or (legacy_has_measurements and not snapshot_has_measurements):
             # LEGACY_BRIDGE: 구세션 payload를 최신 store snapshot 구조로 1회 변환한다.
             store_snapshot = self._migrate_legacy_session_to_store_snapshot(session_data)
         self.domain_store.load_session({**store_snapshot, "session_id": str(session_data.get("active_study_id", ""))})
@@ -11538,12 +11817,30 @@ class DicomViewer:
 
         self.domain_store.set_frame(self._store_image_id, int(self.current_frame))
         self.domain_store.set_selection(self._store_image_id, [])
+        self._rebuild_persistent_measurements_from_domain_store()
         self._draw_persistent_measurements()
 
         for key, value in (session_data.get("analysis_options") or {}).items():
             if key in self.analysis_inputs:
                 self.analysis_inputs[key].set(str(value))
         self._refresh_analysis_selectors()
+        self.iqa_history = [restore_iqa_history_entry(item).__dict__ for item in list(session_data.get("iqa_history") or [])][-50:]
+        self._restore_iqa_ui_state_snapshot(dict(session_data.get("iqa_ui_state") or {}))
+        latest_iqa = get_latest_iqa_history(self.iqa_history)
+        if latest_iqa:
+            if not hasattr(self, "analysis_last_run") or self.analysis_last_run is None:
+                self.analysis_last_run = {}
+            self.analysis_last_run["iqa"] = dict(latest_iqa.get("export_record") or {"analysis_type": "iqa", "status": latest_iqa.get("status", "invalid")})
+            summary = str(latest_iqa.get("display_summary") or summarize_iqa_history_entry(latest_iqa))
+            status = str(latest_iqa.get("status", "success"))
+            if status == "invalid":
+                reason = str(latest_iqa.get("invalid_reason") or "invalid")
+                self.image_analysis_results["image_result"].set(f"Result: IQA unavailable ({reason})")
+                self.image_analysis_results["image_formula"].set(f"Formula: 이전 세션의 IQA 결과 요약입니다. 현재 영상으로 자동 재계산하지 않았습니다. | {summary}")
+            else:
+                self.image_analysis_results["image_result"].set(f"Result: 이전 세션의 IQA 결과 요약입니다. 현재 영상으로 자동 재계산하지 않았습니다. | {summary}")
+                self.image_analysis_results["image_formula"].set("Formula: 이전 세션의 IQA 결과 요약입니다. 현재 영상으로 자동 재계산하지 않았습니다.")
+            self._update_iqa_report_preview_from_history()
         self._sync_analysis_selector_inputs()
         self._toggle_cnr_noise_widgets()
 
@@ -11713,6 +12010,7 @@ class DicomViewer:
                 metrics = self.compute_measurement(measurement, self._get_frame_pixel_array(measurement.frame_index))
                 measurement.summary_text = metrics["summary"]
                 measurement.meta = self._canonicalize_measurement_meta(measurement, metrics)
+                self._action_update_measurement_in_store(measurement)
 
         self._refresh_grid_overlay()
         self._refresh_analysis_selectors()
@@ -12167,11 +12465,12 @@ class DicomViewer:
             messagebox.showwarning("Uniformity", uniformity_result.message_text)
 
     def calculate_snr_from_inputs(self) -> None:
-        self._auto_bind_analysis_inputs_from_roles(overwrite_existing=False)
-        signal_roi = self._get_selected_measurement_from_analysis("roi", "snr_signal_roi_id", "snr_signal")
-        noise_roi = self._get_selected_measurement_from_analysis("roi", "snr_background_roi_id", "snr_noise")
-        signal_roi_id = signal_roi.id if signal_roi is not None else self._read_analysis_selected_id("roi", "snr_signal_roi_id", "snr_signal")
-        noise_roi_id = noise_roi.id if noise_roi is not None else self._read_analysis_selected_id("roi", "snr_background_roi_id", "snr_noise")
+        resolved = self.resolve_signal_analysis_inputs("snr")
+        resolved_measurements = resolved.get("resolved_measurements") or {}
+        signal_roi = resolved_measurements.get("signal")
+        noise_roi = resolved_measurements.get("noise")
+        signal_roi_id = str(resolved.get("signal_roi_id") or "")
+        noise_roi_id = str(resolved.get("noise_roi_id") or "")
         snr_payload: dict[str, Any] = {
             "status": "missing",
             "reason": "",
@@ -12193,19 +12492,15 @@ class DicomViewer:
             "result": None,
             "result_text": "",
         }
-        if signal_roi is None or noise_roi is None:
-            missing: list[str] = []
-            if signal_roi is None:
-                missing.append("signal role(또는 Signal ROI 수동 선택)")
-            if noise_roi is None:
-                missing.append("background/noise role(또는 Noise ROI 수동 선택)")
-            reason = " + ".join(missing)
+        if not bool(resolved.get("is_valid")) or signal_roi is None or noise_roi is None:
+            reason = str(resolved.get("reason") or "ROI selection required")
             preview_text = "ROI selection required"
             result_text = "SNR unavailable"
             self.analysis_results["snr_preview"].set(preview_text)
             self.analysis_results["snr_result"].set(result_text)
             snr_payload["status"] = "missing"
             snr_payload["reason"] = reason
+            snr_payload["warnings"] = list(resolved.get("warnings") or [])
             snr_payload["preview"] = preview_text
             snr_payload["preview_text"] = f"Preview: {preview_text}"
             snr_payload["result_text"] = result_text
@@ -12265,18 +12560,15 @@ class DicomViewer:
         )
 
     def calculate_cnr_from_inputs(self) -> None:
-        self._auto_bind_analysis_inputs_from_roles(overwrite_existing=False)
-        formula = self.analysis_inputs["cnr_formula"].get()
-        target_roi = self._get_selected_measurement_from_analysis("roi", "cnr_target_roi_id", "cnr_target")
-        reference_roi = self._get_selected_measurement_from_analysis("roi", "cnr_reference_roi_id", "cnr_reference")
-        noise_roi = None
-        if formula == "standard_noise":
-            noise_roi = self._get_selected_measurement_from_analysis("roi", "cnr_noise_roi_id", "cnr_noise")
-        target_roi_id = target_roi.id if target_roi is not None else self._read_analysis_selected_id("roi", "cnr_target_roi_id", "cnr_target")
-        reference_roi_id = reference_roi.id if reference_roi is not None else self._read_analysis_selected_id("roi", "cnr_reference_roi_id", "cnr_reference")
-        noise_roi_id = ""
-        if formula == "standard_noise":
-            noise_roi_id = noise_roi.id if noise_roi is not None else self._read_analysis_selected_id("roi", "cnr_noise_roi_id", "cnr_noise")
+        resolved = self.resolve_signal_analysis_inputs("cnr")
+        formula = str(resolved.get("formula") or self.analysis_inputs["cnr_formula"].get())
+        resolved_measurements = resolved.get("resolved_measurements") or {}
+        target_roi = resolved_measurements.get("target")
+        reference_roi = resolved_measurements.get("reference")
+        noise_roi = resolved_measurements.get("noise")
+        target_roi_id = str(resolved.get("target_roi_id") or "")
+        reference_roi_id = str(resolved.get("reference_roi_id") or "")
+        noise_roi_id = str(resolved.get("noise_roi_id") or "")
         cnr_payload: dict[str, Any] = {
             "status": "missing",
             "reason": "",
@@ -12303,21 +12595,15 @@ class DicomViewer:
             "reference_std": None,
             "result": None,
         }
-        if target_roi is None or reference_roi is None or (formula == "standard_noise" and noise_roi is None):
-            missing: list[str] = []
-            if target_roi is None:
-                missing.append("target role(또는 Region A ROI 수동 선택)")
-            if reference_roi is None:
-                missing.append("reference role(또는 Region B ROI 수동 선택)")
-            if formula == "standard_noise" and noise_roi is None:
-                missing.append("noise role(또는 Noise ROI 수동 선택)")
-            reason = " + ".join(missing)
+        if not bool(resolved.get("is_valid")) or target_roi is None or reference_roi is None or (formula == "standard_noise" and noise_roi is None):
+            reason = str(resolved.get("reason") or "ROI selection required")
             preview_text = "ROI selection required"
             result_text = "CNR unavailable"
             self.analysis_results["cnr_preview"].set(preview_text)
             self.analysis_results["cnr_result"].set(result_text)
             cnr_payload["status"] = "missing"
             cnr_payload["reason"] = reason
+            cnr_payload["warnings"] = list(resolved.get("warnings") or [])
             cnr_payload["preview_text"] = f"Preview: {preview_text}"
             cnr_payload["result_text"] = result_text
             self._action_set_analysis_last_run("cnr", cnr_payload)
@@ -12447,107 +12733,447 @@ class DicomViewer:
             frame = frame[..., 0]
         return frame
 
-    @staticmethod
-    def _compute_simple_ssim(reference: np.ndarray, target: np.ndarray, *, data_range: float = 255.0, k1: float = 0.01, k2: float = 0.03) -> float:
-        ref = reference.astype(np.float64)
-        tar = target.astype(np.float64)
-        c1 = (k1 * data_range) ** 2
-        c2 = (k2 * data_range) ** 2
-        mu_x = float(np.mean(ref))
-        mu_y = float(np.mean(tar))
-        sigma_x = float(np.var(ref))
-        sigma_y = float(np.var(tar))
-        sigma_xy = float(np.mean((ref - mu_x) * (tar - mu_y)))
-        numerator = (2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)
-        denominator = (mu_x**2 + mu_y**2 + c1) * (sigma_x + sigma_y + c2)
-        if denominator == 0:
-            return 0.0
-        return float(numerator / denominator)
-
-    @staticmethod
-    def _resolve_data_range(reference: np.ndarray, target: np.ndarray) -> tuple[float, str, list[str]]:
-        warnings: list[str] = []
-        if np.issubdtype(reference.dtype, np.integer) and np.issubdtype(target.dtype, np.integer):
-            info = np.iinfo(reference.dtype)
-            return float(info.max - info.min), "dtype", warnings
-        min_val = float(min(np.min(reference), np.min(target)))
-        max_val = float(max(np.max(reference), np.max(target)))
-        data_range = max_val - min_val
-        if data_range <= 0:
-            warnings.append("data_range_ambiguous")
-            return 1.0, "fallback", warnings
-        return float(data_range), "minmax", warnings
-
-    def calculate_image_comparison_metrics(self) -> None:
+    def _resolve_image_analysis_runtime_inputs(self) -> tuple[str, str, str]:
         reference_id = self._resolve_image_analysis_selection("reference_image_id", "reference_image", "image")
         target_id = self._resolve_image_analysis_selection("target_image_id", "target_image", "image")
-        if not reference_id or not target_id:
-            self.image_analysis_results["image_result"].set("Result: Select reference and target image")
-            return
-        reference = self._load_analysis_image_array(reference_id)
-        target = self._load_analysis_image_array(target_id)
-        if reference is None or target is None:
-            self.image_analysis_results["image_result"].set("Result: Failed to load image pair")
-            return
-        original_reference_shape = tuple(reference.shape)
-        original_target_shape = tuple(target.shape)
-        warnings: list[str] = []
-        if original_reference_shape != original_target_shape:
-            warnings.append("shape_mismatch")
-        min_h = min(reference.shape[0], target.shape[0])
-        min_w = min(reference.shape[1], target.shape[1])
-        reference = reference[:min_h, :min_w]
-        target = target[:min_h, :min_w]
-        if self.image_analysis_inputs["scope_type"].get() == "roi":
-            self._resolve_image_analysis_selection("scope_roi_id", "scope_roi", "roi")
-            roi = self._get_selected_measurement_from_analysis("roi", "scope_roi_id", "scope_roi")
-            if roi is None:
-                self.image_analysis_results["image_result"].set("Result: Select scope ROI")
-                return
-            roi_pixels, (x0, y0, x1, y1) = self._extract_roi_pixels(reference, roi.start, roi.end, ensure_non_empty=False)
-            if roi_pixels.size == 0 or x1 <= x0 or y1 <= y0:
-                self.image_analysis_results["image_result"].set("Result: Invalid ROI scope")
-                return
-            reference = reference[y0:y1, x0:x1]
-            target = target[y0:y1, x0:x1]
-        diff = reference.astype(np.float64) - target.astype(np.float64)
-        mse = float(np.mean(diff**2))
-        data_range, data_range_policy, range_warnings = self._resolve_data_range(reference, target)
-        warnings.extend(range_warnings)
-        psnr = float("inf") if mse <= 0 else float(20 * np.log10(max(data_range, 1e-12) / np.sqrt(mse)))
-        ssim_k1 = 0.01
-        ssim_k2 = 0.03
-        ssim = self._compute_simple_ssim(reference, target, data_range=max(data_range, 1e-12), k1=ssim_k1, k2=ssim_k2)
-        hist_bins = 64
-        hist_min = float(min(np.min(reference), np.min(target)))
-        hist_max = float(max(np.max(reference), np.max(target))) + 1e-6
-        hist_ref, _ = np.histogram(reference, bins=hist_bins, range=(hist_min, hist_max), density=True)
-        hist_tar, _ = np.histogram(target, bins=hist_bins, range=(hist_min, hist_max), density=True)
-        hist_corr = float(np.corrcoef(hist_ref, hist_tar)[0, 1]) if np.std(hist_ref) > 0 and np.std(hist_tar) > 0 else 0.0
-        scope_text = "Full Image" if self.image_analysis_inputs["scope_type"].get() == "full" else "Selected ROI"
-        bits_stored_text = "unknown"
-        if hasattr(self, "dicom_datasets") and isinstance(self.dicom_datasets, list):
+        scope = self.image_analysis_inputs["scope_type"].get()
+        if not hasattr(self, "iqa_ui_state") or self.iqa_ui_state is None:
+            self.iqa_ui_state = create_default_iqa_state()
+        return reference_id, target_id, scope
+
+    def _set_iqa_reference_from_current(self) -> None:
+        if not hasattr(self, "iqa_ui_state") or self.iqa_ui_state is None:
+            self.iqa_ui_state = create_default_iqa_state()
+        image_id = str(self.iqa_ui_state.reference_id or "").strip()
+        if not image_id:
+            image_id = self._resolve_image_analysis_selection("reference_image_id", "reference_image", "image")
+        if not image_id:
+            image_id = str(getattr(self, "path_var", None).get() if getattr(self, "path_var", None) is not None else "").strip()
+        label = str(self.iqa_ui_state.reference_label or image_id or "").strip()
+        array = self._load_analysis_image_array(image_id) if image_id else None
+        dataset = None
+        if image_id and hasattr(self, "dicom_loader") and self.dicom_loader is not None:
             try:
-                ds = self.dicom_datasets[self.current_file_index]
-                bits_stored_text = str(getattr(ds, "BitsStored", "unknown"))
+                dataset, _frames = self.dicom_loader.get_decoded_file(image_id)
             except Exception:
-                bits_stored_text = "unknown"
-        conditions = [
-            "input=raw_dicom",
-            f"scope={scope_text}",
-            f"shape={original_reference_shape}->{original_target_shape}",
-            f"bits={bits_stored_text}",
-            f"pixel_minmax=({float(np.min(reference)):.3f},{float(np.max(reference)):.3f})/({float(np.min(target)):.3f},{float(np.max(target)):.3f})",
-            f"data_range_policy={data_range_policy}",
-            f"data_range={data_range:.6f}",
-            f"ssim=(k1={ssim_k1},k2={ssim_k2})",
-            f"hist=(bins={hist_bins},range=({hist_min:.3f},{hist_max:.3f}))",
-        ]
-        self.image_analysis_results["image_formula"].set("Formula: " + " | ".join(conditions))
-        warn_text = (" | Warnings=" + ",".join(sorted(set(warnings)))) if warnings else ""
-        self.image_analysis_results["image_result"].set(
-            f"Result: MSE={mse:.4f} | PSNR={psnr:.4f} | SSIM={ssim:.4f} | HIST corr={hist_corr:.4f}{warn_text}"
+                dataset = None
+        set_iqa_reference_from_current(self.iqa_ui_state, image_id, label, dataset=dataset, array=array)
+        self._update_iqa_pair_status_display()
+
+    def _set_iqa_target_from_current(self) -> None:
+        if not hasattr(self, "iqa_ui_state") or self.iqa_ui_state is None:
+            self.iqa_ui_state = create_default_iqa_state()
+        image_id = str(self.iqa_ui_state.target_id or "").strip()
+        if not image_id:
+            image_id = self._resolve_image_analysis_selection("target_image_id", "target_image", "image")
+        if not image_id:
+            image_id = str(getattr(self, "path_var", None).get() if getattr(self, "path_var", None) is not None else "").strip()
+        label = str(self.iqa_ui_state.target_label or image_id or "").strip()
+        array = self._load_analysis_image_array(image_id) if image_id else None
+        dataset = None
+        if image_id and hasattr(self, "dicom_loader") and self.dicom_loader is not None:
+            try:
+                dataset, _frames = self.dicom_loader.get_decoded_file(image_id)
+            except Exception:
+                dataset = None
+        set_iqa_target_from_current(self.iqa_ui_state, image_id, label, dataset=dataset, array=array)
+        self._update_iqa_pair_status_display()
+
+    def _swap_iqa_reference_target(self) -> None:
+        if not hasattr(self, "iqa_ui_state") or self.iqa_ui_state is None:
+            self.iqa_ui_state = create_default_iqa_state()
+        swap_iqa_reference_target(self.iqa_ui_state)
+        self._update_iqa_pair_status_display()
+
+    def _clear_iqa_selection(self) -> None:
+        if not hasattr(self, "iqa_ui_state") or self.iqa_ui_state is None:
+            self.iqa_ui_state = create_default_iqa_state()
+        clear_iqa_selection(self.iqa_ui_state)
+        self._update_iqa_pair_status_display()
+
+    def _update_iqa_pair_status_display(self) -> None:
+        if "iqa_pair_status" not in getattr(self, "image_analysis_results", {}):
+            return
+        state = getattr(self, "iqa_ui_state", None) or create_default_iqa_state()
+        run_state = resolve_iqa_run_state(state)
+        ref_label = state.reference_label or "None"
+        tar_label = state.target_label or "None"
+        reason_map = {
+            "missing_reference": "실행 불가: Reference 영상이 선택되지 않았습니다.",
+            "missing_target": "실행 불가: Target 영상이 선택되지 않았습니다.",
+            "missing_scope_roi": "ROI 범위가 선택되었지만 사용할 ROI가 없습니다.",
+            "same_image": "Reference와 Target이 동일합니다. 검증용 비교로 사용할 수 있습니다.",
+            "stale_roi_id": "세션에 저장된 ROI를 현재 영상에서 찾을 수 없습니다.",
+        }
+        ready_text = "실행 가능" if run_state.get("is_ready") else reason_map.get(str(run_state.get("reason") or ""), f"실행 불가: {run_state.get('reason') or 'missing'}")
+        roi_text = f" | ROI={getattr(state, 'selected_roi_label', '') or 'None'}" if str(getattr(state, "scope", "")) == "roi" else ""
+        self.image_analysis_results["iqa_pair_status"].set(f"Pair: Reference={ref_label} | Target={tar_label}{roi_text} | {ready_text}")
+
+    def _update_iqa_report_preview_from_history(self) -> str:
+        latest = get_latest_iqa_history(getattr(self, "iqa_history", []) or [])
+        if not latest:
+            return ""
+        report = build_iqa_report(latest)
+        full_text = format_iqa_report_text(report)
+        lines = [line for line in full_text.splitlines() if line.strip()]
+        kept = lines[:8]
+        if "Metrics:" not in kept and "Metrics:" in lines:
+            kept.append("Metrics:")
+        interp_idx = next((i for i, line in enumerate(lines) if line.startswith("Interpretation:")), None)
+        if interp_idx is not None:
+            kept.append(lines[interp_idx])
+            if interp_idx + 1 < len(lines):
+                kept.append(lines[interp_idx + 1])
+        text = "\n".join(kept[:10])
+        if not hasattr(self, "analysis_last_run") or self.analysis_last_run is None:
+            self.analysis_last_run = {}
+        self.analysis_last_run["iqa_report"] = report
+        self.analysis_last_run["iqa_report_text"] = text
+        return text
+
+    def _get_iqa_report_export_format(self) -> str:
+        value = "txt"
+        if "iqa_report_export_format" in getattr(self, "image_analysis_inputs", {}):
+            value = str(self.image_analysis_inputs["iqa_report_export_format"].get() or "txt")
+        return normalize_iqa_report_export_format(value)
+
+    def _resolve_latest_iqa_report_for_export(self) -> dict[str, Any] | None:
+        return resolve_latest_iqa_report_for_export(getattr(self, "analysis_last_run", {}) or {}, getattr(self, "iqa_history", []) or [])
+
+    def _ask_iqa_report_save_path(self, fmt: str, default_name: str) -> str:
+        ext = f".{fmt}"
+        return str(filedialog.asksaveasfilename(title="IQA Report 저장", defaultextension=ext, initialfile=default_name + ext, filetypes=[(fmt.upper(), f"*{ext}"), ("All Files", "*.*")]) or "")
+
+    def _ask_iqa_report_save_directory(self, default_name: str) -> str:
+        return str(filedialog.askdirectory(title=f"IQA Report 저장 폴더 선택 ({default_name})") or "")
+
+    def _save_latest_iqa_report(self) -> None:
+        report = self._resolve_latest_iqa_report_for_export()
+        fmt = self._get_iqa_report_export_format()
+        status_text, bundle = save_iqa_report_by_format(report, fmt, self._ask_iqa_report_save_path, self._ask_iqa_report_save_directory)
+        self.image_analysis_results["iqa_export_status"].set(status_text)
+        if bundle is not None:
+            if not hasattr(self, "analysis_last_run") or self.analysis_last_run is None:
+                self.analysis_last_run = {}
+            self.analysis_last_run["iqa_report_export_bundle"] = bundle
+
+    def _resolve_iqa_roi_selection(self) -> tuple[Any | None, list[str]]:
+        warnings: list[str] = []
+        if not hasattr(self, "iqa_ui_state") or self.iqa_ui_state is None:
+            self.iqa_ui_state = create_default_iqa_state()
+        roi_id = str(getattr(self.iqa_ui_state, "selected_roi_id", "") or "").strip()
+        if not roi_id:
+            roi_id = self._resolve_image_analysis_selection("scope_roi_id", "scope_roi", "roi")
+        if not roi_id and "scope_roi_id" in self.image_analysis_inputs:
+            roi_id = str(self.image_analysis_inputs["scope_roi_id"].get() or "").strip()
+        if not roi_id:
+            return None, ["missing_scope_roi"]
+        roi = self._get_selected_measurement_from_analysis("roi", "scope_roi_id", "scope_roi")
+        if roi is None or getattr(roi, "id", "") != roi_id:
+            warnings.append("stale_roi_id")
+            roi = self._find_measurement_by_id(roi_id, expected_kind="roi")
+        if roi is None:
+            return None, ["missing_roi_object", *warnings]
+        self.iqa_ui_state.selected_roi_id = str(roi.id)
+        self.iqa_ui_state.selected_roi_label = str(getattr(roi, "summary_text", "") or roi.id)
+        self.iqa_ui_state.selected_roi_source = "analysis_selector"
+        try:
+            self.iqa_ui_state.roi_bbox = (int(roi.start[0]), int(roi.start[1]), int(roi.end[0]), int(roi.end[1]))
+            self.iqa_ui_state.roi_policy = "bbox"
+        except Exception:
+            return None, ["unsupported_roi_shape", *warnings]
+        self.iqa_ui_state.roi_resolution_warnings = list(warnings)
+        return roi, warnings
+
+    @staticmethod
+    def _normalize_iqa_roi_bbox(raw_bbox: tuple[int, int, int, int], image_shape: tuple[int, ...]) -> tuple[tuple[int, int, int, int] | None, list[str]]:
+        warnings: list[str] = []
+        x0, y0, x1, y1 = [int(v) for v in raw_bbox]
+        if x1 <= x0 or y1 <= y0:
+            x1 = x0 + max(x1, 0)
+            y1 = y0 + max(y1, 0)
+            warnings.append("roi_bbox_xywh_converted")
+        h = int(image_shape[0]) if image_shape else 0
+        w = int(image_shape[1]) if len(image_shape) > 1 else 0
+        nx0, ny0 = max(0, x0), max(0, y0)
+        nx1, ny1 = min(w, x1), min(h, y1)
+        if (nx0, ny0, nx1, ny1) != (x0, y0, x1, y1):
+            warnings.append("roi_bbox_clipped_to_image_bounds")
+        if nx1 <= nx0 or ny1 <= ny0:
+            return None, ["invalid_roi_bbox_after_clip", *warnings]
+        return (nx0, ny0, nx1, ny1), warnings
+
+    def _run_iqa_from_viewer_state(self, input_mode: str = "raw_dicom_pixel", scope: str = "full_image") -> tuple[Any | None, list[str]]:
+        reference_id, target_id, selected_scope = self._resolve_image_analysis_runtime_inputs()
+        self._set_iqa_reference_from_current()
+        self._set_iqa_target_from_current()
+        set_iqa_scope(self.iqa_ui_state, selected_scope or scope)
+        if hasattr(self, "image_analysis_inputs"):
+            set_iqa_input_mode(self.iqa_ui_state, self.image_analysis_inputs.get("iqa_input_mode", None).get() if self.image_analysis_inputs.get("iqa_input_mode") is not None else input_mode)
+            set_iqa_data_range_mode(self.iqa_ui_state, self.image_analysis_inputs.get("iqa_data_range_mode", None).get() if self.image_analysis_inputs.get("iqa_data_range_mode") is not None else "auto")
+            set_iqa_photometric_invert(self.iqa_ui_state, bool(self.image_analysis_inputs.get("iqa_photometric_invert", None).get()) if self.image_analysis_inputs.get("iqa_photometric_invert") is not None else False)
+        run_state = resolve_iqa_run_state(self.iqa_ui_state)
+        run_warnings = [str(w) for w in run_state.get("warnings", []) if str(w).strip()]
+        if not run_state.get("is_ready"):
+            return None, [str(run_state.get("reason") or "missing_reference_or_target"), *run_warnings]
+
+        scope_to_use = self.iqa_ui_state.scope
+        roi_options: dict[str, Any] = {}
+        if scope_to_use == "roi":
+            roi, roi_warnings = self._resolve_iqa_roi_selection()
+            if roi is None:
+                return None, roi_warnings or ["missing_scope_roi"]
+            roi_options["bbox"] = tuple(self.iqa_ui_state.roi_bbox or ())
+            run_warnings.extend(roi_warnings)
+
+        reference_array = self._load_analysis_image_array(reference_id)
+        target_array = self._load_analysis_image_array(target_id)
+        if reference_array is None or target_array is None:
+            return None, ["failed_to_load_images"]
+        if scope_to_use == "roi" and "bbox" in roi_options:
+            normalized_bbox, norm_warnings = self._normalize_iqa_roi_bbox(tuple(roi_options["bbox"]), tuple(np.asarray(reference_array).shape))
+            if normalized_bbox is None:
+                return None, norm_warnings
+            roi_options["bbox"] = normalized_bbox
+            run_warnings.extend(norm_warnings)
+
+        ds_ref = None
+        ds_tar = None
+        if hasattr(self, "dicom_loader") and self.dicom_loader is not None:
+            try:
+                ds_ref, _frames_ref = self.dicom_loader.get_decoded_file(reference_id)
+            except Exception:
+                ds_ref = None
+            try:
+                ds_tar, _frames_tar = self.dicom_loader.get_decoded_file(target_id)
+            except Exception:
+                ds_tar = None
+
+        hist_ref = np.asarray(reference_array, dtype=np.float64)
+        hist_tar = np.asarray(target_array, dtype=np.float64)
+        if hist_ref.shape != hist_tar.shape:
+            min_h = min(hist_ref.shape[0], hist_tar.shape[0])
+            min_w = min(hist_ref.shape[1], hist_tar.shape[1])
+            hist_ref = hist_ref[:min_h, :min_w]
+            hist_tar = hist_tar[:min_h, :min_w]
+        if scope_to_use == "roi" and "bbox" in roi_options:
+            x0, y0, x1, y1 = roi_options["bbox"]
+            hist_ref = hist_ref[y0:y1, x0:x1]
+            hist_tar = hist_tar[y0:y1, x0:x1]
+
+        if ds_ref is not None and ds_tar is not None and hasattr(ds_ref, "pixel_array") and hasattr(ds_tar, "pixel_array"):
+            result = calculate_dicom_iqa(
+                ds_ref,
+                ds_tar,
+                input_mode=run_state["options"].get("input_mode", input_mode),
+                scope=scope_to_use,
+                options={
+                    "data_range_policy": run_state["options"].get("data_range_policy", "bits"),
+                    "photometric_invert": bool(run_state["options"].get("photometric_invert", False)),
+                    **roi_options,
+                },
+            )
+            hist_range, hist_warnings = resolve_histogram_range(hist_ref, hist_tar, policy="auto", data_range=result.context.data_range_used)
+            hist_result = calculate_histogram_data(hist_ref, hist_tar, bins=64, hist_range=hist_range, normalize=True)
+            from iqa_result_schema import IQAContext as _IQAContext, IQAResult as _IQAResult
+            ssim_params = dict(result.context.ssim_params or {})
+            histogram_payload = {
+                "histogram_bins": hist_result["bins"],
+                "histogram_range": hist_result["hist_range"],
+                "histogram_normalized": hist_result["normalized"],
+                "histogram_range_policy": "auto",
+                "histogram_corr": hist_result["hist_corr"],
+                "histogram_distribution_hint": hist_result["distribution_shift_hint"],
+                "histogram_reference_peak_bin": hist_result["peak_bin_reference"],
+                "histogram_target_peak_bin": hist_result["peak_bin_target"],
+                "histogram_summary": summarize_histogram_difference(hist_result),
+            }
+            ssim_params.update(histogram_payload)
+            enriched_context = _IQAContext(
+                input_mode=result.context.input_mode,
+                scope=result.context.scope,
+                image_shape=result.context.image_shape,
+                data_range_policy=result.context.data_range_policy,
+                data_range_used=result.context.data_range_used,
+                bits_stored=result.context.bits_stored,
+                histogram_bins=result.context.histogram_bins,
+                histogram_range=result.context.histogram_range,
+                histogram=histogram_payload,
+                ssim_params=ssim_params,
+            )
+            result = _IQAResult(metrics=result.metrics, context=enriched_context, warnings=list(result.warnings))
+            return result, sorted(set(run_warnings + hist_warnings + hist_result.get("warnings", [])))
+
+        ref = np.asarray(reference_array, dtype=np.float64)
+        tar = np.asarray(target_array, dtype=np.float64)
+        if ref.shape != tar.shape:
+            min_h = min(ref.shape[0], tar.shape[0])
+            min_w = min(ref.shape[1], tar.shape[1])
+            ref = ref[:min_h, :min_w]
+            tar = tar[:min_h, :min_w]
+            shape_warning = ["shape_mismatch"]
+        else:
+            shape_warning = []
+        if scope_to_use == "roi" and "bbox" in roi_options:
+            x0, y0, x1, y1 = roi_options["bbox"]
+            ref = ref[y0:y1, x0:x1]
+            tar = tar[y0:y1, x0:x1]
+
+        result = calculate_iqa_metrics(
+            ref,
+            tar,
+            options={
+                "input_mode": "array",
+                "scope": scope_to_use,
+                "data_range_policy": "actual_union",
+            },
         )
+        if ref.shape != tar.shape:
+            pass
+        from iqa_result_schema import IQAContext as _IQAContext, IQAResult as _IQAResult
+        ssim_params = dict(result.context.ssim_params or {})
+        ssim_params["original_reference_shape"] = tuple(int(v) for v in np.asarray(reference_array).shape)
+        ssim_params["original_target_shape"] = tuple(int(v) for v in np.asarray(target_array).shape)
+        ssim_params["compared_shape"] = tuple(int(v) for v in ref.shape)
+        ssim_params["shape_alignment_policy"] = "common_crop" if "shape_mismatch" in shape_warning else "none"
+        if scope_to_use == "roi":
+            ssim_params["roi_id"] = getattr(self.iqa_ui_state, "selected_roi_id", "")
+            ssim_params["roi_label"] = getattr(self.iqa_ui_state, "selected_roi_label", "")
+            ssim_params["roi_source"] = getattr(self.iqa_ui_state, "selected_roi_source", "")
+            ssim_params["roi_bbox"] = tuple(self.iqa_ui_state.roi_bbox or ())
+            ssim_params["roi_policy"] = getattr(self.iqa_ui_state, "roi_policy", "bbox")
+        hist_range, hist_warnings = resolve_histogram_range(ref, tar, policy="auto", data_range=result.context.data_range_used)
+        hist_result = calculate_histogram_data(ref, tar, bins=64, hist_range=hist_range, normalize=True)
+        histogram_payload = {
+            "histogram_bins": hist_result["bins"],
+            "histogram_range": hist_result["hist_range"],
+            "histogram_normalized": hist_result["normalized"],
+            "histogram_range_policy": "auto",
+            "histogram_corr": hist_result["hist_corr"],
+            "histogram_distribution_hint": hist_result["distribution_shift_hint"],
+            "histogram_reference_peak_bin": hist_result["peak_bin_reference"],
+            "histogram_target_peak_bin": hist_result["peak_bin_target"],
+            "histogram_summary": summarize_histogram_difference(hist_result),
+        }
+        ssim_params.update(histogram_payload)
+        enriched_context = _IQAContext(
+            input_mode=result.context.input_mode,
+            scope=result.context.scope,
+            image_shape=result.context.image_shape,
+            data_range_policy=result.context.data_range_policy,
+            data_range_used=result.context.data_range_used,
+            bits_stored=result.context.bits_stored,
+            histogram_bins=result.context.histogram_bins,
+            histogram_range=result.context.histogram_range,
+            histogram=histogram_payload,
+            ssim_params=ssim_params,
+        )
+        result = _IQAResult(metrics=result.metrics, context=enriched_context, warnings=list(result.warnings))
+        if "shape_mismatch" in shape_warning and "영상 크기가 달라 공통 영역 기준으로 비교했습니다." not in run_warnings:
+            run_warnings.append("영상 크기가 달라 공통 영역 기준으로 비교했습니다.")
+        return result, sorted(set(shape_warning + run_warnings + hist_warnings + hist_result.get("warnings", [])))
+
+    def _build_iqa_display_rows(self, iqa_result: Any) -> tuple[str, str, str]:
+        display_model = build_iqa_display_model(iqa_result, reference_label=getattr(self, "iqa_ui_state", create_default_iqa_state()).reference_label, target_label=getattr(self, "iqa_ui_state", create_default_iqa_state()).target_label)
+        result_text, context_text = format_iqa_display_text(display_model)
+        histogram_text = ""
+        if isinstance(getattr(iqa_result.context, "histogram", None), dict):
+            preview = build_histogram_preview_model(
+                iqa_result.context.histogram,
+                reference_label=getattr(self, "iqa_ui_state", create_default_iqa_state()).reference_label,
+                target_label=getattr(self, "iqa_ui_state", create_default_iqa_state()).target_label,
+            )
+            histogram_text = format_histogram_preview_text(preview)
+        warning_rows = display_model.get("warning_rows", [])
+        warning_text = "Warnings=None" if not warning_rows else "Warnings=" + ",".join(row.get("message", "") for row in warning_rows)
+        if histogram_text:
+            result_text = f"{result_text} | {histogram_text}"
+        return result_text, context_text, warning_text
+
+    def calculate_image_comparison_metrics(self) -> None:
+        try:
+            iqa_result, extra_warnings = self._run_iqa_from_viewer_state(input_mode="raw_dicom_pixel", scope="full_image")
+        except Exception as exc:
+            self.image_analysis_results["image_result"].set(f"Result: IQA failed: {exc}")
+            return
+
+        if iqa_result is None:
+            reason = ",".join(extra_warnings) or "invalid"
+            self.image_analysis_results["image_result"].set(
+                "[IQA Summary]\n- 종합 해석: IQA 실행 불가 상태입니다. 진단 정확도 판정이 아닌 영상 품질 비교 지표입니다.\n"
+                f"- Status: invalid\n- Invalid Reason: {reason}\n- Reference: {getattr(self.iqa_ui_state, 'reference_label', '') or 'None'}\n"
+                f"- Target: {getattr(self.iqa_ui_state, 'target_label', '') or 'None'}\n\n"
+                "[Metrics]\n- MSE: 계산 불가\n- RMSE: 계산 불가\n- PSNR: 계산 불가\n- SSIM: 계산 불가\n- HIST Corr: 계산 불가"
+            )
+            friendly = sorted({WARNING_MESSAGE_MAP.get(w, w) for w in extra_warnings})
+            self.image_analysis_results["image_formula"].set("[Warnings]\n- " + (", ".join(friendly) if friendly else "주의 사항 없음"))
+            if not hasattr(self, "analysis_last_run") or self.analysis_last_run is None:
+                self.analysis_last_run = {}
+            self.analysis_last_run["iqa"] = {"analysis_type": "iqa", "status": "invalid", "reason": ",".join(extra_warnings)}
+            self.analysis_last_run["iqa_report"] = {"report_type": "iqa_single", "status": "invalid", "invalid_reason": ",".join(extra_warnings)}
+            if not hasattr(self, "iqa_history") or self.iqa_history is None:
+                self.iqa_history = []
+            invalid_entry = build_iqa_history_entry(
+                result=None,
+                selection_state=getattr(self, "iqa_ui_state", None),
+                export_record=self.analysis_last_run["iqa"],
+                display_model={"summary": "IQA unavailable"},
+                status="invalid",
+                invalid_reason=",".join(extra_warnings) or "missing_input",
+                source="viewer",
+            )
+            append_iqa_history(self.iqa_history, invalid_entry, max_items=50)
+            return
+
+        combined = sorted(set(list(iqa_result.warnings) + list(extra_warnings)))
+        if "data_range <= 0" in combined and "data_range_ambiguous" not in combined:
+            combined.append("data_range_ambiguous")
+        from iqa_result_schema import IQAResult as _IQAResult, IQAContext as _IQAContext
+        ssim_params = dict(iqa_result.context.ssim_params or {})
+        ssim_params["reference_label"] = getattr(self.iqa_ui_state, "reference_label", "")
+        ssim_params["target_label"] = getattr(self.iqa_ui_state, "target_label", "")
+        if getattr(self.iqa_ui_state, "scope", "") == "roi":
+            ssim_params["roi_id"] = getattr(self.iqa_ui_state, "selected_roi_id", "")
+            ssim_params["roi_label"] = getattr(self.iqa_ui_state, "selected_roi_label", "")
+            ssim_params["roi_source"] = getattr(self.iqa_ui_state, "selected_roi_source", "")
+            ssim_params["roi_bbox"] = tuple(getattr(self.iqa_ui_state, "roi_bbox", ()) or ())
+            ssim_params["roi_policy"] = getattr(self.iqa_ui_state, "roi_policy", "bbox")
+        enriched_context = _IQAContext(
+            input_mode=iqa_result.context.input_mode,
+            scope=iqa_result.context.scope,
+            image_shape=iqa_result.context.image_shape,
+            data_range_policy=iqa_result.context.data_range_policy,
+            data_range_used=iqa_result.context.data_range_used,
+            bits_stored=iqa_result.context.bits_stored,
+            histogram_bins=iqa_result.context.histogram_bins,
+            histogram_range=iqa_result.context.histogram_range,
+            histogram=dict(getattr(iqa_result.context, "histogram", {}) or {}),
+            ssim_params=ssim_params,
+        )
+        iqa_result = _IQAResult(metrics=iqa_result.metrics, context=enriched_context, warnings=sorted(set(combined)))
+
+        metrics_text, context_text, warning_text = self._build_iqa_display_rows(iqa_result)
+        self.image_analysis_results["image_result"].set(f"{metrics_text} | {warning_text}")
+        self.image_analysis_results["image_formula"].set(context_text)
+        if not hasattr(self, "analysis_last_run") or self.analysis_last_run is None:
+            self.analysis_last_run = {}
+        self.analysis_last_run["iqa"] = iqa_result_to_analysis_record(iqa_result, source="image_analysis")
+        if not hasattr(self, "iqa_history") or self.iqa_history is None:
+            self.iqa_history = []
+        history_entry = build_iqa_history_entry(
+            result=iqa_result,
+            selection_state=getattr(self, "iqa_ui_state", None),
+            export_record=self.analysis_last_run["iqa"],
+            display_model=build_iqa_display_model(
+                iqa_result,
+                reference_label=getattr(self.iqa_ui_state, "reference_label", "") if hasattr(self, "iqa_ui_state") else "",
+                target_label=getattr(self.iqa_ui_state, "target_label", "") if hasattr(self, "iqa_ui_state") else "",
+            ),
+            status="success",
+            source="viewer",
+        )
+        append_iqa_history(self.iqa_history, history_entry, max_items=50)
+        self._update_iqa_report_preview_from_history()
 
     def assign_roi_role(self) -> None:
         selected = self._find_measurement_by_id(self.selected_persistent_measurement_id, expected_kind="roi")
@@ -12608,10 +13234,8 @@ class DicomViewer:
     def _find_measurement_by_id(self, measurement_id: str | None, expected_kind: str | None = None) -> Measurement | None:
         if measurement_id is None:
             return None
-        for measurement in self._selector_measurements_for_current_frame(kind="roi"):
+        for measurement in self._selector_measurements_for_current_frame(kind=expected_kind):
             if measurement.id == measurement_id:
-                if expected_kind is not None and measurement.kind != expected_kind:
-                    return None
                 return measurement
         return None
 

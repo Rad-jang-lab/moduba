@@ -174,6 +174,11 @@ class SessionController:
             "compare_state": dict(context["compare_state"]),
             "store_snapshot_timestamp": context["store_snapshot"].get("snapshot_timestamp"),
             "store_snapshot": context["store_snapshot"],
+            "iqa_history": list(context.get("iqa_history", [])),
+            "latest_iqa_history_index": context.get("latest_iqa_history_index"),
+            "iqa_ui_state": dict(context.get("iqa_ui_state", {})),
+            "last_iqa_export_record": dict(context.get("last_iqa_export_record", {})),
+            "last_iqa_display_summary": str(context.get("last_iqa_display_summary", "")),
         }
 
 

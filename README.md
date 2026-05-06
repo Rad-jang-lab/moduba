@@ -37,3 +37,10 @@ py -m pip install pylibjpeg pylibjpeg-libjpeg pylibjpeg-openjpeg gdcm
 ```bash
 py dicom_viewer.py
 ```
+
+## IQA Documentation
+- docs/iqa_architecture.md
+- docs/iqa_user_workflow.md
+- docs/iqa_testing_matrix.md
+- docs/iqa_release_note_15.md
+- docs/iqa_handoff_checklist.md

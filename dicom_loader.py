@@ -6,7 +6,6 @@ import numpy as np
 import pydicom
 from pydicom import config as pydicom_config
 from pydicom.errors import InvalidDicomError
-from pydicom.pixel_data_handlers.util import apply_modality_lut
 
 
 class DicomLoader:
@@ -69,7 +68,7 @@ class DicomLoader:
 
     @staticmethod
     def extract_frames(dataset: Any) -> list[np.ndarray]:
-        pixel_array = apply_modality_lut(dataset.pixel_array, dataset)
+        pixel_array = DicomLoader._apply_modality_lut_compat(dataset.pixel_array, dataset)
         pixel_array = np.asarray(pixel_array)
 
         if pixel_array.ndim == 2:
@@ -84,6 +83,14 @@ class DicomLoader:
             return [pixel_array[index] for index in range(pixel_array.shape[0])]
 
         raise ValueError(f"지원하지 않는 이미지 차원입니다: {pixel_array.shape}")
+
+    @staticmethod
+    def _apply_modality_lut_compat(pixel_array: Any, dataset: Any):
+        try:
+            from pydicom.pixels import apply_modality_lut as _apply_modality_lut
+        except Exception:
+            from pydicom.pixel_data_handlers.util import apply_modality_lut as _apply_modality_lut
+        return _apply_modality_lut(pixel_array, dataset)
 
     def ensure_transfer_syntax_supported(self, dataset: Any, _path: str) -> None:
         transfer_syntax = self.get_transfer_syntax(dataset)
