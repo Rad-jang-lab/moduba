@@ -180,6 +180,45 @@ class DomainStore:
             },
         )
 
+    def update_or_add_measurement(
+        self,
+        image_id: str,
+        kind: str,
+        start: tuple[float, float],
+        end: tuple[float, float],
+        frame_index: int,
+        geometry_key: str,
+        summary_text: str,
+        role: str | None = None,
+        meta: dict[str, Any] | None = None,
+        measurement_id: str | None = None,
+    ) -> str:
+        if measurement_id and measurement_id in self.state.measurements:
+            self.update_measurement(
+                measurement_id,
+                kind=kind,
+                start=(float(start[0]), float(start[1])),
+                end=(float(end[0]), float(end[1])),
+                frame_index=int(frame_index),
+                geometry_key=geometry_key,
+                summary_text=summary_text,
+                role=role,
+                meta=meta or {},
+            )
+            return measurement_id
+        return self.add_measurement(
+            image_id=image_id,
+            kind=kind,
+            start=start,
+            end=end,
+            frame_index=frame_index,
+            geometry_key=geometry_key,
+            summary_text=summary_text,
+            role=role,
+            meta=meta,
+            measurement_id=measurement_id,
+        )
+
     def delete_measurement(self, measurement_id: str) -> None:
         measurement = self.state.measurements.pop(measurement_id)
         if measurement_id in self.state.selected_measurement_ids:

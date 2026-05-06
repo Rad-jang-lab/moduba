@@ -4,28 +4,6 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-if "matplotlib" not in sys.modules:
-    matplotlib_stub = types.ModuleType("matplotlib")
-    pyplot_stub = types.ModuleType("matplotlib.pyplot")
-
-    def _noop(*_args, **_kwargs):
-        return None
-
-    pyplot_stub.figure = _noop
-    pyplot_stub.plot = _noop
-    pyplot_stub.xlabel = _noop
-    pyplot_stub.ylabel = _noop
-    pyplot_stub.title = _noop
-    pyplot_stub.tight_layout = _noop
-    pyplot_stub.show = _noop
-    matplotlib_stub.pyplot = pyplot_stub
-    sys.modules["matplotlib"] = matplotlib_stub
-    sys.modules["matplotlib.pyplot"] = pyplot_stub
-
 from dicom_viewer import (
     DicomViewer,
     MTF_METRIC_EDGE_ANGLE_DEG,

@@ -39,8 +39,9 @@ def test_identical_image_has_zero_mse_and_inf_psnr():
     viewer = _build_viewer(arr, arr.copy())
     viewer.calculate_image_comparison_metrics()
     result = viewer.image_analysis_results["image_result"].get()
-    assert "MSE=0.0000" in result
-    assert "PSNR=inf" in result
+    assert "[Metrics]" in result
+    assert "- MSE: 0.0000" in result
+    assert "- PSNR: inf" in result
 
 
 def test_shape_mismatch_reports_warning():
@@ -65,6 +66,6 @@ def test_formula_contains_conditions_text():
     viewer = _build_viewer(ref, tar)
     viewer.calculate_image_comparison_metrics()
     formula = viewer.image_analysis_results["image_formula"].get()
-    assert "data_range_policy=" in formula
-    assert "hist=(bins=64" in formula
-    assert "scope=Full Image" in formula
+    assert "[Context]" in formula
+    assert "Data Range: " in formula
+    assert "Scope: Full Image" in formula

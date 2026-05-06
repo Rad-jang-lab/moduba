@@ -56,7 +56,19 @@ def calculate_matlab_reference_mtf(roi: np.ndarray, pixel_spacing_mm: float | No
     roi_f64 = np.asarray(roi_arr, dtype=np.float64)
     edge = _detect_edge_geometry(roi_f64)
     edge_orientation = _determine_edge_orientation(edge.angle_deg) if edge is not None else "unknown"
-    esf_raw = np.mean(roi_f64, axis=0)
+    column_esf_raw = np.mean(roi_f64, axis=0)
+    row_esf_raw = np.mean(roi_f64, axis=1)
+    column_is_monotonic = _is_monotonic_profile(column_esf_raw)
+    row_is_monotonic = _is_monotonic_profile(row_esf_raw)
+    column_range = float(np.max(column_esf_raw) - np.min(column_esf_raw))
+    row_range = float(np.max(row_esf_raw) - np.min(row_esf_raw))
+    if edge_orientation == "unknown":
+        if column_range > row_range and column_is_monotonic:
+            edge_orientation = "vertical"
+        elif row_range > column_range and row_is_monotonic:
+            edge_orientation = "horizontal"
+    esf_axis = 1 if edge_orientation == "horizontal" else 0
+    esf_raw = row_esf_raw if esf_axis == 1 else column_esf_raw
     esf_smooth, gaussian_kernel = _smooth_gaussian_window_5(esf_raw)
     esf_monotonic_before = _is_monotonic_profile(esf_raw)
     esf_monotonic_after = _is_monotonic_profile(esf_smooth)
@@ -133,8 +145,8 @@ def calculate_matlab_reference_mtf(roi: np.ndarray, pixel_spacing_mm: float | No
         },
         "esf": {
             "esf_length": int(esf.size),
-            "esf_axis_used": "axis=0",
-            "matlab_esf_axis_equivalent": True,
+            "esf_axis_used": f"axis={esf_axis}",
+            "matlab_esf_axis_equivalent": esf_axis == 0,
             "esf_min_raw": float(np.min(esf_raw)),
             "esf_max_raw": float(np.max(esf_raw)),
             "esf_min_norm": float(np.min(esf)),
@@ -171,8 +183,8 @@ def calculate_matlab_reference_mtf(roi: np.ndarray, pixel_spacing_mm: float | No
             "match_status": "match" if direction_match else "mismatch",
         },
         "matlab_esf_validity": {
-            "esf_axis_used": "axis=0",
-            "matlab_esf_axis_equivalent": True,
+            "esf_axis_used": f"axis={esf_axis}",
+            "matlab_esf_axis_equivalent": esf_axis == 0,
             "detected_edge_orientation": edge_orientation,
             "roi_is_valid_for_matlab_esf": roi_is_valid_for_matlab_esf,
             "roi_validity_reason": roi_validity_reason,
