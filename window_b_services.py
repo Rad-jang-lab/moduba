@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable
 import numpy as np
 
@@ -158,7 +158,7 @@ class SessionController:
     def build_serialize_payload(self, context: dict[str, Any]) -> dict[str, Any]:
         return {
             "version": context["schema_version"],
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
             "app": "moduba",
             "source_image_path": context["source_image_path"],
             "frame_index": int(context["frame_index"]),

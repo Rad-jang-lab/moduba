@@ -1,0 +1,11 @@
+# Analysis Threshold Catalog Sync Foundation (27회차-C)
+- current_threshold_config와 current_threshold_catalog 간 명시 sync action foundation입니다.
+- selected_config_id는 catalog 내부 선택 상태이며 current config와 자동 동기화되지 않습니다.
+- 상태: synced/dirty/no_catalog/no_selected_config/unsynced_current_config.
+- Save to Selected: current config를 selected catalog entry로 반영.
+- Save as New: current config를 새 config_id entry로 추가.
+- Reload/Discard: selected catalog config를 current config로 다시 적용.
+- editor 변경은 catalog 자동 수정을 유발하지 않습니다.
+- catalog sync는 report/history 자동 threshold 삽입을 의미하지 않습니다.
+- default clinical threshold/built-in preset은 제공하지 않습니다.
+- 계산 로직은 변경하지 않았습니다.

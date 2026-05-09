@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
 from iqa_history import get_latest_iqa_history
@@ -42,7 +42,7 @@ def resolve_latest_iqa_report_for_export(analysis_last_run: Mapping[str, Any] | 
 
 def build_iqa_report_default_base_name(report: Mapping[str, Any]) -> str:
     history_id = str(report.get("history_id") or "latest")
-    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     return sanitize_export_base_name(f"iqa_report_{history_id}_{stamp}")
 
 
