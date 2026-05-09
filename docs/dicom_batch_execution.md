@@ -14,3 +14,30 @@
 - viewer: preview/export helper만 제공(Toplevel+Text), 자동 실행 UX/대규모 UI 변경 없음.
 - 비범위: automatic ROI detection 미구현, ROI resolver 변경 없음, SNR/CNR/Uniformity/MTF 공식 변경 없음.
 - 비범위: normalized result/history/batch QC 자동 연결 없음(후속 adapter 단계에서 연결 예정).
+
+
+## History/Batch QC Bridge
+- execution result는 `dicom_batch_history_adapter`를 통해 analysis history records / Batch QC run으로 연결할 수 있습니다.
+- execution result schema는 변경하지 않습니다.
+
+
+
+## Window B Run Orchestration
+- Window B에서 execution plan을 build/run하여 execution result를 생성할 수 있습니다.
+- analysis_executor는 주입형이며, 이번 단계는 pixel-backed executor를 구현하지 않습니다.
+- execution result schema는 변경하지 않습니다.
+
+
+- pixel-backed executor를 주입해 execution result를 생성할 수 있습니다.
+- execution result schema는 변경하지 않습니다.
+
+
+- pixel-backed executor + existing analysis dispatcher 조합으로 execution result를 생성할 수 있습니다.
+
+
+## Real DICOM smoke (26회차)
+- 25회차 injected loader smoke와 별도로 pydicom-backed real DICOM read path를 테스트한다.
+- 목표는 계산 정확도 검증이 아니라 read-path/workflow 연결 smoke-regression이다.
+
+
+- Window B Batch 탭에 Validate ROI Roles(preflight report) 버튼을 추가해 pixel run 전 입력 품질을 점검할 수 있습니다.

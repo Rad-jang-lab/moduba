@@ -29,3 +29,9 @@
 - execution plan은 실행 전 dry-run layer이며 Batch QC run을 자동 생성하지 않습니다.
 
 - batch execution result는 아직 batch QC run을 자동 생성하지 않으며, 후속 단계에서 execution result → history records → batch QC 연결이 가능합니다.
+
+
+
+## Raw Export vs Report Export
+- `analysis_batch_qc.py`의 JSON/CSV export는 batch_qc_run 원본(raw) 출력입니다.
+- `analysis_batch_qc_report.py`의 text/PDF export는 사람이 읽기 쉬운 report model 출력입니다.

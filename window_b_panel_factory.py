@@ -24,6 +24,12 @@ class WindowBViewerAdapter(Protocol):
     analysis_results_rows_container: Any
     result_history_table: Any
     history_compare_button: Any
+    current_threshold_config: Any
+    current_dicom_batch_execution_result: Any
+    current_dicom_batch_execution_plan: Any
+    current_dicom_batch_history_records: Any
+    current_batch_qc_run: Any
+    current_batch_qc_report_model: Any
 
     def _relayout_analysis_result_rows(self) -> None: ...
     def _build_grouped_toolbar_strip(self, parent: ttk.Frame) -> ttk.Frame: ...
@@ -43,6 +49,26 @@ class WindowBViewerAdapter(Protocol):
     def save_analysis_session(self) -> None: ...
     def load_analysis_session(self) -> None: ...
     def _reset_analysis_session_state(self) -> None: ...
+    def get_dicom_batch_execution_result_summary_for_viewer(self, execution_result: dict[str, Any] | None = None) -> dict[str, Any]: ...
+    def render_dicom_batch_workspace_summary_text_for_viewer(self, execution_result: dict[str, Any] | None = None) -> str: ...
+    def build_dicom_batch_history_records_for_viewer(self, execution_result: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, record_id_prefix: str | None = None) -> list[dict[str, Any]]: ...
+    def append_dicom_batch_history_records_for_viewer(self, history_path: str | None = None, execution_result: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, record_id_prefix: str | None = None) -> list[dict[str, Any]] | None: ...
+    def build_batch_qc_run_from_dicom_batch_execution_result_for_viewer(self, execution_result: dict[str, Any] | None = None, threshold_config: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, batch_id: str | None = None, use_selected_threshold_config: bool = False) -> dict[str, Any]: ...
+    def show_dicom_batch_history_bridge_viewer(self, execution_result: dict[str, Any] | None = None) -> str: ...
+    def render_current_batch_qc_report_text_for_viewer(self, batch_qc_run: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> str: ...
+    def export_current_batch_qc_run_json_for_viewer(self, path: str | None = None) -> str | None: ...
+    def export_current_batch_qc_run_csv_for_viewer(self, path: str | None = None) -> str | None: ...
+    def export_current_batch_qc_report_text_for_viewer(self, path: str | None = None, metadata: dict[str, Any] | None = None) -> str | None: ...
+    def export_current_batch_qc_report_pdf_for_viewer(self, path: str | None = None, metadata: dict[str, Any] | None = None) -> bytes | None: ...
+    def show_current_batch_qc_report_viewer(self) -> str: ...
+    def build_current_dicom_batch_execution_plan_for_viewer(self, manifest: dict[str, Any] | None = None, roi_preset: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]: ...
+    def run_current_dicom_batch_execution_plan_for_viewer(self, execution_plan: dict[str, Any] | None = None, analysis_executor: Any = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]: ...
+    def get_dicom_batch_execution_plan_summary_for_viewer(self, execution_plan: dict[str, Any] | None = None) -> dict[str, Any]: ...
+    def render_dicom_batch_run_workspace_summary_text_for_viewer(self, execution_plan: dict[str, Any] | None = None, execution_result: dict[str, Any] | None = None) -> str: ...
+    def preview_current_dicom_batch_execution_result_for_viewer(self, execution_result: dict[str, Any] | None = None) -> str: ...
+    def create_dicom_batch_pixel_analysis_executor_for_viewer(self): ...
+    def run_current_dicom_batch_execution_plan_with_pixel_executor_for_viewer(self, execution_plan: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]: ...
+    def preview_current_dicom_batch_pixel_executor_capability_for_viewer(self) -> str: ...
 
 
 def build_window_b_analysis_panel(
@@ -430,3 +456,187 @@ def build_window_b_report_panel(
     ttk.Button(row, text="Export Selected History CSV", command=viewer_adapter.export_selected_result_history_csv).pack(side="left", padx=4)
     ttk.Button(row, text="Export All History CSV", command=viewer_adapter.export_result_history_csv).pack(side="left", padx=4)
     return row
+
+
+def build_window_b_batch_panel(
+    parent: ttk.Frame,
+    viewer_adapter: WindowBViewerAdapter,
+    store: Any,
+    batch_controller: Any = None,
+) -> ttk.Frame:
+    panel = ttk.Frame(parent, padding=(8, 8))
+    panel.pack(fill="both", expand=True)
+    panel.grid_columnconfigure(0, weight=1)
+    panel.grid_rowconfigure(2, weight=1)
+
+    summary = ttk.LabelFrame(panel, text="DICOM Batch Execution", padding=(8, 6))
+    summary.grid(row=0, column=0, sticky="ew")
+    summary_text_var = tk.StringVar(value="")
+    ttk.Label(summary, textvariable=summary_text_var, justify="left", anchor="w").pack(fill="x")
+
+    actions = ttk.Frame(panel)
+    actions.grid(row=1, column=0, sticky="ew", pady=(8, 8))
+    selected_threshold_var = tk.BooleanVar(value=False)
+    strict_roi_var = tk.BooleanVar(value=bool(getattr(viewer_adapter, "current_dicom_batch_strict_roi_validation", False)))
+
+    preview_frame = ttk.LabelFrame(panel, text="Batch Bridge Preview", padding=(8, 6))
+    preview_frame.grid(row=2, column=0, sticky="nsew")
+    preview_frame.grid_columnconfigure(0, weight=1)
+    preview_frame.grid_rowconfigure(0, weight=1)
+    preview_text = tk.Text(preview_frame, wrap="word", height=16)
+    preview_text.grid(row=0, column=0, sticky="nsew")
+    preview_scroll = ttk.Scrollbar(preview_frame, orient="vertical", command=preview_text.yview)
+    preview_scroll.grid(row=0, column=1, sticky="ns")
+    preview_text.configure(yscrollcommand=preview_scroll.set)
+
+    def _set_preview_text(text: str) -> None:
+        preview_text.configure(state="normal")
+        preview_text.delete("1.0", "end")
+        preview_text.insert("1.0", text)
+        preview_text.configure(state="disabled")
+
+    def _refresh() -> None:
+        summary_obj = viewer_adapter.get_dicom_batch_execution_result_summary_for_viewer()
+        summary_text_var.set(
+            f"has_execution_result={summary_obj.get('has_execution_result')} | run_id={summary_obj.get('run_id')} | "
+            f"execution_plan_id={summary_obj.get('execution_plan_id')} | items={summary_obj.get('item_count')} | tasks={summary_obj.get('task_count')} | "
+            f"completed={summary_obj.get('completed_task_count')} blocked={summary_obj.get('blocked_task_count')} "
+            f"not_executed={summary_obj.get('not_executed_task_count')} error={summary_obj.get('error_task_count')} | "
+            f"bridge_records={summary_obj.get('history_record_count')} | has_batch_qc_run={summary_obj.get('has_batch_qc_run')}"
+        )
+        _set_preview_text(viewer_adapter.render_dicom_batch_workspace_summary_text_for_viewer())
+
+    def _preview_bridge() -> None:
+        try:
+            text = viewer_adapter.show_dicom_batch_history_bridge_viewer()
+        except Exception as exc:
+            text = f"preview_error: {exc}"
+        _set_preview_text(f"{text}\n\n{viewer_adapter.render_dicom_batch_workspace_summary_text_for_viewer()}")
+
+    def _build_records() -> None:
+        try:
+            viewer_adapter.build_dicom_batch_history_records_for_viewer()
+        except Exception as exc:
+            _set_preview_text(f"build_history_records_error: {exc}")
+            return
+        _refresh()
+
+    def _append_records() -> None:
+        try:
+            out = viewer_adapter.append_dicom_batch_history_records_for_viewer()
+        except Exception as exc:
+            _set_preview_text(f"append_history_error: {exc}")
+            return
+        if out is None:
+            _set_preview_text("append cancelled by user")
+            return
+        _refresh()
+
+    def _build_qc() -> None:
+        try:
+            viewer_adapter.build_batch_qc_run_from_dicom_batch_execution_result_for_viewer(
+                use_selected_threshold_config=bool(selected_threshold_var.get())
+            )
+        except Exception as exc:
+            _set_preview_text(f"build_batch_qc_error: {exc}")
+            return
+        _refresh()
+
+    ttk.Button(actions, text="Refresh Batch Summary", command=_refresh).pack(side="left", padx=(0, 6))
+    ttk.Button(actions, text="Preview History Bridge", command=_preview_bridge).pack(side="left", padx=6)
+    ttk.Button(actions, text="Build History Records", command=_build_records).pack(side="left", padx=6)
+    ttk.Button(actions, text="Append Records to History JSONL", command=_append_records).pack(side="left", padx=6)
+    ttk.Button(actions, text="Build Batch QC Run", command=_build_qc).pack(side="left", padx=6)
+    ttk.Checkbutton(actions, text="Use selected threshold config", variable=selected_threshold_var).pack(side="left", padx=(12, 0))
+
+    plan_run = ttk.LabelFrame(panel, text="Batch Execution Plan / Run", padding=(8, 6))
+    plan_run.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+
+    def _build_plan() -> None:
+        try:
+            viewer_adapter.build_current_dicom_batch_execution_plan_for_viewer()
+            _set_preview_text(viewer_adapter.render_dicom_batch_run_workspace_summary_text_for_viewer())
+        except Exception as exc:
+            _set_preview_text(f"build_execution_plan_error: {exc}")
+
+    def _run_plan() -> None:
+        try:
+            viewer_adapter.run_current_dicom_batch_execution_plan_for_viewer()
+            _set_preview_text(viewer_adapter.render_dicom_batch_run_workspace_summary_text_for_viewer())
+        except Exception as exc:
+            _set_preview_text(f"run_batch_execution_error: {exc}")
+
+    def _preview_result() -> None:
+        try:
+            _set_preview_text(viewer_adapter.preview_current_dicom_batch_execution_result_for_viewer())
+        except Exception as exc:
+            _set_preview_text(f"preview_execution_result_error: {exc}")
+
+    ttk.Button(plan_run, text="Build Execution Plan", command=_build_plan).pack(side="left", padx=(0, 6))
+    ttk.Button(plan_run, text="Run Batch Execution", command=_run_plan).pack(side="left", padx=6)
+    ttk.Button(plan_run, text="Preview Execution Result", command=_preview_result).pack(side="left", padx=6)
+    def _refresh_workflow_readiness() -> None:
+        try:
+            _set_preview_text(viewer_adapter.preview_current_dicom_batch_workflow_readiness_for_viewer(strict_roi_role_validation=bool(strict_roi_var.get())))
+        except Exception as exc:
+            _set_preview_text(f"workflow_readiness_error: {exc}")
+
+    def _on_strict_roi_toggle() -> None:
+        try:
+            viewer_adapter.set_current_dicom_batch_strict_roi_validation_for_viewer(bool(strict_roi_var.get()))
+        except Exception:
+            pass
+
+    def _validate_roi_roles() -> None:
+        try:
+            _set_preview_text(viewer_adapter.preview_current_dicom_batch_roi_role_validation_for_viewer())
+        except Exception as exc:
+            _set_preview_text(f"validate_roi_roles_error: {exc}")
+
+    ttk.Button(plan_run, text="Validate ROI Roles", command=_validate_roi_roles).pack(side="left", padx=6)
+    ttk.Button(plan_run, text="Refresh Workflow Readiness", command=_refresh_workflow_readiness).pack(side="left", padx=6)
+    def _check_pixel_executor() -> None:
+        try:
+            _set_preview_text(viewer_adapter.preview_current_dicom_batch_pixel_executor_capability_for_viewer())
+        except Exception as exc:
+            _set_preview_text(f"check_pixel_executor_error: {exc}")
+
+    def _run_pixel_execution() -> None:
+        try:
+            viewer_adapter.run_current_dicom_batch_execution_plan_with_pixel_executor_for_viewer(strict_roi_role_validation=bool(strict_roi_var.get()))
+            _set_preview_text(viewer_adapter.preview_current_dicom_batch_execution_result_for_viewer())
+        except Exception as exc:
+            _set_preview_text(f"run_pixel_batch_execution_error: {exc}")
+
+    ttk.Button(plan_run, text="Check Pixel Executor", command=_check_pixel_executor).pack(side="left", padx=6)
+    ttk.Button(plan_run, text="Run Pixel Batch Execution", command=_run_pixel_execution).pack(side="left", padx=6)
+    ttk.Checkbutton(plan_run, text="Require valid ROI roles before pixel run", variable=strict_roi_var, command=_on_strict_roi_toggle).pack(side="left", padx=(10, 0))
+
+    report_actions = ttk.LabelFrame(panel, text="Batch QC Report / Export", padding=(8, 6))
+    report_actions.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+
+    def _report_preview() -> None:
+        try:
+            text = viewer_adapter.show_current_batch_qc_report_viewer()
+        except Exception as exc:
+            text = f"preview_batch_qc_report_error: {exc}"
+        _set_preview_text(text)
+
+    def _run_action(fn_name: str) -> None:
+        try:
+            out = getattr(viewer_adapter, fn_name)()
+            _set_preview_text(f"{fn_name}: {'cancelled' if out is None else 'ok'}")
+        except Exception as exc:
+            _set_preview_text(f"{fn_name}_error: {exc}")
+
+    ttk.Button(report_actions, text="Preview Batch QC Report", command=_report_preview).pack(side="left", padx=(0, 6))
+    ttk.Button(report_actions, text="Export Batch QC JSON", command=lambda: _run_action("export_current_batch_qc_run_json_for_viewer")).pack(side="left", padx=6)
+    ttk.Button(report_actions, text="Export Batch QC CSV", command=lambda: _run_action("export_current_batch_qc_run_csv_for_viewer")).pack(side="left", padx=6)
+    ttk.Button(report_actions, text="Export Batch QC Text", command=lambda: _run_action("export_current_batch_qc_report_text_for_viewer")).pack(side="left", padx=6)
+    ttk.Button(report_actions, text="Export Batch QC PDF", command=lambda: _run_action("export_current_batch_qc_report_pdf_for_viewer")).pack(side="left", padx=6)
+    _refresh()
+
+    setattr(viewer_adapter, "_window_b_batch_summary_var", summary_text_var)
+    setattr(viewer_adapter, "_window_b_batch_preview_text", preview_text)
+    setattr(viewer_adapter, "_window_b_batch_use_selected_threshold_var", selected_threshold_var)
+    return panel

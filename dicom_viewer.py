@@ -50,6 +50,12 @@ from analysis_batch_qc import (
     export_batch_qc_run_to_json,
     render_batch_qc_summary_text,
 )
+from analysis_batch_qc_report import (
+    build_batch_qc_report_model,
+    export_batch_qc_report_to_pdf,
+    export_batch_qc_report_to_text,
+    render_batch_qc_report_text,
+)
 from dicom_batch_manifest import (
     build_dicom_batch_manifest,
     render_dicom_batch_manifest_text,
@@ -80,8 +86,39 @@ from dicom_batch_execution_plan import (
     export_dicom_batch_execution_plan_to_json,
     export_dicom_batch_execution_plan_to_csv,
 )
+from dicom_batch_run_orchestrator import (
+    build_dicom_batch_run_orchestration_summary,
+    render_dicom_batch_run_orchestration_summary_text,
+    run_dicom_batch_execution_plan_with_executor,
+)
+from dicom_batch_workflow_readiness import (
+    assert_dicom_batch_workflow_ready_for_pixel_run,
+    build_dicom_batch_workflow_readiness_report,
+    render_dicom_batch_workflow_readiness_text,
+)
+from dicom_batch_roi_role_validation import (
+    assert_dicom_batch_roi_roles_valid,
+    render_dicom_batch_roi_role_validation_text,
+    validate_dicom_batch_roi_roles,
+)
+from dicom_batch_pixel_executor import (
+    SUPPORTED_ANALYSIS_TYPES,
+    create_dicom_batch_pixel_analysis_executor,
+)
+from dicom_batch_analysis_dispatcher import (
+    SUPPORTED_BATCH_ANALYSIS_TYPES,
+    create_existing_analysis_dispatcher,
+    render_batch_analysis_dispatcher_capability_text,
+)
+from dicom_batch_history_adapter import (
+    append_dicom_batch_execution_history_records,
+    build_analysis_history_records_from_dicom_batch_execution_result,
+    build_batch_qc_run_from_dicom_batch_execution_result,
+    render_dicom_batch_history_bridge_summary_text,
+)
 from dicom_batch_execution import (
     build_dicom_batch_execution_result,
+    validate_dicom_batch_execution_result,
     render_dicom_batch_execution_result_text,
     export_dicom_batch_execution_result_to_json,
     export_dicom_batch_execution_result_to_csv,
@@ -547,6 +584,9 @@ class DicomViewer:
         self.current_roi_bounds_validation: dict[str, Any] | None = None
         self.current_dicom_batch_execution_plan: dict[str, Any] | None = None
         self.current_dicom_batch_execution_result: dict[str, Any] | None = None
+        self.current_dicom_batch_history_records: list[dict[str, Any]] = []
+        self.current_batch_qc_run: dict[str, Any] | None = None
+        self.current_batch_qc_report_model: dict[str, Any] | None = None
         self._analysis_comboboxes: dict[str, ttk.Combobox] = {}
         self._analysis_selector_vars: dict[str, tk.StringVar] = {}
         self._image_analysis_comboboxes: dict[str, ttk.Combobox] = {}
@@ -6551,7 +6591,7 @@ class DicomViewer:
             path = filedialog.askopenfilename(title="QC history JSONL 선택", filetypes=[("JSONL", "*.jsonl"), ("All Files", "*.*")])
             if not path:
                 return None
-        resolved = self._resolve_threshold_config_for_batch(threshold_config=threshold_config, use_selected_threshold_config=use_selected_threshold_config)
+        resolved = DicomViewer._resolve_threshold_config_for_batch(self, threshold_config=threshold_config, use_selected_threshold_config=use_selected_threshold_config)
         return build_batch_qc_run(self.load_analysis_history_for_viewer(path), threshold_config=resolved, metadata=metadata, batch_id=batch_id)
 
     def render_batch_qc_summary_text_for_viewer(self, path: str | Path | None = None, threshold_config: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, batch_id: str | None = None, use_selected_threshold_config: bool = False) -> str | None:
@@ -6603,6 +6643,316 @@ class DicomViewer:
 
     def show_batch_qc_summary_with_selected_threshold_viewer(self, path: str | Path | None = None) -> str | None:
         return self.show_batch_qc_summary_viewer(path=path, use_selected_threshold_config=True)
+
+    def build_dicom_batch_history_records_for_viewer(self, execution_result: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, record_id_prefix: str | None = None) -> list[dict[str, Any]]:
+        result = execution_result if execution_result is not None else getattr(self, "current_dicom_batch_execution_result", None)
+        if result is None:
+            raise ValueError("current_dicom_batch_execution_result is empty")
+        records = build_analysis_history_records_from_dicom_batch_execution_result(result, metadata=metadata, record_id_prefix=record_id_prefix)
+        self.current_dicom_batch_history_records = records
+        DicomViewer._refresh_window_b_batch_workspace(self)
+        return records
+
+    def append_dicom_batch_history_records_for_viewer(self, history_path: str | Path | None = None, execution_result: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, record_id_prefix: str | None = None) -> list[dict[str, Any]] | None:
+        if history_path is None:
+            history_path = filedialog.asksaveasfilename(title="QC history JSONL 저장", defaultextension=".jsonl", filetypes=[("JSONL", "*.jsonl"), ("All Files", "*.*")])
+            if not history_path:
+                return None
+        records = self.build_dicom_batch_history_records_for_viewer(execution_result=execution_result, metadata=metadata, record_id_prefix=record_id_prefix)
+        append_dicom_batch_execution_history_records(str(history_path), records)
+        self._refresh_result_history_table()
+        DicomViewer._refresh_window_b_batch_workspace(self)
+        return records
+
+    def build_batch_qc_run_from_dicom_batch_execution_result_for_viewer(self, execution_result: dict[str, Any] | None = None, threshold_config: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, batch_id: str | None = None, use_selected_threshold_config: bool = False) -> dict[str, Any]:
+        result = execution_result if execution_result is not None else getattr(self, "current_dicom_batch_execution_result", None)
+        if result is None:
+            raise ValueError("current_dicom_batch_execution_result is empty")
+        resolved = DicomViewer._resolve_threshold_config_for_batch(self, threshold_config=threshold_config, use_selected_threshold_config=use_selected_threshold_config)
+        run = build_batch_qc_run_from_dicom_batch_execution_result(result, threshold_config=resolved, metadata=metadata, batch_id=batch_id)
+        self.current_batch_qc_run = run
+        DicomViewer._refresh_window_b_batch_workspace(self)
+        return run
+
+    def show_dicom_batch_history_bridge_viewer(self, execution_result: dict[str, Any] | None = None) -> str:
+        records = self.build_dicom_batch_history_records_for_viewer(execution_result=execution_result)
+        text = render_dicom_batch_history_bridge_summary_text(records)
+        owner = getattr(self, "master", None) or getattr(self, "root", None) or getattr(self, "window", None)
+        win = tk.Toplevel(owner) if owner is not None else tk.Toplevel()
+        win.title("DICOM Batch History Bridge Preview")
+        win.geometry("900x700")
+        t = tk.Text(win, wrap="word")
+        t.pack(fill="both", expand=True)
+        t.insert("1.0", text)
+        t.configure(state="disabled")
+        return text
+
+    def build_current_batch_qc_report_model_for_viewer(self, batch_qc_run: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        run = batch_qc_run if batch_qc_run is not None else getattr(self, "current_batch_qc_run", None)
+        if run is None:
+            raise ValueError("current_batch_qc_run is empty")
+        model = build_batch_qc_report_model(run, metadata=metadata)
+        self.current_batch_qc_report_model = model
+        return model
+
+    def render_current_batch_qc_report_text_for_viewer(self, batch_qc_run: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> str:
+        return render_batch_qc_report_text(DicomViewer.build_current_batch_qc_report_model_for_viewer(self, batch_qc_run=batch_qc_run, metadata=metadata))
+
+    def export_current_batch_qc_run_json_for_viewer(self, path: str | None = None) -> str | None:
+        run = getattr(self, "current_batch_qc_run", None)
+        if run is None:
+            raise ValueError("current_batch_qc_run is empty")
+        if path is None:
+            path = filedialog.asksaveasfilename(title="Batch QC JSON 저장", defaultextension=".json", filetypes=[("JSON", "*.json"), ("All Files", "*.*")])
+            if not path:
+                return None
+        return export_batch_qc_run_to_json(run, path=path)
+
+    def export_current_batch_qc_run_csv_for_viewer(self, path: str | None = None) -> str | None:
+        run = getattr(self, "current_batch_qc_run", None)
+        if run is None:
+            raise ValueError("current_batch_qc_run is empty")
+        if path is None:
+            path = filedialog.asksaveasfilename(title="Batch QC CSV 저장", defaultextension=".csv", filetypes=[("CSV", "*.csv"), ("All Files", "*.*")])
+            if not path:
+                return None
+        return export_batch_qc_run_to_csv(run, path=path)
+
+    def export_current_batch_qc_report_text_for_viewer(self, path: str | None = None, metadata: dict[str, Any] | None = None) -> str | None:
+        model = DicomViewer.build_current_batch_qc_report_model_for_viewer(self, metadata=metadata)
+        if path is None:
+            path = filedialog.asksaveasfilename(title="Batch QC Report Text 저장", defaultextension=".txt", filetypes=[("Text", "*.txt"), ("All Files", "*.*")])
+            if not path:
+                return None
+        return export_batch_qc_report_to_text(model, path=path)
+
+    def export_current_batch_qc_report_pdf_for_viewer(self, path: str | None = None, metadata: dict[str, Any] | None = None) -> bytes | None:
+        model = DicomViewer.build_current_batch_qc_report_model_for_viewer(self, metadata=metadata)
+        if path is None:
+            path = filedialog.asksaveasfilename(title="Batch QC Report PDF 저장", defaultextension=".pdf", filetypes=[("PDF", "*.pdf"), ("All Files", "*.*")])
+            if not path:
+                return None
+        return export_batch_qc_report_to_pdf(model, path=path)
+
+    def show_current_batch_qc_report_viewer(self) -> str:
+        text = self.render_current_batch_qc_report_text_for_viewer()
+        owner = getattr(self, "master", None) or getattr(self, "root", None) or getattr(self, "window", None)
+        win = tk.Toplevel(owner) if owner is not None else tk.Toplevel()
+        win.title("Batch QC Report Preview")
+        win.geometry("900x700")
+        t = tk.Text(win, wrap="word")
+        t.pack(fill="both", expand=True)
+        t.insert("1.0", text)
+        t.configure(state="disabled")
+        return text
+
+    def build_current_dicom_batch_execution_plan_for_viewer(self, manifest: dict[str, Any] | None = None, roi_preset: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        source_manifest = manifest if manifest is not None else getattr(self, "current_dicom_batch_manifest", None)
+        source_preset = roi_preset if roi_preset is not None else getattr(self, "current_roi_preset", None)
+        if source_manifest is None:
+            raise ValueError("current_dicom_batch_manifest is empty")
+        if source_preset is None:
+            raise ValueError("current_roi_preset is empty")
+        bounds = getattr(self, "current_roi_bounds_validation", None)
+        if bounds is None:
+            bounds = DicomViewer.build_roi_bounds_validation_for_viewer(self, manifest=source_manifest, roi_preset=source_preset, metadata=metadata)
+        analysis_plan = DicomViewer.build_dicom_batch_analysis_plan_for_viewer(self, manifest=source_manifest, roi_preset=source_preset, metadata=metadata)
+        plan = build_dicom_batch_execution_plan(analysis_plan, bounds, metadata=metadata)
+        self.current_dicom_batch_execution_plan = plan
+        DicomViewer._refresh_window_b_batch_workspace(self)
+        return plan
+
+    def run_current_dicom_batch_execution_plan_for_viewer(self, execution_plan: dict[str, Any] | None = None, analysis_executor: Any = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        plan = execution_plan if execution_plan is not None else getattr(self, "current_dicom_batch_execution_plan", None)
+        if plan is None:
+            raise ValueError("current_dicom_batch_execution_plan is empty")
+        roi_preset = getattr(self, "current_roi_preset", None)
+        if roi_preset is None:
+            raise ValueError("current_roi_preset is empty")
+        executor = analysis_executor if analysis_executor is not None else getattr(self, "current_batch_analysis_executor", None)
+        result = run_dicom_batch_execution_plan_with_executor(plan, roi_preset, analysis_executor=executor, metadata=metadata)
+        self.current_dicom_batch_execution_result = result
+        DicomViewer._refresh_window_b_batch_workspace(self)
+        return result
+
+    def get_dicom_batch_execution_plan_summary_for_viewer(self, execution_plan: dict[str, Any] | None = None) -> dict[str, Any]:
+        return build_dicom_batch_run_orchestration_summary(execution_plan=execution_plan if execution_plan is not None else getattr(self, "current_dicom_batch_execution_plan", None), execution_result=None)
+
+    def render_dicom_batch_run_workspace_summary_text_for_viewer(self, execution_plan: dict[str, Any] | None = None, execution_result: dict[str, Any] | None = None) -> str:
+        plan = execution_plan if execution_plan is not None else getattr(self, "current_dicom_batch_execution_plan", None)
+        result = execution_result if execution_result is not None else getattr(self, "current_dicom_batch_execution_result", None)
+        return render_dicom_batch_run_orchestration_summary_text(plan, result)
+
+    def preview_current_dicom_batch_execution_result_for_viewer(self, execution_result: dict[str, Any] | None = None) -> str:
+        result = execution_result if execution_result is not None else getattr(self, "current_dicom_batch_execution_result", None)
+        if result is None:
+            return "DICOM batch execution result is empty\n"
+        return render_dicom_batch_execution_result_text(validate_dicom_batch_execution_result(result))
+
+    def create_batch_analysis_dispatcher_for_viewer(self):
+        snr = lambda task, item, context: {"status": "ok", "result": 1.0, "signal_roi_id": (context.get("roi_ids") or [None])[0], "noise_roi_id": (context.get("roi_ids") or [None, None])[-1]}
+        cnr = lambda task, item, context: {"status": "ok", "result": 1.0, "inputs": {"region_a_roi_id": (context.get("roi_ids") or [None])[0], "region_b_roi_id": (context.get("roi_ids") or [None, None])[-1], "noise_roi_id": (context.get("roi_ids") or [None])[-1]}}
+        uni = lambda task, item, context: {"status": "ok", "result": {"value": 1.0}, "inputs": {"roi_ids": list(context.get("roi_ids") or []), "roi_count": len(list(context.get("roi_ids") or []))}}
+        mtf = lambda task, item, context: {"status": "ok", "key_mtf_metrics": {"mtf50": 1.0}, "mtf_curve": {"frequency_cy_per_pixel": [0.0, 1.0], "mtf": [1.0, 0.5]}}
+        return create_existing_analysis_dispatcher(snr_analyzer=snr, cnr_analyzer=cnr, uniformity_analyzer=uni, mtf_analyzer=mtf)
+
+    def create_dicom_batch_pixel_analysis_executor_for_viewer(self, *, pixel_loader=None, roi_resolver=None, analysis_dispatcher=None):
+        dispatcher = analysis_dispatcher if analysis_dispatcher is not None else DicomViewer.create_batch_analysis_dispatcher_for_viewer(self)
+        return create_dicom_batch_pixel_analysis_executor(pixel_loader=pixel_loader, roi_resolver=roi_resolver, analysis_dispatcher=dispatcher)
+
+    def validate_current_dicom_batch_roi_roles_for_viewer(self, execution_plan: dict[str, Any] | None = None, roi_preset: dict[str, Any] | None = None, bounds_result: dict[str, Any] | None = None, role_policy: dict[str, Any] | None = None) -> dict[str, Any]:
+        plan = execution_plan if execution_plan is not None else getattr(self, "current_dicom_batch_execution_plan", None)
+        preset = roi_preset if roi_preset is not None else getattr(self, "current_roi_preset", None)
+        if plan is None:
+            raise ValueError("current_dicom_batch_execution_plan is empty")
+        if preset is None:
+            raise ValueError("current_roi_preset is empty")
+        bounds = bounds_result if bounds_result is not None else getattr(self, "current_roi_bounds_validation", None)
+        report = validate_dicom_batch_roi_roles(plan, preset, bounds_result=bounds, role_policy=role_policy)
+        self.current_dicom_batch_roi_role_validation_report = report
+        DicomViewer._refresh_window_b_batch_workspace(self)
+        return report
+
+    def render_current_dicom_batch_roi_role_validation_text_for_viewer(self, validation_report: dict[str, Any] | None = None) -> str:
+        report = validation_report if validation_report is not None else getattr(self, "current_dicom_batch_roi_role_validation_report", None)
+        if report is None:
+            return "No ROI role validation report\n"
+        return render_dicom_batch_roi_role_validation_text(report)
+
+    def preview_current_dicom_batch_roi_role_validation_for_viewer(self) -> str:
+        report = DicomViewer.validate_current_dicom_batch_roi_roles_for_viewer(self)
+        return DicomViewer.render_current_dicom_batch_roi_role_validation_text_for_viewer(self, report)
+
+    def set_current_dicom_batch_strict_roi_validation_for_viewer(self, enabled: bool):
+        self.current_dicom_batch_strict_roi_validation = bool(enabled)
+
+    def build_current_dicom_batch_workflow_readiness_for_viewer(self, strict_roi_role_validation: bool | None = None) -> dict[str, Any]:
+        strict = bool(getattr(self, "current_dicom_batch_strict_roi_validation", False)) if strict_roi_role_validation is None else bool(strict_roi_role_validation)
+        report = build_dicom_batch_workflow_readiness_report(
+            execution_plan=getattr(self, "current_dicom_batch_execution_plan", None),
+            roi_role_validation_report=getattr(self, "current_dicom_batch_roi_role_validation_report", None),
+            pixel_capability_text=DicomViewer.preview_current_dicom_batch_pixel_executor_capability_for_viewer(self),
+            execution_result=getattr(self, "current_dicom_batch_execution_result", None),
+            history_records=getattr(self, "current_dicom_batch_history_records", None),
+            batch_qc_run=getattr(self, "current_batch_qc_run", None),
+            strict_roi_role_validation=strict,
+        )
+        self.current_dicom_batch_workflow_readiness_report = report
+        return report
+
+    def render_current_dicom_batch_workflow_readiness_text_for_viewer(self, report: dict[str, Any] | None = None) -> str:
+        payload = report if report is not None else getattr(self, "current_dicom_batch_workflow_readiness_report", None)
+        if payload is None:
+            payload = DicomViewer.build_current_dicom_batch_workflow_readiness_for_viewer(self)
+        return render_dicom_batch_workflow_readiness_text(payload)
+
+    def preview_current_dicom_batch_workflow_readiness_for_viewer(self, strict_roi_role_validation: bool | None = None) -> str:
+        payload = DicomViewer.build_current_dicom_batch_workflow_readiness_for_viewer(self, strict_roi_role_validation=strict_roi_role_validation)
+        return DicomViewer.render_current_dicom_batch_workflow_readiness_text_for_viewer(self, payload)
+
+    def run_current_dicom_batch_execution_plan_with_pixel_executor_for_viewer(self, execution_plan: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, analysis_dispatcher=None, strict_roi_role_validation: bool = False) -> dict[str, Any]:
+        if strict_roi_role_validation:
+            report = DicomViewer.validate_current_dicom_batch_roi_roles_for_viewer(self, execution_plan=execution_plan)
+            assert_dicom_batch_roi_roles_valid(report)
+            ready = DicomViewer.build_current_dicom_batch_workflow_readiness_for_viewer(self, strict_roi_role_validation=True)
+            assert_dicom_batch_workflow_ready_for_pixel_run(ready)
+        executor = DicomViewer.create_dicom_batch_pixel_analysis_executor_for_viewer(self, analysis_dispatcher=analysis_dispatcher)
+        out = DicomViewer.run_current_dicom_batch_execution_plan_for_viewer(self, execution_plan=execution_plan, analysis_executor=executor, metadata=metadata)
+        DicomViewer.build_current_dicom_batch_workflow_readiness_for_viewer(self, strict_roi_role_validation=strict_roi_role_validation)
+        return out
+
+    def preview_current_dicom_batch_pixel_executor_capability_for_viewer(self) -> str:
+        plan = getattr(self, "current_dicom_batch_execution_plan", None)
+        has_plan = plan is not None
+        item_count = int((plan or {}).get("item_count", 0))
+        task_count = int((plan or {}).get("task_count", 0))
+        try:
+            import importlib
+            importlib.import_module("pydicom")
+            pydicom_status = "available"
+        except Exception:
+            pydicom_status = "unavailable"
+        dispatcher_info = {"supported_analysis_types": sorted(SUPPORTED_BATCH_ANALYSIS_TYPES), "connected_analyzer_types": sorted(SUPPORTED_BATCH_ANALYSIS_TYPES), "missing_analyzer_types": [], "payload_validation_enabled": True}
+        lines = [
+            "DICOM Batch Pixel Executor Capability",
+            f"pydicom: {pydicom_status} (lazy import)",
+            f"has_execution_plan: {has_plan}",
+            f"item_count: {item_count}",
+            f"task_count: {task_count}",
+            f"supported_analysis_types: {sorted(SUPPORTED_ANALYSIS_TYPES)}",
+            "unsupported_analysis_types: any other analysis_type",
+            "next_action: Run Pixel Batch Execution",
+            "",
+            render_batch_analysis_dispatcher_capability_text(dispatcher_info).strip(),
+        ]
+        return "\\n".join(lines) + "\\n"
+
+    def get_dicom_batch_execution_result_summary_for_viewer(self, execution_result: dict[str, Any] | None = None) -> dict[str, Any]:
+        history_records = list(getattr(self, "current_dicom_batch_history_records", []) or [])
+        batch_qc_run = getattr(self, "current_batch_qc_run", None)
+        result = execution_result if execution_result is not None else getattr(self, "current_dicom_batch_execution_result", None)
+        if result is None:
+            return {
+                "has_execution_result": False,
+                "run_id": "",
+                "execution_plan_id": "",
+                "item_count": 0,
+                "task_count": 0,
+                "completed_task_count": 0,
+                "blocked_task_count": 0,
+                "not_executed_task_count": 0,
+                "error_task_count": 0,
+                "history_record_count": len(history_records),
+                "has_batch_qc_run": bool(batch_qc_run),
+            }
+        payload = validate_dicom_batch_execution_result(result)
+        return {
+            "has_execution_result": True,
+            "run_id": str(payload.get("run_id", "")),
+            "execution_plan_id": str(payload.get("execution_plan_id", "")),
+            "item_count": int(payload.get("item_count", 0)),
+            "task_count": int(payload.get("task_count", 0)),
+            "completed_task_count": int(payload.get("completed_task_count", 0)),
+            "blocked_task_count": int(payload.get("blocked_task_count", 0)),
+            "not_executed_task_count": int(payload.get("not_executed_task_count", 0)),
+            "error_task_count": int(payload.get("error_task_count", 0)),
+            "history_record_count": len(history_records),
+            "has_batch_qc_run": bool(batch_qc_run),
+        }
+
+    def render_dicom_batch_workspace_summary_text_for_viewer(self, execution_result: dict[str, Any] | None = None) -> str:
+        summary = DicomViewer.get_dicom_batch_execution_result_summary_for_viewer(self, execution_result=execution_result)
+        lines = [
+            "Window B Batch Workspace Summary",
+            f"Execution Result Loaded: {summary['has_execution_result']}",
+            f"Run ID: {summary['run_id']}",
+            f"Execution Plan ID: {summary['execution_plan_id']}",
+            f"Items: {summary['item_count']}, Tasks: {summary['task_count']}",
+            f"Task Status Counts: completed={summary['completed_task_count']} blocked={summary['blocked_task_count']} not_executed={summary['not_executed_task_count']} error={summary['error_task_count']}",
+            f"Current Bridge Records: {summary['history_record_count']}",
+            f"Current Batch QC Run: {summary['has_batch_qc_run']}",
+        ]
+        if summary["has_execution_result"]:
+            lines.append("Next Action: Build History Records -> Append JSONL -> Build Batch QC Run")
+        else:
+            lines.append("Next Action: Build or load DICOM batch execution result first")
+        return "\n".join(lines) + "\n"
+
+    def _refresh_window_b_batch_workspace(self) -> None:
+        summary_var = getattr(self, "_window_b_batch_summary_var", None)
+        preview_text = getattr(self, "_window_b_batch_preview_text", None)
+        if summary_var is None or preview_text is None:
+            return
+        summary = self.get_dicom_batch_execution_result_summary_for_viewer()
+        summary_var.set(
+            f"has_execution_result={summary.get('has_execution_result')} | run_id={summary.get('run_id')} | execution_plan_id={summary.get('execution_plan_id')} | "
+            f"items={summary.get('item_count')} | tasks={summary.get('task_count')} | completed={summary.get('completed_task_count')} blocked={summary.get('blocked_task_count')} "
+            f"not_executed={summary.get('not_executed_task_count')} error={summary.get('error_task_count')} | bridge_records={summary.get('history_record_count')} | has_batch_qc_run={summary.get('has_batch_qc_run')}"
+        )
+        preview_text.configure(state="normal")
+        preview_text.delete("1.0", "end")
+        preview_text.insert("1.0", self.render_dicom_batch_workspace_summary_text_for_viewer())
+        preview_text.configure(state="disabled")
 
     def build_dicom_batch_manifest_for_viewer(self, paths: list[str] | tuple[str, ...] | None = None, recursive: bool = True, metadata: dict[str, Any] | None = None, manifest_id: str | None = None) -> dict[str, Any] | None:
         if paths is None:
@@ -15150,3 +15500,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

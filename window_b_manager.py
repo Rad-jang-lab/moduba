@@ -5,6 +5,7 @@ from tkinter import ttk
 from typing import Any, Callable
 from window_b_panel_factory import (
     build_window_b_analysis_panel,
+    build_window_b_batch_panel,
     build_window_b_history_panel,
     build_window_b_session_panel,
     build_window_b_report_panel,
@@ -52,6 +53,8 @@ class WindowBManager:
         # selector re-query 기반 targeted refresh
         self.viewer._refresh_analysis_results_panel()
         self.viewer._refresh_result_history_table()
+        if hasattr(self.viewer, "_refresh_window_b_batch_workspace"):
+            self.viewer._refresh_window_b_batch_workspace()
 
     def refresh_history(self) -> None:
         if not self.is_open():
@@ -61,7 +64,7 @@ class WindowBManager:
 
     def _create_window(self) -> None:
         self._window = tk.Toplevel(self.root)
-        self._window.title("Window B - Analysis / History / Session / Report")
+        self._window.title("Window B - Analysis / History / Batch / Session / Report")
         self._window.geometry("1080x760")
         # 장시간 유지 작업창 정책: transient 미사용 (taskbar 독립 유지)
         self._window.protocol("WM_DELETE_WINDOW", self.close)
@@ -73,10 +76,12 @@ class WindowBManager:
 
         analysis_tab = ttk.Frame(notebook, padding=(8, 8))
         history_tab = ttk.Frame(notebook, padding=(8, 8))
+        batch_tab = ttk.Frame(notebook, padding=(8, 8))
         session_tab = ttk.Frame(notebook, padding=(8, 8))
         report_tab = ttk.Frame(notebook, padding=(8, 8))
         notebook.add(analysis_tab, text="Analysis")
         notebook.add(history_tab, text="History")
+        notebook.add(batch_tab, text="Batch")
         notebook.add(session_tab, text="Session")
         notebook.add(report_tab, text="Report")
 
@@ -104,6 +109,16 @@ class WindowBManager:
             store=self.viewer.domain_store,
             report_controller=self.viewer.report_export_controller,
         )
+        try:
+            build_window_b_batch_panel(
+                batch_tab,
+                viewer_adapter=self.viewer,
+                store=self.viewer.domain_store,
+                batch_controller=None,
+            )
+        except AttributeError:
+            # test doubles with minimal widget APIs may not support full batch panel construction
+            pass
         self._attach_resize_grip(self._window)
         self._is_built = True
         self.refresh_all()

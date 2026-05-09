@@ -45,3 +45,23 @@ Window B panel factory 내부의 viewer 의존성을 명확히 기록하고, `vi
 ## 비고
 - 이번 단계는 동작 동일성 우선으로 copy 방식 UI를 유지.
 - viewer `_build_*` 메서드는 창 A 호환성 때문에 유지한다.
+
+
+- Batch 탭 callback: get_dicom_batch_execution_result_summary_for_viewer, render_dicom_batch_workspace_summary_text_for_viewer, build_dicom_batch_history_records_for_viewer, append_dicom_batch_history_records_for_viewer, build_batch_qc_run_from_dicom_batch_execution_result_for_viewer, show_dicom_batch_history_bridge_viewer.
+- 이번 단계는 controller 분리 단계가 아니라 viewer_adapter 기반 얇은 UI 연결 단계입니다.
+
+
+- Batch QC report/export callback: show_current_batch_qc_report_viewer, export_current_batch_qc_run_json_for_viewer, export_current_batch_qc_run_csv_for_viewer, export_current_batch_qc_report_text_for_viewer, export_current_batch_qc_report_pdf_for_viewer.
+
+
+- Batch plan/run callback: build_current_dicom_batch_execution_plan_for_viewer, run_current_dicom_batch_execution_plan_for_viewer, get_dicom_batch_execution_plan_summary_for_viewer, render_dicom_batch_run_workspace_summary_text_for_viewer, preview_current_dicom_batch_execution_result_for_viewer.
+
+
+- Pixel executor callback: create_dicom_batch_pixel_analysis_executor_for_viewer, run_current_dicom_batch_execution_plan_with_pixel_executor_for_viewer, preview_current_dicom_batch_pixel_executor_capability_for_viewer.
+
+
+- create_batch_analysis_dispatcher_for_viewer callback을 사용해 기본 dispatcher를 구성합니다.
+- create_dicom_batch_pixel_analysis_executor_for_viewer는 explicit dispatcher 인자가 있으면 그것을 우선합니다.
+
+
+- Window B Batch 탭에 Validate ROI Roles(preflight report) 버튼을 추가해 pixel run 전 입력 품질을 점검할 수 있습니다.
