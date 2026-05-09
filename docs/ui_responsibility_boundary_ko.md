@@ -55,3 +55,22 @@
 ## 비고
 - 본 문서는 책임 경계 정의이며, 기능 삭제/코드 제거는 수행하지 않는다.
 - Window B panel factory 및 manager 구조는 현행 유지한다.
+
+
+- Window B는 analysis/history/session/report 관리에 더해 Batch workspace를 통해 batch execution result->history/QC 브리지를 수행합니다.
+- 창 A는 viewer/input 중심, 창 B는 analysis/history/session/report/batch QC 관리 중심입니다.
+
+
+- Window B는 Batch QC report/export 관리(미리보기/JSON/CSV/Text/PDF)를 담당합니다.
+
+
+- Window B는 batch plan/run orchestration을 포함한 batch workflow 중심 관리 역할을 담당합니다.
+
+
+- Window B는 batch execution orchestration과 pixel-backed run trigger를 담당하며, 계산 공식/ROI resolver 책임은 기존 분석 계층에 유지됩니다.
+
+
+- Window B는 실행 trigger/preview를 담당하고 dispatcher는 기존 분석 로직 연결만 담당합니다. 계산식 책임은 기존 분석 계층에 유지됩니다.
+
+
+- Window B Batch 탭에 Validate ROI Roles(preflight report) 버튼을 추가해 pixel run 전 입력 품질을 점검할 수 있습니다.
