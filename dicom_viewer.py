@@ -332,6 +332,8 @@ MTF_METRIC_EDGE_SNR = "EDGE_SNR"
 MTF_METRIC_ROI_WIDTH_MM = "ROI_WIDTH_MM"
 MTF_METRIC_ROI_HEIGHT_MM = "ROI_HEIGHT_MM"
 MTF_METRIC_INVALID = "INVALID"
+ROI_SELECTION_HIT_RADIUS_PX = 8
+RESIZE_GRIP_HIT_SIZE_PX = 24
 
 
 class DicomViewer:
@@ -779,10 +781,19 @@ class DicomViewer:
 
         self.multiview_container.grid_remove()
         self.compare_container.grid_remove()
+        self._attach_resize_grip(self.root)
         self._bind_shortcuts()
         self._update_multiview_controls()
         self._update_compare_controls()
         self.root.after(0, self._set_initial_split_sash)
+
+    @staticmethod
+    def _attach_resize_grip(window: tk.Misc) -> ttk.Frame:
+        grip_container = ttk.Frame(window, width=RESIZE_GRIP_HIT_SIZE_PX, height=RESIZE_GRIP_HIT_SIZE_PX)
+        grip_container.place(relx=1.0, rely=1.0, anchor="se")
+        grip_container.place_propagate(False)
+        ttk.Sizegrip(grip_container).pack(fill="both", expand=True)
+        return grip_container
 
     def _set_initial_split_sash(self) -> None:
         if self.main_vertical_split is None:
@@ -11058,7 +11069,12 @@ class DicomViewer:
             extra_meta = {"roi_type": "free"}
         measurement = self._append_persistent_measurement(mode, image_start, image_end, extra_meta=extra_meta)
         if measurement is not None:
+            if mode == "roi":
+                self._apply_measurement_selection(measurement.id, toggle=False)
             self._update_guided_snr_selection(measurement)
+            if mode == "roi":
+                self._refresh_analysis_selectors()
+                self._update_analysis_action_button_state()
         self._draw_preview_measurements()
         self._draw_persistent_measurements()
 
@@ -11817,7 +11833,16 @@ class DicomViewer:
             return False
         canvas_x = self.canvas.canvasx(event.x)
         canvas_y = self.canvas.canvasy(event.y)
-        overlapping = list(reversed(self.canvas.find_overlapping(canvas_x - 3, canvas_y - 3, canvas_x + 3, canvas_y + 3)))
+        overlapping = list(
+            reversed(
+                self.canvas.find_overlapping(
+                    canvas_x - ROI_SELECTION_HIT_RADIUS_PX,
+                    canvas_y - ROI_SELECTION_HIT_RADIUS_PX,
+                    canvas_x + ROI_SELECTION_HIT_RADIUS_PX,
+                    canvas_y + ROI_SELECTION_HIT_RADIUS_PX,
+                )
+            )
+        )
         for item_id in overlapping:
             measurement_id = self._persistent_canvas_item_to_measurement_id.get(item_id)
             if measurement_id is None:

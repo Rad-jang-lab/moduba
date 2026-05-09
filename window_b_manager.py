@@ -104,8 +104,17 @@ class WindowBManager:
             store=self.viewer.domain_store,
             report_controller=self.viewer.report_export_controller,
         )
+        self._attach_resize_grip(self._window)
         self._is_built = True
         self.refresh_all()
+
+    @staticmethod
+    def _attach_resize_grip(window: tk.Misc) -> ttk.Frame:
+        grip_container = ttk.Frame(window, width=24, height=24)
+        grip_container.place(relx=1.0, rely=1.0, anchor="se")
+        grip_container.place_propagate(False)
+        ttk.Sizegrip(grip_container).pack(fill="both", expand=True)
+        return grip_container
 
     def bind_store_events(self) -> None:
         event_map: dict[str, Callable[[dict[str, Any]], None]] = {
