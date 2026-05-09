@@ -2,7 +2,7 @@ from pathlib import Path
 import copy
 import csv
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import re
 import tkinter as tk
@@ -25,6 +25,107 @@ from mtf_qa_grading import grade_mtf_for_internal_qa
 from domain_store import DomainStore
 from window_b_services import AnalysisResultController, HistoryController, SessionController, ReportExportController
 from window_b_manager import WindowBManager
+from ui_display_helpers import build_analysis_display_model, build_pair_status_label, build_viewer_a_status_label, format_compact_path_label
+from analysis_result_export import export_analysis_results_to_csv, export_analysis_results_to_json
+from analysis_report_model import build_analysis_report_model, render_analysis_report_markdown
+from analysis_report_pdf import export_analysis_report_to_pdf
+from analysis_history_store import append_analysis_history_record, build_analysis_history_record
+from analysis_history_display import (
+    build_history_records_display_model,
+    render_history_record_detail_text,
+)
+from analysis_history_summary import (
+    build_history_summary,
+    build_metric_trend_series,
+    render_history_summary_text,
+    render_metric_trend_text,
+)
+from analysis_history_trend_chart import (
+    build_metric_trend_chart_model,
+    render_metric_trend_chart_text,
+)
+from analysis_batch_qc import (
+    build_batch_qc_run,
+    export_batch_qc_run_to_csv,
+    export_batch_qc_run_to_json,
+    render_batch_qc_summary_text,
+)
+from dicom_batch_manifest import (
+    build_dicom_batch_manifest,
+    render_dicom_batch_manifest_text,
+    export_dicom_batch_manifest_to_json,
+    export_dicom_batch_manifest_to_csv,
+)
+from roi_preset import (
+    build_roi_preset_from_roi_definitions,
+    load_roi_preset,
+    export_roi_preset_to_json,
+    render_roi_preset_text,
+)
+from dicom_batch_plan import (
+    build_dicom_batch_analysis_plan,
+    render_dicom_batch_analysis_plan_text,
+    export_dicom_batch_analysis_plan_to_json,
+    export_dicom_batch_analysis_plan_to_csv,
+)
+from roi_bounds_validation import (
+    build_roi_bounds_validation_result,
+    render_roi_bounds_validation_text,
+    export_roi_bounds_validation_to_json,
+    export_roi_bounds_validation_to_csv,
+)
+from dicom_batch_execution_plan import (
+    build_dicom_batch_execution_plan,
+    render_dicom_batch_execution_plan_text,
+    export_dicom_batch_execution_plan_to_json,
+    export_dicom_batch_execution_plan_to_csv,
+)
+from dicom_batch_execution import (
+    build_dicom_batch_execution_result,
+    render_dicom_batch_execution_result_text,
+    export_dicom_batch_execution_result_to_json,
+    export_dicom_batch_execution_result_to_csv,
+)
+from analysis_history_store import load_analysis_history_records
+from analysis_thresholds import evaluate_analysis_thresholds, render_threshold_evaluation_text, validate_threshold_config
+from analysis_threshold_config import (
+    build_threshold_config_display_model,
+    load_threshold_config,
+    render_threshold_config_text,
+    save_threshold_config,
+)
+from analysis_threshold_editor import (
+    add_threshold_rule,
+    duplicate_threshold_rule,
+    get_threshold_rule,
+    list_threshold_rules,
+    remove_threshold_rule,
+    reorder_threshold_rules,
+    update_threshold_rule,
+)
+from analysis_threshold_editor_display import (
+    build_threshold_editor_display_model,
+    render_threshold_editor_text,
+    render_threshold_rule_detail_text,
+)
+from analysis_threshold_catalog_sync import build_threshold_catalog_sync_status
+from analysis_threshold_catalog import (
+    add_threshold_config_to_catalog,
+    build_empty_threshold_catalog,
+    build_threshold_catalog_display_model,
+    export_threshold_config_from_catalog,
+    get_threshold_config_from_catalog,
+    import_threshold_config_file_to_catalog,
+    load_threshold_catalog,
+    remove_threshold_config_from_catalog,
+    render_threshold_catalog_text,
+    save_threshold_catalog,
+    set_selected_threshold_config_id,
+    update_threshold_config_in_catalog,
+    validate_threshold_catalog,
+    get_selected_threshold_config,
+)
+from analysis_result_model import normalize_analysis_last_run, normalize_analysis_result
 from iqa_metrics import calculate_iqa_metrics
 from iqa_dicom_adapter import calculate_dicom_iqa
 from iqa_export import iqa_result_to_analysis_record
@@ -438,6 +539,12 @@ class DicomViewer:
             "roi": {},
         }
         self.analysis_last_run: dict[str, dict[str, Any]] = {}
+        self.analysis_last_run_normalized: dict[str, dict[str, Any]] = {}
+        self.analysis_last_run_display: dict[str, dict[str, Any]] = {}
+        self.current_dicom_batch_analysis_plan: dict[str, Any] | None = None
+        self.current_roi_bounds_validation: dict[str, Any] | None = None
+        self.current_dicom_batch_execution_plan: dict[str, Any] | None = None
+        self.current_dicom_batch_execution_result: dict[str, Any] | None = None
         self._analysis_comboboxes: dict[str, ttk.Combobox] = {}
         self._analysis_selector_vars: dict[str, tk.StringVar] = {}
         self._image_analysis_comboboxes: dict[str, ttk.Combobox] = {}
@@ -1115,7 +1222,8 @@ class DicomViewer:
         nested_notebook.bind("<<NotebookTabChanged>>", self._on_signal_analysis_tab_changed, add="+")
 
         snr_group = ttk.LabelFrame(snr_tab, text="SNR", padding=(8, 6))
-        snr_group.pack(fill="both", expand=True)
+        snr_group.pack(fill="x", anchor="n")
+        snr_group.columnconfigure(0, weight=1)
         ttk.Label(snr_group, text="Input: Signal ROI").grid(row=0, column=0, sticky="w")
         self._analysis_comboboxes["snr_signal"] = ttk.Combobox(
             snr_group,
@@ -1133,14 +1241,15 @@ class DicomViewer:
         )
         self._analysis_comboboxes["snr_noise"].grid(row=3, column=0, sticky="ew", pady=(2, 4))
         ttk.Label(snr_group, text="Formula: mean(Signal ROI) / std(Background ROI)").grid(row=4, column=0, sticky="w")
-        ttk.Label(snr_group, textvariable=self.signal_analysis_results["snr_preview"]).grid(row=5, column=0, sticky="w", pady=(2, 0))
-        ttk.Label(snr_group, textvariable=self.signal_analysis_results["snr_result"]).grid(row=6, column=0, sticky="w", pady=(2, 0))
+        self._build_analysis_summary_label(snr_group, self.signal_analysis_results["snr_preview"]).grid(row=5, column=0, sticky="ew", pady=(2, 0))
+        self._build_analysis_summary_label(snr_group, self.signal_analysis_results["snr_result"]).grid(row=6, column=0, sticky="ew", pady=(2, 0))
         self._analysis_action_buttons["snr"] = ttk.Button(snr_group, text="Calculate SNR", command=self.calculate_snr_from_inputs)
         self._analysis_action_buttons["snr"].grid(row=7, column=0, sticky="ew", pady=(6, 0))
         ttk.Label(snr_group, textvariable=self.signal_analysis_results["snr_ready_reason"]).grid(row=8, column=0, sticky="w", pady=(2, 0))
 
         cnr_group = ttk.LabelFrame(cnr_tab, text="CNR", padding=(8, 6))
-        cnr_group.pack(fill="both", expand=True)
+        cnr_group.pack(fill="x", anchor="n")
+        cnr_group.columnconfigure(0, weight=1)
         formula_cards = ttk.LabelFrame(cnr_group, text="Formula Selection", padding=(6, 4))
         formula_cards.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         ttk.Radiobutton(formula_cards, text="Option A | |S_A - S_B| / sigma_o", value="standard_noise", variable=self.analysis_inputs["cnr_formula"]).grid(row=0, column=0, sticky="w")
@@ -1171,13 +1280,14 @@ class DicomViewer:
         )
         self._analysis_comboboxes["cnr_noise"].grid(row=6, column=0, sticky="ew", pady=(2, 4))
         self._cnr_noise_widgets = [noise_label, self._analysis_comboboxes["cnr_noise"]]
-        ttk.Label(cnr_group, textvariable=self.signal_analysis_results["cnr_preview"]).grid(row=7, column=0, sticky="w", pady=(2, 0))
-        ttk.Label(cnr_group, textvariable=self.signal_analysis_results["cnr_result"]).grid(row=8, column=0, sticky="w", pady=(2, 0))
+        self._build_analysis_summary_label(cnr_group, self.signal_analysis_results["cnr_preview"]).grid(row=7, column=0, sticky="ew", pady=(2, 0))
+        self._build_analysis_summary_label(cnr_group, self.signal_analysis_results["cnr_result"]).grid(row=8, column=0, sticky="ew", pady=(2, 0))
         self._analysis_action_buttons["cnr"] = ttk.Button(cnr_group, text="Calculate CNR", command=self.calculate_cnr_from_inputs)
         self._analysis_action_buttons["cnr"].grid(row=9, column=0, sticky="ew", pady=(6, 0))
 
         uniformity_group = ttk.LabelFrame(uniformity_tab, text="Uniformity", padding=(8, 6))
-        uniformity_group.pack(fill="both", expand=True)
+        uniformity_group.pack(fill="x", anchor="n")
+        uniformity_group.columnconfigure(0, weight=1)
         ttk.Label(uniformity_group, text="Formula").grid(row=0, column=0, sticky="w")
         uniformity_formula_combo = ttk.Combobox(
             uniformity_group,
@@ -1210,17 +1320,18 @@ class DicomViewer:
         self._uniformity_roi_listbox.grid(row=5, column=0, sticky="ew", pady=(4, 4))
         ttk.Label(uniformity_group, text="Role filter (csv)").grid(row=6, column=0, sticky="w")
         ttk.Entry(uniformity_group, textvariable=self.analysis_inputs["uniformity_role_filter"], width=42).grid(row=7, column=0, sticky="ew", pady=(2, 4))
-        ttk.Label(uniformity_group, textvariable=self.signal_analysis_results["uniformity_preview"]).grid(row=8, column=0, sticky="w", pady=(2, 0))
-        ttk.Label(uniformity_group, textvariable=self.signal_analysis_results["uniformity_result"]).grid(row=9, column=0, sticky="w", pady=(2, 0))
+        self._build_analysis_summary_label(uniformity_group, self.signal_analysis_results["uniformity_preview"]).grid(row=8, column=0, sticky="ew", pady=(2, 0))
+        self._build_analysis_summary_label(uniformity_group, self.signal_analysis_results["uniformity_result"]).grid(row=9, column=0, sticky="ew", pady=(2, 0))
         ttk.Button(uniformity_group, text="Calculate Uniformity", command=self.calculate_uniformity_from_inputs).grid(row=10, column=0, sticky="ew", pady=(6, 0))
 
         line_group = ttk.LabelFrame(line_profile_tab, text="Line Profile", padding=(8, 6))
-        line_group.pack(fill="both", expand=True)
+        line_group.pack(fill="x", anchor="n")
+        line_group.columnconfigure(0, weight=1)
         ttk.Label(line_group, text="Input: Profile Line").grid(row=0, column=0, sticky="w")
         self._analysis_comboboxes["line_profile"] = ttk.Combobox(line_group, state="readonly", width=42)
         self._analysis_comboboxes["line_profile"].grid(row=1, column=0, sticky="ew", pady=(2, 4))
         ttk.Label(line_group, text="Formula: intensity(x) sampled along selected line").grid(row=2, column=0, sticky="w")
-        ttk.Label(line_group, textvariable=self.signal_analysis_results["line_info"]).grid(row=3, column=0, sticky="w", pady=(2, 0))
+        self._build_analysis_summary_label(line_group, self.signal_analysis_results["line_info"]).grid(row=3, column=0, sticky="ew", pady=(2, 0))
         ttk.Button(line_group, text="Show Line Profile", command=self.show_line_profile_for_selected_line).grid(row=4, column=0, sticky="ew", pady=(6, 0))
         ttk.Button(line_group, text="Show Feature Details", command=self.show_line_profile_feature_details).grid(row=5, column=0, sticky="ew", pady=(4, 0))
         ttk.Button(line_group, text="Export Profile CSV", command=self.export_selected_line_profile_csv).grid(row=6, column=0, sticky="ew", pady=(4, 0))
@@ -1539,16 +1650,27 @@ class DicomViewer:
         if mapped_id:
             self.analysis_inputs[input_key].set(mapped_id)
 
+    def _format_compact_path_label(self, path_text: str, max_chars: int = 54) -> str:
+        normalized = str(path_text or "").strip()
+        if not normalized:
+            return "No file"
+        return format_compact_path_label(normalized, max_chars=max_chars, empty_placeholder="No file")
+
+    def _build_analysis_summary_label(self, parent: ttk.Widget, textvariable: tk.StringVar, wraplength: int = 520) -> ttk.Label:
+        return ttk.Label(parent, textvariable=textvariable, justify="left", wraplength=wraplength)
+
     def _build_image_analysis_toolbar(self, tab: ttk.Frame) -> None:
         frame = ttk.Frame(tab)
         frame.pack(fill="x")
+        frame.columnconfigure(0, weight=1)
         pairing_group = ttk.LabelFrame(frame, text="Image Pairing", padding=(8, 6))
-        pairing_group.pack(side="left", padx=(0, 8), fill="y")
+        pairing_group.pack(side="left", padx=(0, 8), fill="both")
+        pairing_group.columnconfigure(0, weight=1)
         ttk.Label(pairing_group, text="Reference Image").grid(row=0, column=0, sticky="w")
-        self._image_analysis_comboboxes["reference_image"] = ttk.Combobox(pairing_group, state="readonly", width=52)
+        self._image_analysis_comboboxes["reference_image"] = ttk.Combobox(pairing_group, state="readonly", width=36)
         self._image_analysis_comboboxes["reference_image"].grid(row=1, column=0, sticky="ew", pady=(2, 4))
         ttk.Label(pairing_group, text="Target Image").grid(row=2, column=0, sticky="w")
-        self._image_analysis_comboboxes["target_image"] = ttk.Combobox(pairing_group, state="readonly", width=52)
+        self._image_analysis_comboboxes["target_image"] = ttk.Combobox(pairing_group, state="readonly", width=36)
         self._image_analysis_comboboxes["target_image"].grid(row=3, column=0, sticky="ew", pady=(2, 4))
         ttk.Button(pairing_group, text="현재 이미지를 Reference로", command=self._set_current_image_as_reference).grid(row=4, column=0, sticky="ew", pady=(4, 0))
         ttk.Button(pairing_group, text="현재 이미지를 Target으로", command=self._set_current_image_as_target).grid(row=5, column=0, sticky="ew", pady=(4, 0))
@@ -1561,8 +1683,8 @@ class DicomViewer:
         self._image_analysis_comboboxes["scope_roi"].grid(row=2, column=0, sticky="ew", pady=(6, 0))
 
         result_group = ttk.LabelFrame(frame, text="Image Metrics", padding=(8, 6))
-        result_group.pack(side="left", padx=(0, 8), fill="y")
-        ttk.Label(result_group, textvariable=self.image_analysis_results["iqa_pair_status"]).grid(row=0, column=0, sticky="w")
+        result_group.pack(side="left", padx=(0, 8), fill="both", expand=True)
+        self._build_analysis_summary_label(result_group, self.image_analysis_results["iqa_pair_status"], wraplength=560).grid(row=0, column=0, sticky="ew")
         option_row = ttk.Frame(result_group)
         option_row.grid(row=1, column=0, sticky="ew", pady=(4, 0))
         ttk.Label(option_row, text="Input").grid(row=0, column=0, sticky="w")
@@ -1575,8 +1697,8 @@ class DicomViewer:
         iqa_range_combo = ttk.Combobox(option_row, state="readonly", width=10, values=("auto", "bits", "actual_union"), textvariable=self.image_analysis_inputs["iqa_data_range_mode"])
         iqa_range_combo.grid(row=0, column=5, padx=(4, 6))
         ttk.Checkbutton(option_row, text="Photometric Invert", variable=self.image_analysis_inputs["iqa_photometric_invert"]).grid(row=0, column=6, sticky="w")
-        ttk.Label(result_group, textvariable=self.image_analysis_results["image_formula"]).grid(row=5, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(result_group, textvariable=self.image_analysis_results["image_result"]).grid(row=6, column=0, sticky="w", pady=(4, 0))
+        self._build_analysis_summary_label(result_group, self.image_analysis_results["image_formula"], wraplength=560).grid(row=5, column=0, sticky="ew", pady=(4, 0))
+        self._build_analysis_summary_label(result_group, self.image_analysis_results["image_result"], wraplength=560).grid(row=6, column=0, sticky="ew", pady=(4, 0))
         action_row = ttk.Frame(result_group)
         action_row.grid(row=3, column=0, sticky="ew", pady=(6, 0))
         ttk.Button(action_row, text=IQA_BUTTON_LABELS["set_ref"], command=self._set_iqa_reference_from_current).grid(row=0, column=0, padx=(0, 4))
@@ -1774,7 +1896,7 @@ class DicomViewer:
             except Exception:
                 measurement_mode = "unknown"
         return {
-            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             "image_name": self._current_image_name(),
             "image_path": self._get_current_image_path() if hasattr(self, "_get_current_image_path") else "",
             "frame_index": int(self.current_frame),
@@ -1798,7 +1920,7 @@ class DicomViewer:
         study = StudySession(
             study_id=study_id,
             name="Default Study",
-            created_at=datetime.utcnow().isoformat(),
+            created_at=datetime.now(timezone.utc).isoformat(),
             group_ids=[],
         )
         study_sessions[study_id] = study
@@ -1826,7 +1948,7 @@ class DicomViewer:
             study_id=study.study_id,
             source_image_path=current_path,
             image_name=current_image_name,
-            created_at=datetime.utcnow().isoformat(),
+            created_at=datetime.now(timezone.utc).isoformat(),
             entry_ids=[],
             frame_indices=[],
             roi_source_type=str(roi_source.get("roi_source_type", "manual")),
@@ -1894,7 +2016,7 @@ class DicomViewer:
                     study_id=str(study_id or group.study_id),
                     source_image_path=str(context.get("image_path", "")),
                     image_name=str(context.get("image_name", "N/A")),
-                    created_at=str(context.get("timestamp", datetime.utcnow().isoformat())),
+                    created_at=str(context.get("timestamp", datetime.now(timezone.utc).isoformat())),
                     frame_indices=[int(context.get("frame_index", 0))],
                 )
                 analysis_groups[group.group_id] = group
@@ -6181,7 +6303,7 @@ class DicomViewer:
         return {
             "user_schema": {
                 "version": "1.0",
-                "generated_at": datetime.utcnow().isoformat(),
+                "generated_at": datetime.now(timezone.utc).isoformat(),
                 "rows": user_rows,
             },
             "developer_meta": {
@@ -6190,7 +6312,989 @@ class DicomViewer:
             },
         }
 
-    def export_analysis_results_json(self) -> None:
+    def _get_exportable_analysis_results(self) -> dict[str, dict[str, Any]]:
+        normalized = dict(getattr(self, "analysis_last_run_normalized", {}) or {})
+        if normalized:
+            return normalized
+        raw_last_run = dict(getattr(self, "analysis_last_run", {}) or {})
+        if raw_last_run:
+            normalized = normalize_analysis_last_run(raw_last_run)
+            self.analysis_last_run_normalized = normalized
+            return normalized
+        raise ValueError("No analysis results available for export")
+
+    def export_analysis_results_json(self, path: str | None = None) -> str | None:
+        if path is None:
+            path = filedialog.asksaveasfilename(
+                title="분석 결과 JSON 저장",
+                defaultextension=".json",
+                filetypes=[("JSON", "*.json"), ("All Files", "*.*")],
+            )
+        if not path:
+            return None
+        normalized_results = self._get_exportable_analysis_results()
+        return export_analysis_results_to_json(
+            normalized_results,
+            path=path,
+            metadata={"app": "moduba", "export_source": "viewer"},
+        )
+
+    def export_analysis_results_csv(self, path: str | None = None) -> str | None:
+        if path is None:
+            path = filedialog.asksaveasfilename(
+                title="분석 결과 CSV 저장",
+                defaultextension=".csv",
+                filetypes=[("CSV", "*.csv"), ("All Files", "*.*")],
+            )
+        if not path:
+            return None
+        normalized_results = self._get_exportable_analysis_results()
+        return export_analysis_results_to_csv(
+            normalized_results,
+            path=path,
+            metadata={"app": "moduba", "export_source": "viewer"},
+        )
+
+    def _get_reportable_analysis_results(self) -> dict[str, dict[str, Any]]:
+        return self._get_exportable_analysis_results()
+
+    def _resolve_threshold_config_for_report(self, threshold_config: dict[str, Any] | None = None, use_selected_threshold_config: bool = False) -> dict[str, Any] | None:
+        if threshold_config is not None:
+            return threshold_config
+        if use_selected_threshold_config:
+            current = getattr(self, "current_threshold_config", None)
+            if not current:
+                raise ValueError("current_threshold_config is empty")
+            return current
+        return None
+
+    def build_current_analysis_report_model(self, metadata: dict[str, Any] | None = None, threshold_config: dict[str, Any] | None = None, use_selected_threshold_config: bool = False) -> dict[str, Any]:
+        normalized_results = self._get_reportable_analysis_results()
+        base_metadata = {"app": "moduba", "report_source": "viewer"}
+        if metadata:
+            base_metadata.update(dict(metadata))
+        resolved = self._resolve_threshold_config_for_report(threshold_config=threshold_config, use_selected_threshold_config=use_selected_threshold_config)
+        threshold_eval = self.evaluate_current_analysis_thresholds(resolved) if resolved is not None else None
+        return build_analysis_report_model(normalized_results, metadata=base_metadata, threshold_evaluation=threshold_eval)
+
+    def render_current_analysis_report_markdown(self, metadata: dict[str, Any] | None = None, threshold_config: dict[str, Any] | None = None, use_selected_threshold_config: bool = False) -> str:
+        report_model = self.build_current_analysis_report_model(metadata=metadata, threshold_config=threshold_config, use_selected_threshold_config=use_selected_threshold_config)
+        return render_analysis_report_markdown(report_model)
+
+    def export_analysis_report_markdown(self, path: str | None = None, metadata: dict[str, Any] | None = None, threshold_config: dict[str, Any] | None = None, use_selected_threshold_config: bool = False) -> str | None:
+        if path is None:
+            path = filedialog.asksaveasfilename(
+                title="분석 리포트 Markdown 저장",
+                defaultextension=".md",
+                filetypes=[("Markdown", "*.md"), ("Text", "*.txt"), ("All Files", "*.*")],
+            )
+        if not path:
+            return None
+        text = self.render_current_analysis_report_markdown(metadata=metadata, threshold_config=threshold_config, use_selected_threshold_config=use_selected_threshold_config)
+        Path(path).write_text(text, encoding="utf-8")
+        return text
+
+    def export_analysis_report_pdf(self, path: str | None = None, metadata: dict[str, Any] | None = None, threshold_config: dict[str, Any] | None = None, use_selected_threshold_config: bool = False) -> bytes | None:
+        if path is None:
+            path = filedialog.asksaveasfilename(
+                title="분석 리포트 PDF 저장",
+                defaultextension=".pdf",
+                filetypes=[("PDF", "*.pdf"), ("All Files", "*.*")],
+            )
+        if not path:
+            return None
+        report_metadata = {"report_format": "pdf"}
+        if metadata:
+            report_metadata.update(dict(metadata))
+        report_model = self.build_current_analysis_report_model(metadata=report_metadata, threshold_config=threshold_config, use_selected_threshold_config=use_selected_threshold_config)
+        return export_analysis_report_to_pdf(report_model, path=path)
+
+    def build_current_analysis_report_preview_text(self, metadata: dict[str, Any] | None = None, threshold_config: dict[str, Any] | None = None, use_selected_threshold_config: bool = False) -> str:
+        preview_metadata = {"report_view": "preview"}
+        if metadata:
+            preview_metadata.update(dict(metadata))
+        return self.render_current_analysis_report_markdown(metadata=preview_metadata, threshold_config=threshold_config, use_selected_threshold_config=use_selected_threshold_config)
+
+    def show_analysis_report_preview(self, metadata: dict[str, Any] | None = None) -> str:
+        text = self.build_current_analysis_report_preview_text(metadata=metadata)
+        owner = getattr(self, "master", None) or getattr(self, "root", None) or getattr(self, "window", None)
+        preview = tk.Toplevel(owner) if owner is not None else tk.Toplevel()
+        preview.title("QC Report Preview")
+        preview.geometry("900x700")
+        container = ttk.Frame(preview, padding=8)
+        container.pack(fill="both", expand=True)
+        text_widget = tk.Text(container, wrap="word")
+        text_widget.pack(side="left", fill="both", expand=True)
+        scroll = ttk.Scrollbar(container, orient="vertical", command=text_widget.yview)
+        scroll.pack(side="right", fill="y")
+        text_widget.configure(yscrollcommand=scroll.set)
+        text_widget.insert("1.0", text)
+        text_widget.configure(state="disabled")
+        return text
+
+    def build_current_analysis_history_record(self, metadata: dict[str, Any] | None = None, record_id: str | None = None, threshold_config: dict[str, Any] | None = None, use_selected_threshold_config: bool = False) -> dict[str, Any]:
+        normalized_results = self._get_reportable_analysis_results()
+        base_metadata = {"app": "moduba", "history_source": "viewer"}
+        if metadata:
+            base_metadata.update(dict(metadata))
+        resolved = self._resolve_threshold_config_for_report(threshold_config=threshold_config, use_selected_threshold_config=use_selected_threshold_config)
+        threshold_eval = self.evaluate_current_analysis_thresholds(resolved) if resolved is not None else None
+        return build_analysis_history_record(normalized_results, metadata=base_metadata, record_id=record_id, threshold_evaluation=threshold_eval)
+
+    def append_current_analysis_history(self, history_path: str | Path, metadata: dict[str, Any] | None = None, record_id: str | None = None, threshold_config: dict[str, Any] | None = None, use_selected_threshold_config: bool = False) -> dict[str, Any]:
+        record = self.build_current_analysis_history_record(metadata=metadata, record_id=record_id, threshold_config=threshold_config, use_selected_threshold_config=use_selected_threshold_config)
+        append_analysis_history_record(history_path, record)
+        return record
+
+    def load_analysis_history_for_viewer(self, path: str | Path) -> list[dict[str, Any]]:
+        return load_analysis_history_records(path)
+
+    def build_analysis_history_summary_for_viewer(self, path: str | Path | None = None, analysis_type: str | None = None, validity: str | None = None) -> dict[str, Any] | None:
+        if path is None:
+            path = filedialog.askopenfilename(title="QC history JSONL 선택", filetypes=[("JSONL", "*.jsonl"), ("All Files", "*.*")])
+            if not path:
+                return None
+        return build_history_summary(self.load_analysis_history_for_viewer(path), analysis_type=analysis_type, validity=validity)
+
+    def render_analysis_history_summary_text_for_viewer(self, path: str | Path | None = None, analysis_type: str | None = None, validity: str | None = None) -> str | None:
+        s = self.build_analysis_history_summary_for_viewer(path=path, analysis_type=analysis_type, validity=validity)
+        return None if s is None else render_history_summary_text(s)
+
+    def build_metric_trend_series_for_viewer(self, path: str | Path | None = None, analysis_type: str | None = None, metric_name: str | None = None) -> dict[str, Any] | None:
+        if not analysis_type or not metric_name:
+            raise ValueError("analysis_type and metric_name are required")
+        if path is None:
+            path = filedialog.askopenfilename(title="QC history JSONL 선택", filetypes=[("JSONL", "*.jsonl"), ("All Files", "*.*")])
+            if not path:
+                return None
+        return build_metric_trend_series(self.load_analysis_history_for_viewer(path), analysis_type=analysis_type, metric_name=metric_name)
+
+    def render_metric_trend_text_for_viewer(self, path: str | Path | None = None, analysis_type: str | None = None, metric_name: str | None = None) -> str | None:
+        t = self.build_metric_trend_series_for_viewer(path=path, analysis_type=analysis_type, metric_name=metric_name)
+        return None if t is None else render_metric_trend_text(t)
+
+    def show_analysis_history_summary_viewer(self, path: str | Path | None = None) -> str | None:
+        text = self.render_analysis_history_summary_text_for_viewer(path=path)
+        if text is None:
+            return None
+        owner = getattr(self, "master", None) or getattr(self, "root", None) or getattr(self, "window", None)
+        win = tk.Toplevel(owner) if owner is not None else tk.Toplevel()
+        win.title("QC History Summary")
+        win.geometry("900x700")
+        t = tk.Text(win, wrap="word")
+        t.pack(fill="both", expand=True)
+        t.insert("1.0", text)
+        t.configure(state="disabled")
+        return text
+
+    def build_metric_trend_chart_model_for_viewer(self, path: str | Path | None = None, analysis_type: str | None = None, metric_name: str | None = None) -> dict[str, Any] | None:
+        series = self.build_metric_trend_series_for_viewer(path=path, analysis_type=analysis_type, metric_name=metric_name)
+        return None if series is None else build_metric_trend_chart_model(series)
+
+    def render_metric_trend_chart_text_for_viewer(self, path: str | Path | None = None, analysis_type: str | None = None, metric_name: str | None = None) -> str | None:
+        model = self.build_metric_trend_chart_model_for_viewer(path=path, analysis_type=analysis_type, metric_name=metric_name)
+        return None if model is None else render_metric_trend_chart_text(model)
+
+    def show_metric_trend_chart_viewer(self, path: str | Path | None = None, analysis_type: str | None = None, metric_name: str | None = None) -> dict[str, Any] | None:
+        model = self.build_metric_trend_chart_model_for_viewer(path=path, analysis_type=analysis_type, metric_name=metric_name)
+        if model is None:
+            return None
+        owner = getattr(self, "master", None) or getattr(self, "root", None) or getattr(self, "window", None)
+        win = tk.Toplevel(owner) if owner is not None else tk.Toplevel()
+        win.title("Metric Trend Chart")
+        win.geometry("900x700")
+        canvas = tk.Canvas(win, width=860, height=360, bg="white")
+        canvas.pack(fill="x")
+        text = tk.Text(win, wrap="word")
+        text.pack(fill="both", expand=True)
+        text.insert("1.0", render_metric_trend_chart_text(model))
+        text.configure(state="disabled")
+        pts = model.get("points") or []
+        if pts:
+            left, top, width, height = 40, 20, 780, 300
+            ys = [p["y"] for p in pts]
+            ymin, ymax = min(ys), max(ys)
+            span = (ymax - ymin) if ymax != ymin else 1.0
+            coords = []
+            for i, p in enumerate(pts):
+                x = left + (i * width / max(1, len(pts) - 1))
+                y = top + height - ((p["y"] - ymin) / span) * height
+                coords.extend([x, y])
+                canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill="blue", outline="blue")
+            if len(coords) >= 4:
+                canvas.create_line(*coords, fill="blue")
+        return model
+
+    def _resolve_threshold_config_for_batch(self, threshold_config: dict[str, Any] | None = None, use_selected_threshold_config: bool = False) -> dict[str, Any] | None:
+        if threshold_config is not None:
+            return dict(threshold_config)
+        if not use_selected_threshold_config:
+            return None
+        current = getattr(self, "current_threshold_config", None)
+        if current is None:
+            raise ValueError("current_threshold_config is empty")
+        return dict(current)
+
+    def build_batch_qc_run_for_viewer(self, path: str | Path | None = None, threshold_config: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, batch_id: str | None = None, use_selected_threshold_config: bool = False) -> dict[str, Any] | None:
+        if path is None:
+            path = filedialog.askopenfilename(title="QC history JSONL 선택", filetypes=[("JSONL", "*.jsonl"), ("All Files", "*.*")])
+            if not path:
+                return None
+        resolved = self._resolve_threshold_config_for_batch(threshold_config=threshold_config, use_selected_threshold_config=use_selected_threshold_config)
+        return build_batch_qc_run(self.load_analysis_history_for_viewer(path), threshold_config=resolved, metadata=metadata, batch_id=batch_id)
+
+    def render_batch_qc_summary_text_for_viewer(self, path: str | Path | None = None, threshold_config: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, batch_id: str | None = None, use_selected_threshold_config: bool = False) -> str | None:
+        run = self.build_batch_qc_run_for_viewer(path=path, threshold_config=threshold_config, metadata=metadata, batch_id=batch_id, use_selected_threshold_config=use_selected_threshold_config)
+        return None if run is None else render_batch_qc_summary_text(run)
+
+    def export_batch_qc_run_json_for_viewer(self, path: str | None = None, history_path: str | Path | None = None, threshold_config: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, batch_id: str | None = None, use_selected_threshold_config: bool = False) -> str | None:
+        run = self.build_batch_qc_run_for_viewer(path=history_path, threshold_config=threshold_config, metadata=metadata, batch_id=batch_id, use_selected_threshold_config=use_selected_threshold_config)
+        if run is None:
+            return None
+        if path is None:
+            path = filedialog.asksaveasfilename(title="Batch QC JSON 저장", defaultextension=".json", filetypes=[("JSON", "*.json"), ("All Files", "*.*")])
+            if not path:
+                return None
+        return export_batch_qc_run_to_json(run, path=path)
+
+    def export_batch_qc_run_csv_for_viewer(self, path: str | None = None, history_path: str | Path | None = None, threshold_config: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, batch_id: str | None = None, use_selected_threshold_config: bool = False) -> str | None:
+        run = self.build_batch_qc_run_for_viewer(path=history_path, threshold_config=threshold_config, metadata=metadata, batch_id=batch_id, use_selected_threshold_config=use_selected_threshold_config)
+        if run is None:
+            return None
+        if path is None:
+            path = filedialog.asksaveasfilename(title="Batch QC CSV 저장", defaultextension=".csv", filetypes=[("CSV", "*.csv"), ("All Files", "*.*")])
+            if not path:
+                return None
+        return export_batch_qc_run_to_csv(run, path=path)
+
+    def show_batch_qc_summary_viewer(self, path: str | Path | None = None, threshold_config: dict[str, Any] | None = None, use_selected_threshold_config: bool = False) -> str | None:
+        text = self.render_batch_qc_summary_text_for_viewer(path=path, threshold_config=threshold_config, use_selected_threshold_config=use_selected_threshold_config)
+        if text is None:
+            return None
+        owner = getattr(self, "master", None) or getattr(self, "root", None) or getattr(self, "window", None)
+        win = tk.Toplevel(owner) if owner is not None else tk.Toplevel()
+        win.title("Batch QC Summary")
+        win.geometry("900x700")
+        t = tk.Text(win, wrap="word"); t.pack(fill="both", expand=True); t.insert("1.0", text); t.configure(state="disabled")
+        return text
+
+    def build_batch_qc_run_with_selected_threshold_for_viewer(self, path: str | Path | None = None, metadata: dict[str, Any] | None = None, batch_id: str | None = None) -> dict[str, Any] | None:
+        return self.build_batch_qc_run_for_viewer(path=path, metadata=metadata, batch_id=batch_id, use_selected_threshold_config=True)
+
+    def render_batch_qc_summary_text_with_selected_threshold_for_viewer(self, path: str | Path | None = None, metadata: dict[str, Any] | None = None, batch_id: str | None = None) -> str | None:
+        return self.render_batch_qc_summary_text_for_viewer(path=path, metadata=metadata, batch_id=batch_id, use_selected_threshold_config=True)
+
+    def export_batch_qc_run_json_with_selected_threshold_for_viewer(self, path: str | None = None, history_path: str | Path | None = None, metadata: dict[str, Any] | None = None, batch_id: str | None = None) -> str | None:
+        return self.export_batch_qc_run_json_for_viewer(path=path, history_path=history_path, metadata=metadata, batch_id=batch_id, use_selected_threshold_config=True)
+
+    def export_batch_qc_run_csv_with_selected_threshold_for_viewer(self, path: str | None = None, history_path: str | Path | None = None, metadata: dict[str, Any] | None = None, batch_id: str | None = None) -> str | None:
+        return self.export_batch_qc_run_csv_for_viewer(path=path, history_path=history_path, metadata=metadata, batch_id=batch_id, use_selected_threshold_config=True)
+
+    def show_batch_qc_summary_with_selected_threshold_viewer(self, path: str | Path | None = None) -> str | None:
+        return self.show_batch_qc_summary_viewer(path=path, use_selected_threshold_config=True)
+
+    def build_dicom_batch_manifest_for_viewer(self, paths: list[str] | tuple[str, ...] | None = None, recursive: bool = True, metadata: dict[str, Any] | None = None, manifest_id: str | None = None) -> dict[str, Any] | None:
+        if paths is None:
+            picked = filedialog.askopenfilenames(title="Batch DICOM 파일 선택", filetypes=[("DICOM", "*.dcm"), ("All Files", "*.*")])
+            if not picked:
+                return None
+            paths = list(picked)
+        m = build_dicom_batch_manifest(paths, recursive=recursive, metadata=metadata, manifest_id=manifest_id)
+        self.current_dicom_batch_manifest = m
+        return m
+
+    def render_dicom_batch_manifest_text_for_viewer(self, paths: list[str] | tuple[str, ...] | None = None, recursive: bool = True, metadata: dict[str, Any] | None = None, manifest_id: str | None = None) -> str | None:
+        m = self.build_dicom_batch_manifest_for_viewer(paths=paths, recursive=recursive, metadata=metadata, manifest_id=manifest_id)
+        return None if m is None else render_dicom_batch_manifest_text(m)
+
+    def export_dicom_batch_manifest_json_for_viewer(self, path: str | None = None, source_paths: list[str] | tuple[str, ...] | None = None, recursive: bool = True, metadata: dict[str, Any] | None = None, manifest_id: str | None = None) -> str | None:
+        m = self.build_dicom_batch_manifest_for_viewer(paths=source_paths, recursive=recursive, metadata=metadata, manifest_id=manifest_id)
+        if m is None:
+            return None
+        if path is None:
+            path = filedialog.asksaveasfilename(title="DICOM Batch Manifest JSON 저장", defaultextension=".json", filetypes=[("JSON", "*.json"), ("All Files", "*.*")])
+            if not path:
+                return None
+        return export_dicom_batch_manifest_to_json(m, path=path)
+
+    def export_dicom_batch_manifest_csv_for_viewer(self, path: str | None = None, source_paths: list[str] | tuple[str, ...] | None = None, recursive: bool = True, metadata: dict[str, Any] | None = None, manifest_id: str | None = None) -> str | None:
+        m = self.build_dicom_batch_manifest_for_viewer(paths=source_paths, recursive=recursive, metadata=metadata, manifest_id=manifest_id)
+        if m is None:
+            return None
+        if path is None:
+            path = filedialog.asksaveasfilename(title="DICOM Batch Manifest CSV 저장", defaultextension=".csv", filetypes=[("CSV", "*.csv"), ("All Files", "*.*")])
+            if not path:
+                return None
+        return export_dicom_batch_manifest_to_csv(m, path=path)
+
+    def show_dicom_batch_manifest_viewer(self, paths: list[str] | tuple[str, ...] | None = None, recursive: bool = True) -> str | None:
+        text = self.render_dicom_batch_manifest_text_for_viewer(paths=paths, recursive=recursive)
+        if text is None:
+            return None
+        owner = getattr(self, "master", None) or getattr(self, "root", None) or getattr(self, "window", None)
+        win = tk.Toplevel(owner) if owner is not None else tk.Toplevel()
+        win.title("DICOM Batch Manifest")
+        win.geometry("900x700")
+        t = tk.Text(win, wrap="word"); t.pack(fill="both", expand=True); t.insert("1.0", text); t.configure(state="disabled")
+        return text
+
+    def build_current_roi_preset(self, name: str = "Untitled ROI preset", description: str = "", metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        rois = getattr(self, "roi_definitions", None)
+        if not isinstance(rois, list):
+            rois = (getattr(self, "current_roi_preset", {}) or {}).get("roi_definitions") or []
+        return build_roi_preset_from_roi_definitions(rois, name=name, description=description, metadata=metadata)
+
+    def load_roi_preset_for_viewer(self, path: str | None = None) -> dict[str, Any] | None:
+        if path is None:
+            path = filedialog.askopenfilename(title="ROI preset JSON 선택", filetypes=[("JSON", "*.json"), ("All Files", "*.*")])
+            if not path:
+                return None
+        self.current_roi_preset = load_roi_preset(path)
+        return self.current_roi_preset
+
+    def save_current_roi_preset(self, path: str | None = None, name: str = "Untitled ROI preset", description: str = "", metadata: dict[str, Any] | None = None) -> str | None:
+        preset = getattr(self, "current_roi_preset", None) or self.build_current_roi_preset(name=name, description=description, metadata=metadata)
+        if path is None:
+            path = filedialog.asksaveasfilename(title="ROI preset JSON 저장", defaultextension=".json", filetypes=[("JSON", "*.json"), ("All Files", "*.*")])
+            if not path:
+                return None
+        return export_roi_preset_to_json(preset, path=path)
+
+    def render_current_roi_preset_text(self) -> str:
+        preset = getattr(self, "current_roi_preset", None) or self.build_current_roi_preset()
+        return render_roi_preset_text(preset)
+
+    def show_current_roi_preset_preview(self) -> str:
+        text = self.render_current_roi_preset_text()
+        owner = getattr(self, "master", None) or getattr(self, "root", None) or getattr(self, "window", None)
+        win = tk.Toplevel(owner) if owner is not None else tk.Toplevel()
+        win.title("ROI Preset Preview")
+        win.geometry("900x700")
+        t = tk.Text(win, wrap="word"); t.pack(fill="both", expand=True); t.insert("1.0", text); t.configure(state="disabled")
+        return text
+
+    def build_dicom_batch_analysis_plan_for_viewer(self, manifest: dict[str, Any] | None = None, roi_preset: dict[str, Any] | None = None, analyses: list[str] | None = None, metadata: dict[str, Any] | None = None, plan_id: str | None = None) -> dict[str, Any]:
+        m = manifest or getattr(self, "current_dicom_batch_manifest", None)
+        if m is None:
+            raise ValueError("current_dicom_batch_manifest is empty")
+        p = roi_preset or getattr(self, "current_roi_preset", None)
+        if p is None:
+            raise ValueError("current_roi_preset is empty")
+        plan = build_dicom_batch_analysis_plan(m, p, analyses=analyses, metadata=metadata, plan_id=plan_id)
+        self.current_dicom_batch_analysis_plan = plan
+        return plan
+
+    def render_dicom_batch_analysis_plan_text_for_viewer(self, manifest: dict[str, Any] | None = None, roi_preset: dict[str, Any] | None = None, analyses: list[str] | None = None, metadata: dict[str, Any] | None = None, plan_id: str | None = None) -> str:
+        return render_dicom_batch_analysis_plan_text(self.build_dicom_batch_analysis_plan_for_viewer(manifest=manifest, roi_preset=roi_preset, analyses=analyses, metadata=metadata, plan_id=plan_id))
+
+    def export_dicom_batch_analysis_plan_json_for_viewer(self, path: str | None = None, manifest: dict[str, Any] | None = None, roi_preset: dict[str, Any] | None = None, analyses: list[str] | None = None, metadata: dict[str, Any] | None = None, plan_id: str | None = None) -> str | None:
+        plan = self.build_dicom_batch_analysis_plan_for_viewer(manifest=manifest, roi_preset=roi_preset, analyses=analyses, metadata=metadata, plan_id=plan_id)
+        if path is None:
+            path = filedialog.asksaveasfilename(title="DICOM Batch Plan JSON 저장", defaultextension=".json", filetypes=[("JSON", "*.json"), ("All Files", "*.*")])
+            if not path:
+                return None
+        return export_dicom_batch_analysis_plan_to_json(plan, path=path)
+
+    def export_dicom_batch_analysis_plan_csv_for_viewer(self, path: str | None = None, manifest: dict[str, Any] | None = None, roi_preset: dict[str, Any] | None = None, analyses: list[str] | None = None, metadata: dict[str, Any] | None = None, plan_id: str | None = None) -> str | None:
+        plan = self.build_dicom_batch_analysis_plan_for_viewer(manifest=manifest, roi_preset=roi_preset, analyses=analyses, metadata=metadata, plan_id=plan_id)
+        if path is None:
+            path = filedialog.asksaveasfilename(title="DICOM Batch Plan CSV 저장", defaultextension=".csv", filetypes=[("CSV", "*.csv"), ("All Files", "*.*")])
+            if not path:
+                return None
+        return export_dicom_batch_analysis_plan_to_csv(plan, path=path)
+
+    def show_dicom_batch_analysis_plan_viewer(self, manifest: dict[str, Any] | None = None, roi_preset: dict[str, Any] | None = None, analyses: list[str] | None = None) -> str:
+        text = self.render_dicom_batch_analysis_plan_text_for_viewer(manifest=manifest, roi_preset=roi_preset, analyses=analyses)
+        owner = getattr(self, "master", None) or getattr(self, "root", None) or getattr(self, "window", None)
+        win = tk.Toplevel(owner) if owner is not None else tk.Toplevel()
+        win.title("DICOM Batch Analysis Plan")
+        win.geometry("900x700")
+        t = tk.Text(win, wrap="word"); t.pack(fill="both", expand=True); t.insert("1.0", text); t.configure(state="disabled")
+        return text
+
+    def build_roi_bounds_validation_for_viewer(self, manifest: dict[str, Any] | None = None, roi_preset: dict[str, Any] | None = None, analyses: list[str] | None = None, metadata: dict[str, Any] | None = None, validation_id: str | None = None) -> dict[str, Any]:
+        m = manifest or getattr(self, "current_dicom_batch_manifest", None)
+        if m is None:
+            raise ValueError("current_dicom_batch_manifest is empty")
+        p = roi_preset or getattr(self, "current_roi_preset", None)
+        if p is None:
+            raise ValueError("current_roi_preset is empty")
+        result = build_roi_bounds_validation_result(m, p, analyses=analyses, metadata=metadata, validation_id=validation_id)
+        self.current_roi_bounds_validation = result
+        return result
+
+    def build_dicom_batch_execution_plan_for_viewer(self, batch_plan: dict[str, Any] | None = None, bounds_validation: dict[str, Any] | None = None, analyses: list[str] | None = None, metadata: dict[str, Any] | None = None, execution_plan_id: str | None = None) -> dict[str, Any]:
+        plan = batch_plan if batch_plan is not None else getattr(self, "current_dicom_batch_analysis_plan", None)
+        if plan is None:
+            raise ValueError("current_dicom_batch_analysis_plan is empty")
+        bounds = bounds_validation if bounds_validation is not None else getattr(self, "current_roi_bounds_validation", None)
+        if bounds is None:
+            raise ValueError("current_roi_bounds_validation is empty")
+        execution_plan = build_dicom_batch_execution_plan(plan, bounds, analyses=analyses, metadata=metadata, execution_plan_id=execution_plan_id)
+        self.current_dicom_batch_execution_plan = execution_plan
+        return execution_plan
+
+    def render_dicom_batch_execution_plan_text_for_viewer(self, batch_plan: dict[str, Any] | None = None, bounds_validation: dict[str, Any] | None = None, analyses: list[str] | None = None, metadata: dict[str, Any] | None = None, execution_plan_id: str | None = None) -> str:
+        plan = DicomViewer.build_dicom_batch_execution_plan_for_viewer(self, batch_plan=batch_plan, bounds_validation=bounds_validation, analyses=analyses, metadata=metadata, execution_plan_id=execution_plan_id)
+        return render_dicom_batch_execution_plan_text(plan)
+
+    def export_dicom_batch_execution_plan_json_for_viewer(self, path: str | None = None, batch_plan: dict[str, Any] | None = None, bounds_validation: dict[str, Any] | None = None, analyses: list[str] | None = None, metadata: dict[str, Any] | None = None, execution_plan_id: str | None = None) -> str | None:
+        if path is None:
+            path = filedialog.asksaveasfilename(title="DICOM Batch Execution Plan JSON 저장", defaultextension=".json", filetypes=[("JSON", "*.json"), ("All Files", "*.*")])
+            if not path:
+                return None
+        plan = DicomViewer.build_dicom_batch_execution_plan_for_viewer(self, batch_plan=batch_plan, bounds_validation=bounds_validation, analyses=analyses, metadata=metadata, execution_plan_id=execution_plan_id)
+        return export_dicom_batch_execution_plan_to_json(plan, path=path)
+
+    def export_dicom_batch_execution_plan_csv_for_viewer(self, path: str | None = None, batch_plan: dict[str, Any] | None = None, bounds_validation: dict[str, Any] | None = None, analyses: list[str] | None = None, metadata: dict[str, Any] | None = None, execution_plan_id: str | None = None) -> str | None:
+        if path is None:
+            path = filedialog.asksaveasfilename(title="DICOM Batch Execution Plan CSV 저장", defaultextension=".csv", filetypes=[("CSV", "*.csv"), ("All Files", "*.*")])
+            if not path:
+                return None
+        plan = DicomViewer.build_dicom_batch_execution_plan_for_viewer(self, batch_plan=batch_plan, bounds_validation=bounds_validation, analyses=analyses, metadata=metadata, execution_plan_id=execution_plan_id)
+        return export_dicom_batch_execution_plan_to_csv(plan, path=path)
+
+    def show_dicom_batch_execution_plan_viewer(self, batch_plan: dict[str, Any] | None = None, bounds_validation: dict[str, Any] | None = None, analyses: list[str] | None = None) -> str:
+        text = DicomViewer.render_dicom_batch_execution_plan_text_for_viewer(self, batch_plan=batch_plan, bounds_validation=bounds_validation, analyses=analyses)
+        owner = getattr(self, "master", None) or getattr(self, "root", None) or getattr(self, "window", None)
+        win = tk.Toplevel(owner) if owner is not None else tk.Toplevel()
+        win.title("DICOM Batch Execution Plan")
+        win.geometry("900x700")
+        t = tk.Text(win, wrap="word"); t.pack(fill="both", expand=True); t.insert("1.0", text); t.configure(state="disabled")
+        return text
+
+    def build_dicom_batch_execution_result_for_viewer(self, execution_plan: dict[str, Any] | None = None, roi_preset: dict[str, Any] | None = None, analysis_executor=None, metadata: dict[str, Any] | None = None, run_id: str | None = None) -> dict[str, Any]:
+        plan = execution_plan if execution_plan is not None else getattr(self, "current_dicom_batch_execution_plan", None)
+        if plan is None:
+            raise ValueError("current_dicom_batch_execution_plan is empty")
+        preset = roi_preset if roi_preset is not None else getattr(self, "current_roi_preset", None)
+        if preset is None:
+            raise ValueError("current_roi_preset is empty")
+        result = build_dicom_batch_execution_result(plan, preset, analysis_executor=analysis_executor, metadata=metadata, run_id=run_id)
+        self.current_dicom_batch_execution_result = result
+        return result
+
+    def render_dicom_batch_execution_result_text_for_viewer(self, execution_plan: dict[str, Any] | None = None, roi_preset: dict[str, Any] | None = None, analysis_executor=None, metadata: dict[str, Any] | None = None, run_id: str | None = None) -> str:
+        result = DicomViewer.build_dicom_batch_execution_result_for_viewer(self, execution_plan=execution_plan, roi_preset=roi_preset, analysis_executor=analysis_executor, metadata=metadata, run_id=run_id)
+        return render_dicom_batch_execution_result_text(result)
+
+    def export_dicom_batch_execution_result_json_for_viewer(self, path: str | None = None, execution_plan: dict[str, Any] | None = None, roi_preset: dict[str, Any] | None = None, analysis_executor=None, metadata: dict[str, Any] | None = None, run_id: str | None = None) -> str | None:
+        if path is None:
+            path = filedialog.asksaveasfilename(title="DICOM Batch Execution Result JSON 저장", defaultextension=".json", filetypes=[("JSON", "*.json"), ("All Files", "*.*")])
+            if not path:
+                return None
+        result = DicomViewer.build_dicom_batch_execution_result_for_viewer(self, execution_plan=execution_plan, roi_preset=roi_preset, analysis_executor=analysis_executor, metadata=metadata, run_id=run_id)
+        return export_dicom_batch_execution_result_to_json(result, path=path)
+
+    def export_dicom_batch_execution_result_csv_for_viewer(self, path: str | None = None, execution_plan: dict[str, Any] | None = None, roi_preset: dict[str, Any] | None = None, analysis_executor=None, metadata: dict[str, Any] | None = None, run_id: str | None = None) -> str | None:
+        if path is None:
+            path = filedialog.asksaveasfilename(title="DICOM Batch Execution Result CSV 저장", defaultextension=".csv", filetypes=[("CSV", "*.csv"), ("All Files", "*.*")])
+            if not path:
+                return None
+        result = DicomViewer.build_dicom_batch_execution_result_for_viewer(self, execution_plan=execution_plan, roi_preset=roi_preset, analysis_executor=analysis_executor, metadata=metadata, run_id=run_id)
+        return export_dicom_batch_execution_result_to_csv(result, path=path)
+
+    def show_dicom_batch_execution_result_viewer(self, execution_plan: dict[str, Any] | None = None, roi_preset: dict[str, Any] | None = None, analysis_executor=None) -> str:
+        text = DicomViewer.render_dicom_batch_execution_result_text_for_viewer(self, execution_plan=execution_plan, roi_preset=roi_preset, analysis_executor=analysis_executor)
+        owner = getattr(self, "master", None) or getattr(self, "root", None) or getattr(self, "window", None)
+        win = tk.Toplevel(owner) if owner is not None else tk.Toplevel()
+        win.title("DICOM Batch Execution Result")
+        win.geometry("900x700")
+        t = tk.Text(win, wrap="word"); t.pack(fill="both", expand=True); t.insert("1.0", text); t.configure(state="disabled")
+        return text
+
+    def render_roi_bounds_validation_text_for_viewer(self, manifest: dict[str, Any] | None = None, roi_preset: dict[str, Any] | None = None, analyses: list[str] | None = None, metadata: dict[str, Any] | None = None, validation_id: str | None = None) -> str:
+        return render_roi_bounds_validation_text(self.build_roi_bounds_validation_for_viewer(manifest=manifest, roi_preset=roi_preset, analyses=analyses, metadata=metadata, validation_id=validation_id))
+
+    def export_roi_bounds_validation_json_for_viewer(self, path: str | None = None, manifest: dict[str, Any] | None = None, roi_preset: dict[str, Any] | None = None, analyses: list[str] | None = None, metadata: dict[str, Any] | None = None, validation_id: str | None = None) -> str | None:
+        result = self.build_roi_bounds_validation_for_viewer(manifest=manifest, roi_preset=roi_preset, analyses=analyses, metadata=metadata, validation_id=validation_id)
+        if path is None:
+            path = filedialog.asksaveasfilename(title="ROI Bounds Validation JSON 저장", defaultextension=".json", filetypes=[("JSON", "*.json"), ("All Files", "*.*")])
+            if not path:
+                return None
+        return export_roi_bounds_validation_to_json(result, path=path)
+
+    def export_roi_bounds_validation_csv_for_viewer(self, path: str | None = None, manifest: dict[str, Any] | None = None, roi_preset: dict[str, Any] | None = None, analyses: list[str] | None = None, metadata: dict[str, Any] | None = None, validation_id: str | None = None) -> str | None:
+        result = self.build_roi_bounds_validation_for_viewer(manifest=manifest, roi_preset=roi_preset, analyses=analyses, metadata=metadata, validation_id=validation_id)
+        if path is None:
+            path = filedialog.asksaveasfilename(title="ROI Bounds Validation CSV 저장", defaultextension=".csv", filetypes=[("CSV", "*.csv"), ("All Files", "*.*")])
+            if not path:
+                return None
+        return export_roi_bounds_validation_to_csv(result, path=path)
+
+    def show_roi_bounds_validation_viewer(self, manifest: dict[str, Any] | None = None, roi_preset: dict[str, Any] | None = None, analyses: list[str] | None = None) -> str:
+        text = self.render_roi_bounds_validation_text_for_viewer(manifest=manifest, roi_preset=roi_preset, analyses=analyses)
+        owner = getattr(self, "master", None) or getattr(self, "root", None) or getattr(self, "window", None)
+        win = tk.Toplevel(owner) if owner is not None else tk.Toplevel()
+        win.title("ROI Bounds Validation")
+        win.geometry("900x700")
+        t = tk.Text(win, wrap="word"); t.pack(fill="both", expand=True); t.insert("1.0", text); t.configure(state="disabled")
+        return text
+
+    def build_analysis_history_display_model(self, path: str | Path | None = None, analysis_type: str | None = None, validity: str | None = None) -> dict[str, Any] | None:
+        if path is None:
+            path = filedialog.askopenfilename(title="QC history JSONL 선택", filetypes=[("JSONL", "*.jsonl"), ("All Files", "*.*")])
+            if not path:
+                return None
+        records = self.load_analysis_history_for_viewer(path)
+        return build_history_records_display_model(records, analysis_type=analysis_type, validity=validity)
+
+    def render_analysis_history_record_detail(self, record: dict[str, Any]) -> str:
+        return render_history_record_detail_text(record)
+
+    def show_analysis_history_viewer(self, path: str | Path | None = None) -> dict[str, Any] | None:
+        if path is None:
+            path = filedialog.askopenfilename(title="QC history JSONL 선택", filetypes=[("JSONL", "*.jsonl"), ("All Files", "*.*")])
+            if not path:
+                return None
+        records = self.load_analysis_history_for_viewer(path)
+        display = build_history_records_display_model(records)
+        owner = getattr(self, "master", None) or getattr(self, "root", None) or getattr(self, "window", None)
+        win = tk.Toplevel(owner) if owner is not None else tk.Toplevel()
+        win.title("QC History Viewer")
+        win.geometry("980x700")
+        left = ttk.Frame(win, padding=8)
+        left.pack(side="left", fill="both", expand=True)
+        right = ttk.Frame(win, padding=8)
+        right.pack(side="right", fill="both", expand=True)
+        lst = tk.Listbox(left)
+        lst.pack(fill="both", expand=True)
+        detail = tk.Text(right, wrap="word")
+        detail.pack(fill="both", expand=True)
+        for row in display["rows"]:
+            lst.insert("end", f"{row['record_id']} | {row['generated_at']} | invalid={row['invalid_count']}")
+
+        def _on_select(_event=None):
+            sel = lst.curselection()
+            if not sel:
+                return
+            idx = int(sel[0])
+            txt = self.render_analysis_history_record_detail(records[idx])
+            detail.configure(state="normal")
+            detail.delete("1.0", "end")
+            detail.insert("1.0", txt)
+            detail.configure(state="disabled")
+
+        lst.bind("<<ListboxSelect>>", _on_select)
+        if records:
+            lst.selection_set(0)
+            _on_select()
+        return display
+
+    def evaluate_current_analysis_thresholds(self, threshold_config: dict[str, Any], generated_at: str | None = None) -> dict[str, Any]:
+        normalized_results = self._get_reportable_analysis_results()
+        return evaluate_analysis_thresholds(normalized_results, threshold_config, generated_at=generated_at)
+
+    def render_current_threshold_evaluation_text(self, threshold_config: dict[str, Any]) -> str:
+        return render_threshold_evaluation_text(self.evaluate_current_analysis_thresholds(threshold_config))
+
+    def set_current_threshold_config(self, config: dict[str, Any]) -> dict[str, Any]:
+        self.current_threshold_config = dict(config)
+        validate_threshold_config(self.current_threshold_config)
+        self.current_threshold_config_display = build_threshold_config_display_model(self.current_threshold_config)
+        return self.current_threshold_config
+
+    def clear_current_threshold_config(self) -> None:
+        self.current_threshold_config = None
+        self.current_threshold_config_display = None
+
+    def set_current_threshold_catalog(self, catalog: dict[str, Any]) -> dict[str, Any]:
+        self.current_threshold_catalog = validate_threshold_catalog(catalog)
+        return self.current_threshold_catalog
+
+    def build_current_threshold_catalog_display_model(self) -> dict[str, Any]:
+        catalog = getattr(self, "current_threshold_catalog", None)
+        if not catalog:
+            catalog = self.set_current_threshold_catalog(build_empty_threshold_catalog())
+        return build_threshold_catalog_display_model(catalog)
+
+    def clear_current_threshold_catalog(self) -> None:
+        self.current_threshold_catalog = None
+
+    def load_threshold_catalog_for_viewer(self, path: str | Path | None = None) -> dict[str, Any] | None:
+        if path is None:
+            path = filedialog.askopenfilename(title="Threshold catalog JSON 선택", filetypes=[("JSON", "*.json"), ("All Files", "*.*")])
+            if not path:
+                return None
+        catalog = load_threshold_catalog(path)
+        return self.set_current_threshold_catalog(catalog)
+
+    def save_current_threshold_catalog(self, path: str | Path | None = None) -> str | None:
+        catalog = getattr(self, "current_threshold_catalog", None)
+        if not catalog:
+            raise ValueError("current_threshold_catalog is empty")
+        if path is None:
+            path = filedialog.asksaveasfilename(title="Threshold catalog JSON 저장", defaultextension=".json", filetypes=[("JSON", "*.json"), ("All Files", "*.*")])
+            if not path:
+                return None
+        return save_threshold_catalog(catalog, path)
+
+    def render_current_threshold_catalog_text(self) -> str:
+        catalog = getattr(self, "current_threshold_catalog", None)
+        if not catalog:
+            raise ValueError("current_threshold_catalog is empty")
+        return render_threshold_catalog_text(catalog)
+
+    def add_current_threshold_config_to_catalog(self, config_id: str | None = None) -> dict[str, Any]:
+        config = self._require_current_threshold_config()
+        catalog = getattr(self, "current_threshold_catalog", None)
+        if not catalog:
+            raise ValueError("current_threshold_catalog is empty")
+        updated = add_threshold_config_to_catalog(catalog, config, config_id=config_id)
+        return self.set_current_threshold_catalog(updated)
+
+    def select_threshold_config_from_catalog(self, config_id: str) -> dict[str, Any]:
+        catalog = getattr(self, "current_threshold_catalog", None)
+        if not catalog:
+            raise ValueError("current_threshold_catalog is empty")
+        updated = set_selected_threshold_config_id(catalog, config_id)
+        return self.set_current_threshold_catalog(updated)
+
+    def apply_selected_catalog_threshold_config_to_viewer(self) -> dict[str, Any]:
+        catalog = getattr(self, "current_threshold_catalog", None)
+        if not catalog:
+            raise ValueError("current_threshold_catalog is empty")
+        selected = get_selected_threshold_config(catalog)
+        return self.set_current_threshold_config(selected)
+
+    def remove_threshold_config_from_current_catalog(self, config_id: str) -> dict[str, Any]:
+        catalog = getattr(self, "current_threshold_catalog", None)
+        if not catalog:
+            raise ValueError("current_threshold_catalog is empty")
+        updated = remove_threshold_config_from_catalog(catalog, config_id)
+        return self.set_current_threshold_catalog(updated)
+
+    def export_threshold_config_from_current_catalog(self, config_id: str, path: str | None = None) -> str | None:
+        catalog = getattr(self, "current_threshold_catalog", None)
+        if not catalog:
+            raise ValueError("current_threshold_catalog is empty")
+        if path is None:
+            path = filedialog.asksaveasfilename(title="Threshold config JSON 저장", defaultextension=".json", filetypes=[("JSON", "*.json"), ("All Files", "*.*")])
+            if not path:
+                return None
+        return export_threshold_config_from_catalog(catalog, config_id, path)
+
+    def import_threshold_config_file_to_current_catalog(self, path: str | None = None, config_id: str | None = None) -> dict[str, Any] | None:
+        catalog = getattr(self, "current_threshold_catalog", None)
+        if not catalog:
+            raise ValueError("current_threshold_catalog is empty")
+        if path is None:
+            path = filedialog.askopenfilename(title="Threshold config JSON 선택", filetypes=[("JSON", "*.json"), ("All Files", "*.*")])
+            if not path:
+                return None
+        updated = import_threshold_config_file_to_catalog(catalog, path, config_id=config_id)
+        return self.set_current_threshold_catalog(updated)
+
+    def show_threshold_catalog_manager(self) -> dict[str, Any]:
+        display = self.build_current_threshold_catalog_display_model()
+        owner = getattr(self, "master", None) or getattr(self, "root", None) or getattr(self, "window", None)
+        win = tk.Toplevel(owner) if owner is not None else tk.Toplevel()
+        win.title("Threshold Catalog Manager")
+        win.geometry("980x700")
+        left = ttk.Frame(win, padding=8); left.pack(side="left", fill="both", expand=True)
+        right = ttk.Frame(win, padding=8); right.pack(side="right", fill="both", expand=True)
+        lst = tk.Listbox(left); lst.pack(fill="both", expand=True)
+        detail = tk.Text(right, wrap="word"); detail.pack(fill="both", expand=True)
+        btns = ttk.Frame(right); btns.pack(fill="x")
+
+        def _selected_config_id() -> str | None:
+            sel = lst.curselection()
+            if not sel:
+                return None
+            idx = int(sel[0])
+            rows = self.build_current_threshold_catalog_display_model().get("entries", [])
+            if idx < 0 or idx >= len(rows):
+                return None
+            return rows[idx]["config_id"]
+
+        def _refresh() -> None:
+            d = self.build_current_threshold_catalog_display_model()
+            lst.delete(0, "end")
+            for e in d["entries"]:
+                mark = "*" if e["is_selected"] else "-"
+                lst.insert("end", f"{mark} {e['config_id']} | {e['name']} | rules={e['rule_count']}")
+            detail.configure(state="normal"); detail.delete("1.0", "end"); detail.insert("1.0", self.render_current_threshold_catalog_text()); detail.configure(state="disabled")
+
+        def _on_select(_event=None):
+            cid = _selected_config_id()
+            if not cid:
+                return
+            cfg = get_threshold_config_from_catalog(self.current_threshold_catalog, cid)
+            text = render_threshold_config_text(cfg)
+            detail.configure(state="normal"); detail.delete("1.0", "end"); detail.insert("1.0", text); detail.configure(state="disabled")
+
+        def _load():
+            if self.load_threshold_catalog_for_viewer() is not None:
+                _refresh()
+
+        def _save():
+            _ = self.save_current_threshold_catalog()
+
+        def _import():
+            if self.import_threshold_config_file_to_current_catalog() is not None:
+                _refresh()
+
+        def _export():
+            cid = _selected_config_id()
+            if cid:
+                _ = self.export_threshold_config_from_current_catalog(cid)
+
+        def _select():
+            cid = _selected_config_id()
+            if cid:
+                self.select_threshold_config_from_catalog(cid); _refresh()
+
+        def _apply():
+            self.apply_selected_catalog_threshold_config_to_viewer()
+
+        def _remove():
+            cid = _selected_config_id()
+            if cid:
+                self.remove_threshold_config_from_current_catalog(cid); _refresh()
+        def _save_current_to_selected():
+            _run = lambda fn: fn()
+            _run(lambda: self.save_current_threshold_config_to_selected_catalog_entry()); _refresh()
+        def _save_current_as_new():
+            cid = getattr(self, "threshold_catalog_sync_new_id_var", None)
+            config_id = cid.get().strip() if cid else ""
+            if config_id:
+                self.save_current_threshold_config_as_catalog_entry(config_id); _refresh()
+
+        ttk.Button(btns, text="Load Catalog", command=_load).pack(fill="x")
+        ttk.Button(btns, text="Save Catalog", command=_save).pack(fill="x")
+        ttk.Button(btns, text="Import Config", command=_import).pack(fill="x")
+        ttk.Button(btns, text="Export Selected Config", command=_export).pack(fill="x")
+        ttk.Button(btns, text="Select Config", command=_select).pack(fill="x")
+        ttk.Button(btns, text="Apply Selected to Viewer", command=_apply).pack(fill="x")
+        self.threshold_catalog_sync_new_id_var = tk.StringVar(master=win, value="")
+        ttk.Entry(btns, textvariable=self.threshold_catalog_sync_new_id_var).pack(fill="x")
+        ttk.Button(btns, text="Save Current to Selected", command=_save_current_to_selected).pack(fill="x")
+        ttk.Button(btns, text="Save Current as New", command=_save_current_as_new).pack(fill="x")
+        ttk.Button(btns, text="Remove Selected Config", command=_remove).pack(fill="x")
+        ttk.Button(btns, text="Close", command=win.destroy).pack(fill="x")
+        lst.bind("<<ListboxSelect>>", _on_select)
+        _refresh()
+        return display
+
+    def load_threshold_config_for_viewer(self, path: str | Path | None = None) -> dict[str, Any] | None:
+        if path is None:
+            path = filedialog.askopenfilename(title="Threshold config JSON 선택", filetypes=[("JSON", "*.json"), ("All Files", "*.*")])
+            if not path:
+                return None
+        config = load_threshold_config(path)
+        return self.set_current_threshold_config(config)
+
+    def save_current_threshold_config(self, path: str | Path | None = None) -> str | None:
+        config = getattr(self, "current_threshold_config", None)
+        if not config:
+            raise ValueError("current_threshold_config is empty")
+        if path is None:
+            path = filedialog.asksaveasfilename(title="Threshold config JSON 저장", defaultextension=".json", filetypes=[("JSON", "*.json"), ("All Files", "*.*")])
+            if not path:
+                return None
+        return save_threshold_config(config, path)
+
+    def render_current_threshold_config_text(self) -> str:
+        config = getattr(self, "current_threshold_config", None)
+        if not config:
+            raise ValueError("current_threshold_config is empty")
+        return render_threshold_config_text(config)
+
+    def _require_current_threshold_config(self) -> dict[str, Any]:
+        config = getattr(self, "current_threshold_config", None)
+        if not config:
+            raise ValueError("current_threshold_config is empty")
+        return config
+
+    def add_rule_to_current_threshold_config(self, rule: dict[str, Any]) -> dict[str, Any]:
+        updated = add_threshold_rule(self._require_current_threshold_config(), rule)
+        return self.set_current_threshold_config(updated)
+
+    def update_rule_in_current_threshold_config(self, rule_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+        updated = update_threshold_rule(self._require_current_threshold_config(), rule_id, updates)
+        return self.set_current_threshold_config(updated)
+
+    def remove_rule_from_current_threshold_config(self, rule_id: str) -> dict[str, Any]:
+        updated = remove_threshold_rule(self._require_current_threshold_config(), rule_id)
+        return self.set_current_threshold_config(updated)
+
+    def reorder_rules_in_current_threshold_config(self, rule_ids: list[str]) -> dict[str, Any]:
+        updated = reorder_threshold_rules(self._require_current_threshold_config(), rule_ids)
+        return self.set_current_threshold_config(updated)
+
+    def duplicate_rule_in_current_threshold_config(self, source_rule_id: str, new_rule_id: str) -> dict[str, Any]:
+        updated = duplicate_threshold_rule(self._require_current_threshold_config(), source_rule_id, new_rule_id)
+        return self.set_current_threshold_config(updated)
+
+    def get_current_threshold_rule(self, rule_id: str) -> dict[str, Any]:
+        return get_threshold_rule(self._require_current_threshold_config(), rule_id)
+
+    def list_current_threshold_rules(self) -> list[dict[str, Any]]:
+        return list_threshold_rules(self._require_current_threshold_config())
+
+    def build_current_threshold_editor_display_model(self, selected_rule_id: str | None = None) -> dict[str, Any]:
+        config = getattr(self, "current_threshold_config", None)
+        if not config:
+            raise ValueError("current_threshold_config is empty")
+        return build_threshold_editor_display_model(config, selected_rule_id=selected_rule_id)
+
+    def show_threshold_config_editor(self) -> dict[str, Any]:
+        model = self.build_current_threshold_editor_display_model()
+        owner = getattr(self, "master", None) or getattr(self, "root", None) or getattr(self, "window", None)
+        win = tk.Toplevel(owner) if owner is not None else tk.Toplevel()
+        win.title("Threshold Config Editor")
+        win.geometry("980x700")
+        left = ttk.Frame(win, padding=8); left.pack(side="left", fill="both", expand=True)
+        right = ttk.Frame(win, padding=8); right.pack(side="right", fill="both", expand=True)
+        lst = tk.Listbox(left); lst.pack(fill="both", expand=True)
+        status = tk.Text(right, height=4, wrap="word"); status.pack(fill="x")
+        detail = tk.Text(right, wrap="word"); detail.pack(fill="both", expand=True)
+        fields = {k: tk.StringVar(value="") for k in ("rule_id","analysis_type","metric","operator","threshold","severity","label")}
+        grid = ttk.Frame(right); grid.pack(fill="x")
+        for i, k in enumerate(fields):
+            ttk.Label(grid, text=k).grid(row=i, column=0, sticky="w")
+            ttk.Entry(grid, textvariable=fields[k]).grid(row=i, column=1, sticky="ew")
+        btns = ttk.Frame(right); btns.pack(fill="x")
+
+        def _rows(): return self.build_current_threshold_editor_display_model().get("rules", [])
+        def _sel_id():
+            s=lst.curselection()
+            if not s: return None
+            rows=_rows(); i=int(s[0])
+            return rows[i]["rule_id"] if 0 <= i < len(rows) else None
+        def _set_status(t): status.configure(state="normal"); status.delete("1.0","end"); status.insert("1.0",t); status.configure(state="disabled")
+        def _refresh(select_id=None):
+            d=self.build_current_threshold_editor_display_model(selected_rule_id=select_id) if select_id else self.build_current_threshold_editor_display_model()
+            lst.delete(0,"end")
+            for r in d["rules"]: lst.insert("end", f"{r['rule_id']} | {r['analysis_type']}.{r['metric']} | {r['operator']} {r['threshold']} | {r['severity']}")
+            detail.configure(state="normal"); detail.delete("1.0","end"); detail.insert("1.0", render_threshold_editor_text(self.current_threshold_config, selected_rule_id=select_id)); detail.configure(state="disabled")
+        def _on_select(_e=None):
+            rid=_sel_id()
+            if not rid: return
+            r=self.get_current_threshold_rule(rid)
+            for k,v in fields.items(): v.set(str(r.get(k,"")))
+            detail.configure(state="normal"); detail.delete("1.0","end"); detail.insert("1.0", render_threshold_rule_detail_text(r)); detail.configure(state="disabled")
+
+        def _rule_from_fields():
+            return {"rule_id":fields["rule_id"].get(),"analysis_type":fields["analysis_type"].get(),"metric":fields["metric"].get(),"operator":fields["operator"].get(),"threshold":float(fields["threshold"].get()),"severity":fields["severity"].get(),"label":fields["label"].get()}
+        def _run(fn):
+            try: fn(); _set_status("ok")
+            except Exception as e: _set_status(f"error: {e}")
+        def _add(): _run(lambda: (self.add_rule_to_current_threshold_config(_rule_from_fields()), _refresh(fields["rule_id"].get())))
+        def _update():
+            rid=_sel_id()
+            if rid: _run(lambda: (self.update_rule_in_current_threshold_config(rid, _rule_from_fields()), _refresh(fields["rule_id"].get())))
+        def _remove():
+            rid=_sel_id()
+            if rid: _run(lambda: (self.remove_rule_from_current_threshold_config(rid), _refresh(None)))
+        def _dup():
+            rid=_sel_id()
+            if rid: _run(lambda: (self.duplicate_rule_in_current_threshold_config(rid, fields["rule_id"].get()), _refresh(fields["rule_id"].get())))
+        def _move(delta):
+            rid=_sel_id()
+            if not rid: return
+            ids=[r["rule_id"] for r in self.list_current_threshold_rules()]; i=ids.index(rid); j=i+delta
+            if j<0 or j>=len(ids): return
+            ids[i],ids[j]=ids[j],ids[i]
+            _run(lambda: (self.reorder_rules_in_current_threshold_config(ids), _refresh(rid)))
+        def _sync_status(): _set_status(str(self.build_current_threshold_catalog_sync_status()))
+        sync_new_id = tk.StringVar(master=win, value="")
+        ttk.Entry(btns, textvariable=sync_new_id).pack(fill="x")
+        ttk.Button(btns, text="Save to Selected Catalog Entry", command=lambda: _run(lambda: self.save_current_threshold_config_to_selected_catalog_entry())).pack(fill="x")
+        ttk.Button(btns, text="Save as New Catalog Entry", command=lambda: _run(lambda: self.save_current_threshold_config_as_catalog_entry(sync_new_id.get().strip()))).pack(fill="x")
+        ttk.Button(btns, text="Reload from Selected Catalog Entry", command=lambda: _run(lambda: self.refresh_current_threshold_config_from_selected_catalog_entry())).pack(fill="x")
+        ttk.Button(btns, text="Sync Status", command=_sync_status).pack(fill="x")
+        ttk.Button(btns, text="Add Rule", command=_add).pack(fill="x")
+        ttk.Button(btns, text="Update Rule", command=_update).pack(fill="x")
+        ttk.Button(btns, text="Remove Rule", command=_remove).pack(fill="x")
+        ttk.Button(btns, text="Duplicate Rule", command=_dup).pack(fill="x")
+        ttk.Button(btns, text="Move Up", command=lambda: _move(-1)).pack(fill="x")
+        ttk.Button(btns, text="Move Down", command=lambda: _move(1)).pack(fill="x")
+        ttk.Button(btns, text="Save Config", command=lambda: _run(lambda: self.save_current_threshold_config())).pack(fill="x")
+        ttk.Button(btns, text="Close", command=win.destroy).pack(fill="x")
+        lst.bind("<<ListboxSelect>>", _on_select); _refresh()
+        return model
+
+    def build_current_threshold_catalog_sync_status(self) -> dict[str, Any]:
+        return build_threshold_catalog_sync_status(getattr(self, "current_threshold_config", None), getattr(self, "current_threshold_catalog", None))
+
+    def save_current_threshold_config_to_selected_catalog_entry(self) -> dict[str, Any]:
+        cfg = self._require_current_threshold_config()
+        catalog = getattr(self, "current_threshold_catalog", None)
+        if not catalog:
+            raise ValueError("current_threshold_catalog is empty")
+        sid = catalog.get("selected_config_id")
+        if not sid:
+            raise ValueError("selected_config_id is empty")
+        updated = update_threshold_config_in_catalog(catalog, sid, cfg)
+        return self.set_current_threshold_catalog(updated)
+
+    def save_current_threshold_config_as_catalog_entry(self, config_id: str) -> dict[str, Any]:
+        cfg = self._require_current_threshold_config()
+        catalog = getattr(self, "current_threshold_catalog", None)
+        if not catalog:
+            raise ValueError("current_threshold_catalog is empty")
+        return self.set_current_threshold_catalog(add_threshold_config_to_catalog(catalog, cfg, config_id=config_id))
+
+    def refresh_current_threshold_config_from_selected_catalog_entry(self) -> dict[str, Any]:
+        return self.apply_selected_catalog_threshold_config_to_viewer()
+
+    def discard_current_threshold_config_changes_from_catalog_selection(self) -> dict[str, Any]:
+        return self.refresh_current_threshold_config_from_selected_catalog_entry()
+
+    def evaluate_current_analysis_with_selected_threshold_config(self, generated_at: str | None = None) -> dict[str, Any]:
+        config = getattr(self, "current_threshold_config", None)
+        if not config:
+            raise ValueError("current_threshold_config is empty")
+        return self.evaluate_current_analysis_thresholds(config, generated_at=generated_at)
+
+    def render_current_selected_threshold_evaluation_text(self) -> str:
+        return render_threshold_evaluation_text(self.evaluate_current_analysis_with_selected_threshold_config())
+
+    def show_current_threshold_evaluation_preview(self) -> str:
+        text = self.render_current_selected_threshold_evaluation_text()
+        owner = getattr(self, "master", None) or getattr(self, "root", None) or getattr(self, "window", None)
+        preview = tk.Toplevel(owner) if owner is not None else tk.Toplevel()
+        preview.title("Threshold Evaluation Preview")
+        preview.geometry("900x700")
+        container = ttk.Frame(preview, padding=8)
+        container.pack(fill="both", expand=True)
+        t = tk.Text(container, wrap="word")
+        t.pack(fill="both", expand=True)
+        t.insert("1.0", text)
+        t.configure(state="disabled")
+        return text
+
+    def build_current_analysis_report_preview_text_with_selected_threshold(self, metadata: dict[str, Any] | None = None) -> str:
+        return self.build_current_analysis_report_preview_text(metadata=metadata, use_selected_threshold_config=True)
+
+    def show_analysis_report_preview_with_selected_threshold(self, metadata: dict[str, Any] | None = None) -> str:
+        text = self.build_current_analysis_report_preview_text_with_selected_threshold(metadata=metadata)
+        owner = getattr(self, "master", None) or getattr(self, "root", None) or getattr(self, "window", None)
+        preview = tk.Toplevel(owner) if owner is not None else tk.Toplevel()
+        preview.title("QC Report Preview (Selected Threshold)")
+        preview.geometry("900x700")
+        container = ttk.Frame(preview, padding=8)
+        container.pack(fill="both", expand=True)
+        t = tk.Text(container, wrap="word")
+        t.pack(fill="both", expand=True)
+        t.insert("1.0", text)
+        t.configure(state="disabled")
+        return text
+
+    def export_analysis_report_markdown_with_selected_threshold(self, path: str | None = None, metadata: dict[str, Any] | None = None) -> str | None:
+        return self.export_analysis_report_markdown(path=path, metadata=metadata, use_selected_threshold_config=True)
+
+    def export_analysis_report_pdf_with_selected_threshold(self, path: str | None = None, metadata: dict[str, Any] | None = None) -> bytes | None:
+        return self.export_analysis_report_pdf(path=path, metadata=metadata, use_selected_threshold_config=True)
+
+    def build_current_analysis_history_record_with_selected_threshold(self, metadata: dict[str, Any] | None = None, record_id: str | None = None) -> dict[str, Any]:
+        return self.build_current_analysis_history_record(metadata=metadata, record_id=record_id, use_selected_threshold_config=True)
+
+    def append_current_analysis_history_with_selected_threshold(self, history_path: str | Path, metadata: dict[str, Any] | None = None, record_id: str | None = None) -> dict[str, Any]:
+        return self.append_current_analysis_history(history_path, metadata=metadata, record_id=record_id, use_selected_threshold_config=True)
+
+    def export_analysis_results_json_legacy(self) -> None:
         payload = self._build_analysis_export_payload()
         path = filedialog.asksaveasfilename(
             title="분석 결과 JSON 저장",
@@ -6202,7 +7306,7 @@ class DicomViewer:
         Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         messagebox.showinfo("저장 완료", f"Analysis JSON 저장 완료:\n{path}")
 
-    def export_analysis_results_csv(self) -> None:
+    def export_analysis_results_csv_legacy(self) -> None:
         payload = self._build_analysis_export_payload()
         path = filedialog.asksaveasfilename(
             title="분석 결과 CSV 저장",
@@ -6323,12 +7427,35 @@ class DicomViewer:
         ttk.Label(status, textvariable=self.view_mode_var).pack(side="left")
         ttk.Label(status, textvariable=self.compare_sync_status_var).pack(side="left", padx=(12, 0))
         ttk.Label(status, textvariable=self.source_var).pack(side="left", padx=(12, 0))
+        self.viewer_a_file_status_var = tk.StringVar(value="A | No file | Frame -")
+        ttk.Label(status, textvariable=self.viewer_a_file_status_var).pack(side="left", padx=(12, 0), fill="x", expand=True)
         ttk.Label(status, textvariable=self.image_var).pack(side="left", padx=(12, 0))
         ttk.Label(status, textvariable=self.frame_var).pack(side="left", padx=(12, 0))
         ttk.Label(status, textvariable=self.zoom_var).pack(side="left", padx=(12, 0))
         ttk.Label(status, textvariable=self.window_level_var).pack(side="left", padx=(12, 0))
         ttk.Label(status, textvariable=self.cursor_var).pack(side="left", padx=(12, 0))
         ttk.Button(status, textvariable=self.info_toggle_var, command=self._toggle_info_panel).pack(side="right")
+        if hasattr(self, "path_var") and self.path_var is not None:
+            self.path_var.trace_add("write", lambda *_args: self._update_viewer_a_file_status())
+        if hasattr(self, "frame_var") and self.frame_var is not None:
+            self.frame_var.trace_add("write", lambda *_args: self._update_viewer_a_file_status())
+        self._update_viewer_a_file_status()
+
+    def _update_viewer_a_file_status(self) -> None:
+        if not hasattr(self, "viewer_a_file_status_var"):
+            return
+        path_text = ""
+        try:
+            path_text = self.path_var.get().strip() if hasattr(self, "path_var") and self.path_var is not None else ""
+        except Exception:
+            path_text = ""
+        try:
+            current = int(getattr(self, "current_frame", 0))
+            total = len(getattr(self, "frames", []) or [])
+        except Exception:
+            current = 0
+            total = 0
+        self.viewer_a_file_status_var.set(build_viewer_a_status_label(path_text, current, total, prefix="A"))
 
     def _build_collapsible_info_panel(self, parent: ttk.Frame) -> None:
         self.info_panel_frame = ttk.Frame(parent, padding=(12, 4, 12, 6))
@@ -6358,6 +7485,7 @@ class DicomViewer:
         self.info_panel_expanded.set(not self.info_panel_expanded.get())
 
     def _sync_info_panel_visibility(self, *_args: object) -> None:
+        self._update_viewer_a_file_status()
         has_path = bool(self.path_var.get().strip())
         has_info = bool(self.info_var.get().strip())
         has_content = has_path or has_info
@@ -10901,6 +12029,18 @@ class DicomViewer:
         self.domain_store.set_analysis_last_run(key, dict(payload))
         # LEGACY_BRIDGE: 결과 패널 read 경로 완전 selector화 전까지만 캐시 유지.
         self.analysis_last_run[key] = dict(payload)
+        if key in {"snr", "cnr", "uniformity", "mtf"}:
+            try:
+                normalized = normalize_analysis_result(key, dict(payload))
+            except Exception:
+                normalized = None
+            if normalized is not None:
+                if not hasattr(self, "analysis_last_run_normalized") or self.analysis_last_run_normalized is None:
+                    self.analysis_last_run_normalized = {}
+                if not hasattr(self, "analysis_last_run_display") or self.analysis_last_run_display is None:
+                    self.analysis_last_run_display = {}
+                self.analysis_last_run_normalized[key] = normalized
+                self.analysis_last_run_display[key] = build_analysis_display_model(normalized)
         if hasattr(self, "window_b_manager") and self.window_b_manager is not None:
             self.window_b_manager.refresh_all()
 
@@ -10909,6 +12049,8 @@ class DicomViewer:
         self.domain_store.clear_analysis_last_run()
         # LEGACY_BRIDGE: 결과 패널 read 경로 완전 selector화 전까지만 캐시 유지.
         self.analysis_last_run = {}
+        self.analysis_last_run_normalized = {}
+        self.analysis_last_run_display = {}
         self._last_mtf_curve_payload = {}
         self._last_esf_curve_payload = {}
         self._last_lsf_curve_payload = {}
@@ -11425,7 +12567,7 @@ class DicomViewer:
             id=str(payload.get("id", uuid.uuid4())),
             name=str(payload.get("name", "Imported Set")),
             geometry_key=str(payload.get("geometry_key", "")),
-            created_at=str(payload.get("created_at", datetime.utcnow().isoformat())),
+            created_at=str(payload.get("created_at", datetime.now(timezone.utc).isoformat())),
             measurements=measurements,
         )
 
@@ -11444,7 +12586,7 @@ class DicomViewer:
             id=str(uuid.uuid4()),
             name=name,
             geometry_key=geometry_key,
-            created_at=datetime.utcnow().isoformat(),
+            created_at=datetime.now(timezone.utc).isoformat(),
             measurements=copy.deepcopy(selected),
         )
         self.measurement_sets[measurement_set.id] = measurement_set
@@ -11536,7 +12678,7 @@ class DicomViewer:
             study_id=str(payload.get("study_id", "")),
             source_image_path=str(payload.get("source_image_path", "")),
             image_name=str(payload.get("image_name", "N/A")),
-            created_at=str(payload.get("created_at", datetime.utcnow().isoformat())),
+            created_at=str(payload.get("created_at", datetime.now(timezone.utc).isoformat())),
             entry_ids=[str(item) for item in (payload.get("entry_ids") or [])],
             frame_indices=[int(item) for item in (payload.get("frame_indices") or [])],
             roi_source_type=str(payload.get("roi_source_type", "manual")),
@@ -11558,7 +12700,7 @@ class DicomViewer:
         return StudySession(
             study_id=str(payload.get("study_id") or uuid.uuid4()),
             name=str(payload.get("name", "Imported Study")),
-            created_at=str(payload.get("created_at", datetime.utcnow().isoformat())),
+            created_at=str(payload.get("created_at", datetime.now(timezone.utc).isoformat())),
             group_ids=[str(item) for item in (payload.get("group_ids") or [])],
         )
 
@@ -11875,7 +13017,7 @@ class DicomViewer:
                         study_id=default_study.study_id,
                         source_image_path=entry.source_image_path,
                         image_name=entry.image_name,
-                        created_at=datetime.utcnow().isoformat(),
+                        created_at=datetime.now(timezone.utc).isoformat(),
                         entry_ids=[],
                         frame_indices=[],
                         roi_source_type="manual",
@@ -11958,7 +13100,7 @@ class DicomViewer:
         }
         return {
             "version": PRESET_SCHEMA_VERSION,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
             "app": "moduba",
             "kind": "measurement_preset",
             "analysis_options": analysis_options,
@@ -12796,8 +13938,8 @@ class DicomViewer:
             return
         state = getattr(self, "iqa_ui_state", None) or create_default_iqa_state()
         run_state = resolve_iqa_run_state(state)
-        ref_label = state.reference_label or "None"
-        tar_label = state.target_label or "None"
+        ref_label = state.reference_label or ""
+        tar_label = state.target_label or ""
         reason_map = {
             "missing_reference": "실행 불가: Reference 영상이 선택되지 않았습니다.",
             "missing_target": "실행 불가: Target 영상이 선택되지 않았습니다.",
@@ -12806,8 +13948,15 @@ class DicomViewer:
             "stale_roi_id": "세션에 저장된 ROI를 현재 영상에서 찾을 수 없습니다.",
         }
         ready_text = "실행 가능" if run_state.get("is_ready") else reason_map.get(str(run_state.get("reason") or ""), f"실행 불가: {run_state.get('reason') or 'missing'}")
-        roi_text = f" | ROI={getattr(state, 'selected_roi_label', '') or 'None'}" if str(getattr(state, "scope", "")) == "roi" else ""
-        self.image_analysis_results["iqa_pair_status"].set(f"Pair: Reference={ref_label} | Target={tar_label}{roi_text} | {ready_text}")
+        self.image_analysis_results["iqa_pair_status"].set(
+            build_pair_status_label(
+                reference_label=ref_label,
+                target_label=tar_label,
+                ready_text=ready_text,
+                roi_label=str(getattr(state, "selected_roi_label", "") or ""),
+                scope=str(getattr(state, "scope", "")),
+            )
+        )
 
     def _update_iqa_report_preview_from_history(self) -> str:
         latest = get_latest_iqa_history(getattr(self, "iqa_history", []) or [])
