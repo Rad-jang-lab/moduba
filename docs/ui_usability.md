@@ -15,6 +15,13 @@
 ## Resize Grip
 - `ttk.Sizegrip` 기반으로 bottom-right에 배치했습니다.
 - 사용성 향상을 위해 약 24px hit area를 갖는 컨테이너에 배치했습니다.
+- 창 리사이즈/재배치 중 grip이 가려지지 않도록 `lift()` 처리했습니다.
+- 창 종료 등으로 Tcl context가 사라진 경우를 대비해 `TclError`를 안전하게 무시합니다.
+
+## A/B 대상 확인
+- 별도 A/B 전용 `Toplevel` 창은 없고, A/B 비교는 main viewer 내부의 compare panel(좌/우) 구조입니다.
+- 이번 UX-1에서는 compare panel 레이아웃 구조 변경(예: PanedWindow 전환)을 수행하지 않았습니다.
+- compare panel 리사이즈 구조 개선은 후속 UX-2 후보로 남깁니다.
 
 ## Non-goals (unchanged)
 - SNR/CNR/Uniformity/MTF 계산 로직 및 공식
