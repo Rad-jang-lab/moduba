@@ -126,9 +126,13 @@ class WindowBManager:
     @staticmethod
     def _attach_resize_grip(window: tk.Misc) -> ttk.Frame:
         grip_container = ttk.Frame(window, width=24, height=24)
-        grip_container.place(relx=1.0, rely=1.0, anchor="se")
-        grip_container.place_propagate(False)
-        ttk.Sizegrip(grip_container).pack(fill="both", expand=True)
+        try:
+            grip_container.place(relx=1.0, rely=1.0, anchor="se")
+            grip_container.place_propagate(False)
+            ttk.Sizegrip(grip_container).pack(fill="both", expand=True)
+            grip_container.lift()
+        except tk.TclError:
+            return grip_container
         return grip_container
 
     def bind_store_events(self) -> None:

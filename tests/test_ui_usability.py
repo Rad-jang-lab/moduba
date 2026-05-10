@@ -154,6 +154,9 @@ def test_attach_resize_grip_adds_sizegrip_to_root(monkeypatch):
         def place_propagate(self, flag):
             created.append(("propagate", flag))
 
+        def lift(self):
+            created.append(("lift",))
+
     class FakeSizegrip:
         def __init__(self, _parent):
             created.append(("sizegrip",))
@@ -168,6 +171,21 @@ def test_attach_resize_grip_adds_sizegrip_to_root(monkeypatch):
 
     assert ("frame", RESIZE_GRIP_HIT_SIZE_PX, RESIZE_GRIP_HIT_SIZE_PX) in created
     assert any(item[0] == "sizegrip" for item in created)
+
+
+def test_resize_grip_helper_handles_destroyed_window_safely(monkeypatch):
+    class FakeFrame:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def place(self, **_kwargs):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr("dicom_viewer.ttk.Frame", FakeFrame)
+    monkeypatch.setattr("dicom_viewer.tk.TclError", RuntimeError)
+
+    # no exception
+    DicomViewer._attach_resize_grip(object())
 
 
 def test_grid_roi_still_selects_created_roi():
