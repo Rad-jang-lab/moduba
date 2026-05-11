@@ -58,3 +58,5 @@ DICOM batch execution result를 Window B에서 history/QC 흐름으로 연결합
 
 
 - Window B Batch 탭에 Validate ROI Roles(preflight report) 버튼을 추가해 pixel run 전 입력 품질을 점검할 수 있습니다.
+
+- Window B Batch 탭에서 normalized workflow action을 명시적으로 호출해 실행할 수 있습니다.

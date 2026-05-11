@@ -116,12 +116,36 @@ from dicom_batch_history_adapter import (
     build_batch_qc_run_from_dicom_batch_execution_result,
     render_dicom_batch_history_bridge_summary_text,
 )
+from dicom_batch_normalized_history_adapter import (
+    build_analysis_history_records_from_normalized_dicom_batch_execution_result,
+    append_normalized_dicom_batch_execution_history_records,
+    render_normalized_execution_history_adapter_text,
+)
+from dicom_batch_normalized_batch_qc_adapter import (
+    build_batch_qc_run_from_normalized_execution_history_records,
+    build_batch_qc_run_from_normalized_dicom_batch_execution_result,
+    render_normalized_batch_qc_adapter_text,
+)
+from dicom_batch_normalized_batch_qc_report_adapter import (
+    build_report_model_from_normalized_batch_qc_run,
+    render_normalized_batch_qc_report_text,
+    export_normalized_batch_qc_report_to_json,
+    export_normalized_batch_qc_report_to_csv,
+    export_normalized_batch_qc_report_to_text,
+    export_normalized_batch_qc_report_to_pdf,
+)
 from dicom_batch_execution import (
     build_dicom_batch_execution_result,
     validate_dicom_batch_execution_result,
     render_dicom_batch_execution_result_text,
     export_dicom_batch_execution_result_to_json,
     export_dicom_batch_execution_result_to_csv,
+)
+from dicom_batch_execution_normalization import (
+    build_normalized_dicom_batch_execution_result,
+    render_normalized_dicom_batch_execution_result_text,
+    export_normalized_dicom_batch_execution_result_to_json,
+    export_normalized_dicom_batch_execution_result_to_csv,
 )
 from analysis_history_store import load_analysis_history_records
 from analysis_thresholds import evaluate_analysis_thresholds, render_threshold_evaluation_text, validate_threshold_config
@@ -584,9 +608,12 @@ class DicomViewer:
         self.current_roi_bounds_validation: dict[str, Any] | None = None
         self.current_dicom_batch_execution_plan: dict[str, Any] | None = None
         self.current_dicom_batch_execution_result: dict[str, Any] | None = None
+        self.current_normalized_dicom_batch_execution_result: dict[str, Any] | None = None
         self.current_dicom_batch_history_records: list[dict[str, Any]] = []
+        self.current_normalized_execution_history_records: list[dict[str, Any]] = []
         self.current_batch_qc_run: dict[str, Any] | None = None
         self.current_batch_qc_report_model: dict[str, Any] | None = None
+        self.current_normalized_batch_qc_report_model: dict[str, Any] | None = None
         self._analysis_comboboxes: dict[str, ttk.Combobox] = {}
         self._analysis_selector_vars: dict[str, tk.StringVar] = {}
         self._image_analysis_comboboxes: dict[str, ttk.Combobox] = {}
@@ -833,6 +860,18 @@ class DicomViewer:
         grip_container.place(relx=1.0, rely=1.0, anchor="se")
         grip_container.place_propagate(False)
         ttk.Sizegrip(grip_container).pack(fill="both", expand=True)
+
+        def _lift_grip(_event: tk.Event | None = None) -> None:
+            try:
+                grip_container.lift()
+            except (tk.TclError, AttributeError):
+                return
+
+        _lift_grip()
+        try:
+            window.bind("<Configure>", _lift_grip, add="+")
+        except (tk.TclError, AttributeError):
+            pass
         return grip_container
 
     def _set_initial_split_sash(self) -> None:
@@ -6674,6 +6713,166 @@ class DicomViewer:
         DicomViewer._refresh_window_b_batch_workspace(self)
         return run
 
+    def build_analysis_history_records_from_normalized_execution_for_viewer(self, normalized_execution_result: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, record_id_prefix: str | None = None) -> list[dict[str, Any]]:
+        normalized = normalized_execution_result if normalized_execution_result is not None else getattr(self, "current_normalized_dicom_batch_execution_result", None)
+        if normalized is None:
+            execution_result = getattr(self, "current_dicom_batch_execution_result", None)
+            if execution_result is None:
+                raise ValueError("current_normalized_dicom_batch_execution_result is empty")
+            normalized = DicomViewer.build_normalized_dicom_batch_execution_result_for_viewer(self, execution_result=execution_result)
+        records = build_analysis_history_records_from_normalized_dicom_batch_execution_result(normalized, metadata=metadata, record_id_prefix=record_id_prefix)
+        self.current_normalized_execution_history_records = records
+        return records
+
+    def append_normalized_execution_history_records_for_viewer(self, history_path: str | Path | None = None, normalized_execution_result: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, record_id_prefix: str | None = None) -> list[dict[str, Any]] | None:
+        if history_path is None:
+            history_path = filedialog.asksaveasfilename(title="QC history JSONL 저장", defaultextension=".jsonl", filetypes=[("JSONL", "*.jsonl"), ("All Files", "*.*")])
+            if not history_path:
+                return None
+        records = self.build_analysis_history_records_from_normalized_execution_for_viewer(normalized_execution_result=normalized_execution_result, metadata=metadata, record_id_prefix=record_id_prefix)
+        out = append_normalized_dicom_batch_execution_history_records(str(history_path), records)
+        self._refresh_result_history_table()
+        return out
+
+    def render_normalized_execution_history_adapter_text_for_viewer(self, normalized_execution_result: dict[str, Any] | None = None) -> str:
+        normalized = normalized_execution_result if normalized_execution_result is not None else getattr(self, "current_normalized_dicom_batch_execution_result", None)
+        if normalized is None:
+            raise ValueError("current_normalized_dicom_batch_execution_result is empty")
+        records = self.build_analysis_history_records_from_normalized_execution_for_viewer(normalized_execution_result=normalized)
+        return render_normalized_execution_history_adapter_text(records, normalized_execution_result=normalized)
+
+    def build_batch_qc_run_from_normalized_execution_history_records_for_viewer(self, records: list[dict[str, Any]] | None = None, threshold_config: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, batch_id: str | None = None, use_selected_threshold_config: bool = False) -> dict[str, Any]:
+        record_list = records if records is not None else getattr(self, "current_normalized_execution_history_records", None)
+        if not record_list:
+            raise ValueError("current_normalized_execution_history_records is empty")
+        resolved = DicomViewer._resolve_threshold_config_for_batch(self, threshold_config=threshold_config, use_selected_threshold_config=use_selected_threshold_config)
+        run = build_batch_qc_run_from_normalized_execution_history_records(record_list, threshold_config=resolved, metadata=metadata, batch_id=batch_id)
+        self.current_batch_qc_run = run
+        return run
+
+    def build_batch_qc_run_from_normalized_execution_for_viewer(self, normalized_execution_result: dict[str, Any] | None = None, threshold_config: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, batch_id: str | None = None, record_id_prefix: str | None = None, use_selected_threshold_config: bool = False) -> dict[str, Any]:
+        normalized = normalized_execution_result if normalized_execution_result is not None else getattr(self, "current_normalized_dicom_batch_execution_result", None)
+        if normalized is None:
+            raise ValueError("current_normalized_dicom_batch_execution_result is empty")
+        records = DicomViewer.build_analysis_history_records_from_normalized_execution_for_viewer(self, normalized_execution_result=normalized, record_id_prefix=record_id_prefix)
+        resolved = DicomViewer._resolve_threshold_config_for_batch(self, threshold_config=threshold_config, use_selected_threshold_config=use_selected_threshold_config)
+        run = build_batch_qc_run_from_normalized_dicom_batch_execution_result(normalized, threshold_config=resolved, metadata=metadata, batch_id=batch_id, record_id_prefix=record_id_prefix)
+        self.current_normalized_execution_history_records = records
+        self.current_batch_qc_run = run
+        return run
+
+    def render_normalized_batch_qc_adapter_text_for_viewer(self, batch_qc_run: dict[str, Any] | None = None, records: list[dict[str, Any]] | None = None, normalized_execution_result: dict[str, Any] | None = None) -> str:
+        run = batch_qc_run if batch_qc_run is not None else getattr(self, "current_batch_qc_run", None)
+        if run is None:
+            raise ValueError("current_batch_qc_run is empty")
+        return render_normalized_batch_qc_adapter_text(run, records=records, normalized_execution_result=normalized_execution_result)
+
+    def build_normalized_batch_qc_report_model_for_viewer(self, batch_qc_run: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        run = batch_qc_run if batch_qc_run is not None else getattr(self, "current_batch_qc_run", None)
+        if run is None:
+            raise ValueError("current_batch_qc_run is empty")
+        model = build_report_model_from_normalized_batch_qc_run(run, metadata=metadata)
+        self.current_normalized_batch_qc_report_model = model
+        return model
+
+    def render_normalized_batch_qc_report_text_for_viewer(self, batch_qc_run: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> str:
+        model = self.build_normalized_batch_qc_report_model_for_viewer(batch_qc_run=batch_qc_run, metadata=metadata)
+        return render_normalized_batch_qc_report_text(model)
+
+    def export_normalized_batch_qc_report_json_for_viewer(self, path: str | None = None, batch_qc_run: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> str | None:
+        if path is None:
+            path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")], title="Save Normalized Batch QC Report JSON")
+            if not path: return None
+        model = self.build_normalized_batch_qc_report_model_for_viewer(batch_qc_run=batch_qc_run, metadata=metadata)
+        return export_normalized_batch_qc_report_to_json(model, path=path)
+
+    def export_normalized_batch_qc_report_csv_for_viewer(self, path: str | None = None, batch_qc_run: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> str | None:
+        if path is None:
+            path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")], title="Save Normalized Batch QC Report CSV")
+            if not path: return None
+        model = self.build_normalized_batch_qc_report_model_for_viewer(batch_qc_run=batch_qc_run, metadata=metadata)
+        return export_normalized_batch_qc_report_to_csv(model, path=path)
+
+    def export_normalized_batch_qc_report_text_for_viewer(self, path: str | None = None, batch_qc_run: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> str | None:
+        if path is None:
+            path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text", "*.txt")], title="Save Normalized Batch QC Report Text")
+            if not path: return None
+        model = self.build_normalized_batch_qc_report_model_for_viewer(batch_qc_run=batch_qc_run, metadata=metadata)
+        return export_normalized_batch_qc_report_to_text(model, path=path)
+
+    def export_normalized_batch_qc_report_pdf_for_viewer(self, path: str | None = None, batch_qc_run: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> bytes | None:
+        if path is None:
+            path = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF", "*.pdf")], title="Save Normalized Batch QC Report PDF")
+            if not path: return None
+        model = self.build_normalized_batch_qc_report_model_for_viewer(batch_qc_run=batch_qc_run, metadata=metadata)
+        return export_normalized_batch_qc_report_to_pdf(model, path=path)
+
+    def render_normalized_batch_workflow_summary_text_for_viewer(self) -> str:
+        has_execution = getattr(self, "current_dicom_batch_execution_result", None) is not None
+        has_norm_exec = getattr(self, "current_normalized_dicom_batch_execution_result", None) is not None
+        record_count = len(getattr(self, "current_normalized_execution_history_records", []) or [])
+        has_qc = getattr(self, "current_batch_qc_run", None) is not None
+        has_report = getattr(self, "current_normalized_batch_qc_report_model", None) is not None
+        selected_threshold_var = getattr(self, "_window_b_batch_use_selected_threshold_var", None)
+        selected_threshold_enabled = bool(selected_threshold_var.get()) if selected_threshold_var is not None and hasattr(selected_threshold_var, "get") else False
+        if not has_execution:
+            next_action = "Run or build batch execution result first."
+        elif not has_norm_exec:
+            next_action = "Build normalized execution result."
+        elif record_count == 0:
+            next_action = "Build normalized history records."
+        elif not has_qc:
+            next_action = "Build normalized batch QC run."
+        elif not has_report:
+            next_action = "Preview or export normalized batch QC report."
+        else:
+            next_action = "Workflow ready."
+        return (
+            f"has_execution_result={has_execution}\n"
+            f"has_normalized_execution_result={has_norm_exec}\n"
+            f"normalized_history_record_count={record_count}\n"
+            f"has_batch_qc_run={has_qc}\n"
+            f"has_normalized_batch_qc_report_model={has_report}\n"
+            f"selected_threshold_enabled={selected_threshold_enabled}\n"
+            f"next_action={next_action}\n"
+        )
+
+    def show_normalized_batch_qc_report_viewer(self, batch_qc_run: dict[str, Any] | None = None) -> str:
+        text = self.render_normalized_batch_qc_report_text_for_viewer(batch_qc_run=batch_qc_run)
+        owner = getattr(self, "master", None) or getattr(self, "root", None) or getattr(self, "window", None)
+        win = tk.Toplevel(owner) if owner is not None else tk.Toplevel()
+        win.title("Normalized Batch QC Report Preview")
+        win.geometry("900x700")
+        t = tk.Text(win, wrap="word")
+        t.pack(fill="both", expand=True)
+        t.insert("1.0", text)
+        t.configure(state="disabled")
+        return text
+
+    def show_normalized_batch_qc_adapter_viewer(self, batch_qc_run: dict[str, Any] | None = None) -> str:
+        text = self.render_normalized_batch_qc_adapter_text_for_viewer(batch_qc_run=batch_qc_run)
+        owner = getattr(self, "master", None) or getattr(self, "root", None) or getattr(self, "window", None)
+        win = tk.Toplevel(owner) if owner is not None else tk.Toplevel()
+        win.title("Normalized Batch QC Adapter Preview")
+        win.geometry("900x700")
+        t = tk.Text(win, wrap="word")
+        t.pack(fill="both", expand=True)
+        t.insert("1.0", text)
+        t.configure(state="disabled")
+        return text
+
+    def show_normalized_execution_history_adapter_viewer(self, normalized_execution_result: dict[str, Any] | None = None) -> str:
+        text = self.render_normalized_execution_history_adapter_text_for_viewer(normalized_execution_result=normalized_execution_result)
+        owner = getattr(self, "master", None) or getattr(self, "root", None) or getattr(self, "window", None)
+        win = tk.Toplevel(owner) if owner is not None else tk.Toplevel()
+        win.title("Normalized Execution → History Adapter Preview")
+        win.geometry("900x700")
+        t = tk.Text(win, wrap="word")
+        t.pack(fill="both", expand=True)
+        t.insert("1.0", text)
+        t.configure(state="disabled")
+        return text
+
     def show_dicom_batch_history_bridge_viewer(self, execution_result: dict[str, Any] | None = None) -> str:
         records = self.build_dicom_batch_history_records_for_viewer(execution_result=execution_result)
         text = render_dicom_batch_history_bridge_summary_text(records)
@@ -7154,6 +7353,45 @@ class DicomViewer:
                 return None
         result = DicomViewer.build_dicom_batch_execution_result_for_viewer(self, execution_plan=execution_plan, roi_preset=roi_preset, analysis_executor=analysis_executor, metadata=metadata, run_id=run_id)
         return export_dicom_batch_execution_result_to_csv(result, path=path)
+
+    def build_normalized_dicom_batch_execution_result_for_viewer(self, execution_result: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, normalization_id: str | None = None) -> dict[str, Any]:
+        result = execution_result if execution_result is not None else getattr(self, "current_dicom_batch_execution_result", None)
+        if result is None:
+            raise ValueError("current_dicom_batch_execution_result is empty")
+        normalized = build_normalized_dicom_batch_execution_result(result, metadata=metadata, normalization_id=normalization_id)
+        self.current_normalized_dicom_batch_execution_result = normalized
+        return normalized
+
+    def render_normalized_dicom_batch_execution_result_text_for_viewer(self, execution_result: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, normalization_id: str | None = None) -> str:
+        normalized = DicomViewer.build_normalized_dicom_batch_execution_result_for_viewer(self, execution_result=execution_result, metadata=metadata, normalization_id=normalization_id)
+        return render_normalized_dicom_batch_execution_result_text(normalized)
+
+    def export_normalized_dicom_batch_execution_result_json_for_viewer(self, path: str | None = None, execution_result: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, normalization_id: str | None = None) -> str | None:
+        if path is None:
+            path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")], title="Save Normalized DICOM Batch Execution Result JSON")
+            if not path:
+                return None
+        normalized = DicomViewer.build_normalized_dicom_batch_execution_result_for_viewer(self, execution_result=execution_result, metadata=metadata, normalization_id=normalization_id)
+        return export_normalized_dicom_batch_execution_result_to_json(normalized, path=path)
+
+    def export_normalized_dicom_batch_execution_result_csv_for_viewer(self, path: str | None = None, execution_result: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, normalization_id: str | None = None) -> str | None:
+        if path is None:
+            path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")], title="Save Normalized DICOM Batch Execution Result CSV")
+            if not path:
+                return None
+        normalized = DicomViewer.build_normalized_dicom_batch_execution_result_for_viewer(self, execution_result=execution_result, metadata=metadata, normalization_id=normalization_id)
+        return export_normalized_dicom_batch_execution_result_to_csv(normalized, path=path)
+
+    def show_normalized_dicom_batch_execution_result_viewer(self, execution_result: dict[str, Any] | None = None) -> str:
+        text = DicomViewer.render_normalized_dicom_batch_execution_result_text_for_viewer(self, execution_result=execution_result)
+        win = tk.Toplevel(self.root)
+        win.title("DICOM Batch Execution Normalized Result")
+        win.geometry("900x620")
+        txt = tk.Text(win, wrap="none")
+        txt.pack(fill="both", expand=True)
+        txt.insert("1.0", text)
+        txt.config(state="disabled")
+        return text
 
     def show_dicom_batch_execution_result_viewer(self, execution_plan: dict[str, Any] | None = None, roi_preset: dict[str, Any] | None = None, analysis_executor=None) -> str:
         text = DicomViewer.render_dicom_batch_execution_result_text_for_viewer(self, execution_plan=execution_plan, roi_preset=roi_preset, analysis_executor=analysis_executor)

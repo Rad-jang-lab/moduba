@@ -80,3 +80,19 @@
 - ROI preset은 history record가 아니라 분석 전 입력 정의입니다.
 
 - DICOM batch plan은 history record가 아니라 분석 전 실행 계획입니다.
+
+
+## Normalized Execution Result Note
+- normalized execution result는 아직 history record가 아닙니다.
+- 후속 adapter 단계에서 history record 생성으로 연결될 수 있습니다.
+
+
+- normalized execution result는 직접 history record가 아니며, normalized-history adapter를 통해 history record로 변환됩니다.
+
+
+- normalized execution history records는 Batch QC adapter 입력으로 사용할 수 있습니다.
+- history store 자체는 QC run을 자동 생성하지 않습니다.
+
+
+- history records는 Batch QC run을 거쳐 report/export로 이어질 수 있습니다.
+- history store 자체는 QC/report를 자동 생성하지 않습니다.

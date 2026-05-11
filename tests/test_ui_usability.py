@@ -247,3 +247,38 @@ def test_window_b_create_window_adds_resize_grip(monkeypatch):
     manager._create_window()
 
     assert len(calls) == 1
+
+
+def test_resize_grip_helper_handles_destroyed_window_safely(monkeypatch):
+    class FakeTclError(Exception):
+        pass
+
+    class FakeFrame:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def place(self, **_kwargs):
+            return None
+
+        def place_propagate(self, _flag):
+            return None
+
+        def lift(self):
+            raise FakeTclError()
+
+    class FakeSizegrip:
+        def __init__(self, _parent):
+            return None
+
+        def pack(self, **_kwargs):
+            return None
+
+    class FakeWindow:
+        def bind(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr("dicom_viewer.tk.TclError", FakeTclError)
+    monkeypatch.setattr("dicom_viewer.ttk.Frame", FakeFrame)
+    monkeypatch.setattr("dicom_viewer.ttk.Sizegrip", FakeSizegrip)
+
+    DicomViewer._attach_resize_grip(FakeWindow())

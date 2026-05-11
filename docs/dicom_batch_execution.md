@@ -41,3 +41,22 @@
 
 
 - Window B Batch 탭에 Validate ROI Roles(preflight report) 버튼을 추가해 pixel run 전 입력 품질을 점검할 수 있습니다.
+
+
+## Execution Result vs Normalization Layer
+- execution result는 task별 `raw_result_payload`를 보존하는 원본 레이어입니다.
+- normalization layer는 completed task payload를 normalized analysis result model로 변환한 별도 레이어입니다.
+
+
+- execution result → normalized execution result → history records 흐름을 지원합니다.
+- execution result schema는 변경하지 않습니다.
+
+
+- execution result → normalized execution result → history records → Batch QC run 흐름을 지원합니다.
+- execution result schema는 변경하지 않습니다.
+
+
+- execution result → normalized execution result → history records → Batch QC run → report/export 흐름을 지원합니다.
+- execution result schema는 변경하지 않습니다.
+
+- Window B Batch 탭에서 normalized workflow action을 명시적으로 호출해 실행할 수 있습니다.

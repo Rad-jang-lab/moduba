@@ -35,3 +35,24 @@
 ## Raw Export vs Report Export
 - `analysis_batch_qc.py`의 JSON/CSV export는 batch_qc_run 원본(raw) 출력입니다.
 - `analysis_batch_qc_report.py`의 text/PDF export는 사람이 읽기 쉬운 report model 출력입니다.
+
+
+## Normalized Execution Result Integration Scope
+- normalized execution result가 생성되어도 batch QC run은 자동 생성하지 않습니다.
+- 후속 단계에서 normalized execution result → history records → batch QC 연결을 수행할 수 있습니다.
+
+
+- normalized execution history adapter 단계에서도 batch QC run은 자동 생성하지 않습니다.
+- 후속 단계에서 history records → batch QC run 연결이 가능합니다.
+
+
+- normalized execution history records 기반 Batch QC adapter를 통해 QC run 생성이 가능합니다.
+- raw Batch QC run schema는 변경하지 않습니다.
+- threshold_config는 자동 적용하지 않고 explicit 전달 또는 selected-flag 경로에서만 적용합니다.
+
+
+- normalized Batch QC report/export adapter를 통해 raw Batch QC run을 report model로 변환할 수 있습니다.
+- raw Batch QC run과 report model은 구분됩니다.
+- threshold_evaluation은 item별 overall_status로 report에 표시됩니다.
+
+- Window B Batch 탭에서 normalized workflow action을 명시적으로 호출해 실행할 수 있습니다.

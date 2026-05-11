@@ -22,3 +22,12 @@
 - Batch execution/history/report/threshold schema
 - DomainStore 구조/세션 복원 구조
 - 대규모 UI 레이아웃
+
+## A/B Resize Scope
+- 코드 기준 A/B는 별도 Toplevel이 아니라 main viewer 내부 `compare_container` 좌/우 panel입니다.
+- 이번 UX-1에서는 대규모 compare layout 변경(PanedWindow 전환 등) 없이 유지합니다.
+- 필요 시 UX-2에서 compare panel 전용 리사이즈 상호작용 개선을 후속으로 진행합니다.
+
+## Safety
+- resize grip은 `<Configure>` 시점에 `lift()` 재호출로 가려짐을 방지합니다.
+- 창 종료/파괴 타이밍의 `TclError`는 helper 내부에서 안전하게 무시합니다.

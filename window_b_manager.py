@@ -129,6 +129,18 @@ class WindowBManager:
         grip_container.place(relx=1.0, rely=1.0, anchor="se")
         grip_container.place_propagate(False)
         ttk.Sizegrip(grip_container).pack(fill="both", expand=True)
+
+        def _lift_grip(_event: tk.Event | None = None) -> None:
+            try:
+                grip_container.lift()
+            except (tk.TclError, AttributeError):
+                return
+
+        _lift_grip()
+        try:
+            window.bind("<Configure>", _lift_grip, add="+")
+        except (tk.TclError, AttributeError):
+            pass
         return grip_container
 
     def bind_store_events(self) -> None:

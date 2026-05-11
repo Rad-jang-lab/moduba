@@ -69,6 +69,19 @@ class WindowBViewerAdapter(Protocol):
     def create_dicom_batch_pixel_analysis_executor_for_viewer(self): ...
     def run_current_dicom_batch_execution_plan_with_pixel_executor_for_viewer(self, execution_plan: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]: ...
     def preview_current_dicom_batch_pixel_executor_capability_for_viewer(self) -> str: ...
+    def build_normalized_dicom_batch_execution_result_for_viewer(self, execution_result: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, normalization_id: str | None = None) -> dict[str, Any]: ...
+    def render_normalized_dicom_batch_execution_result_text_for_viewer(self, execution_result: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, normalization_id: str | None = None) -> str: ...
+    def export_normalized_dicom_batch_execution_result_json_for_viewer(self, path: str | None = None, execution_result: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, normalization_id: str | None = None) -> str | None: ...
+    def export_normalized_dicom_batch_execution_result_csv_for_viewer(self, path: str | None = None, execution_result: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, normalization_id: str | None = None) -> str | None: ...
+    def build_analysis_history_records_from_normalized_execution_for_viewer(self, normalized_execution_result: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, record_id_prefix: str | None = None) -> list[dict[str, Any]]: ...
+    def append_normalized_execution_history_records_for_viewer(self, history_path: str | None = None, normalized_execution_result: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, record_id_prefix: str | None = None) -> list[dict[str, Any]] | None: ...
+    def build_batch_qc_run_from_normalized_execution_for_viewer(self, normalized_execution_result: dict[str, Any] | None = None, threshold_config: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None, batch_id: str | None = None, record_id_prefix: str | None = None, use_selected_threshold_config: bool = False) -> dict[str, Any]: ...
+    def render_normalized_batch_qc_report_text_for_viewer(self, batch_qc_run: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> str: ...
+    def export_normalized_batch_qc_report_json_for_viewer(self, path: str | None = None, batch_qc_run: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> str | None: ...
+    def export_normalized_batch_qc_report_csv_for_viewer(self, path: str | None = None, batch_qc_run: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> str | None: ...
+    def export_normalized_batch_qc_report_text_for_viewer(self, path: str | None = None, batch_qc_run: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> str | None: ...
+    def export_normalized_batch_qc_report_pdf_for_viewer(self, path: str | None = None, batch_qc_run: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> bytes | None: ...
+    def render_normalized_batch_workflow_summary_text_for_viewer(self) -> str: ...
 
 
 def build_window_b_analysis_panel(
@@ -548,6 +561,38 @@ def build_window_b_batch_panel(
     ttk.Button(actions, text="Append Records to History JSONL", command=_append_records).pack(side="left", padx=6)
     ttk.Button(actions, text="Build Batch QC Run", command=_build_qc).pack(side="left", padx=6)
     ttk.Checkbutton(actions, text="Use selected threshold config", variable=selected_threshold_var).pack(side="left", padx=(12, 0))
+
+    normalized_actions = ttk.LabelFrame(panel, text="Normalized Batch Workflow", padding=(8, 6))
+    normalized_actions.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+
+    def _run_normalized_action(prefix: str, callback) -> None:
+        try:
+            out = callback()
+            if out is None:
+                _set_preview_text(f"{prefix}: cancelled")
+            elif isinstance(out, str):
+                _set_preview_text(out)
+            elif isinstance(out, (list, dict)):
+                summary_text = viewer_adapter.render_normalized_batch_workflow_summary_text_for_viewer()
+                _set_preview_text(f"{prefix}: ok\n{summary_text}")
+            else:
+                _set_preview_text(f"{prefix}: ok")
+        except Exception as exc:
+            _set_preview_text(f"{prefix}: {exc}")
+
+    ttk.Button(normalized_actions, text="Build Normalized Execution", command=lambda: _run_normalized_action("build_normalized_execution", viewer_adapter.build_normalized_dicom_batch_execution_result_for_viewer)).pack(side="left", padx=(0, 6))
+    ttk.Button(normalized_actions, text="Preview Normalized Execution", command=lambda: _run_normalized_action("preview_normalized_execution", viewer_adapter.render_normalized_dicom_batch_execution_result_text_for_viewer)).pack(side="left", padx=6)
+    ttk.Button(normalized_actions, text="Export Normalized JSON", command=lambda: _run_normalized_action("export_normalized_execution_json", viewer_adapter.export_normalized_dicom_batch_execution_result_json_for_viewer)).pack(side="left", padx=6)
+    ttk.Button(normalized_actions, text="Export Normalized CSV", command=lambda: _run_normalized_action("export_normalized_execution_csv", viewer_adapter.export_normalized_dicom_batch_execution_result_csv_for_viewer)).pack(side="left", padx=6)
+    ttk.Button(normalized_actions, text="Build Normalized History Records", command=lambda: _run_normalized_action("build_normalized_history", viewer_adapter.build_analysis_history_records_from_normalized_execution_for_viewer)).pack(side="left", padx=6)
+    ttk.Button(normalized_actions, text="Append Normalized History JSONL", command=lambda: _run_normalized_action("append_normalized_history", viewer_adapter.append_normalized_execution_history_records_for_viewer)).pack(side="left", padx=6)
+    ttk.Button(normalized_actions, text="Build Normalized Batch QC Run", command=lambda: _run_normalized_action("build_normalized_batch_qc", lambda: viewer_adapter.build_batch_qc_run_from_normalized_execution_for_viewer(use_selected_threshold_config=bool(selected_threshold_var.get())))).pack(side="left", padx=6)
+    ttk.Button(normalized_actions, text="Preview Normalized Batch QC Report", command=lambda: _run_normalized_action("preview_normalized_batch_qc_report", viewer_adapter.render_normalized_batch_qc_report_text_for_viewer)).pack(side="left", padx=6)
+    ttk.Button(normalized_actions, text="Export Normalized Report JSON", command=lambda: _run_normalized_action("export_normalized_batch_qc_report_json", viewer_adapter.export_normalized_batch_qc_report_json_for_viewer)).pack(side="left", padx=6)
+    ttk.Button(normalized_actions, text="Export Normalized Report CSV", command=lambda: _run_normalized_action("export_normalized_batch_qc_report_csv", viewer_adapter.export_normalized_batch_qc_report_csv_for_viewer)).pack(side="left", padx=6)
+    ttk.Button(normalized_actions, text="Export Normalized Report Text", command=lambda: _run_normalized_action("export_normalized_batch_qc_report_text", viewer_adapter.export_normalized_batch_qc_report_text_for_viewer)).pack(side="left", padx=6)
+    ttk.Button(normalized_actions, text="Export Normalized Report PDF", command=lambda: _run_normalized_action("export_normalized_batch_qc_report_pdf", viewer_adapter.export_normalized_batch_qc_report_pdf_for_viewer)).pack(side="left", padx=6)
+    ttk.Button(normalized_actions, text="Refresh Normalized Workflow Summary", command=lambda: _run_normalized_action("normalized_workflow_summary", viewer_adapter.render_normalized_batch_workflow_summary_text_for_viewer)).pack(side="left", padx=6)
 
     plan_run = ttk.LabelFrame(panel, text="Batch Execution Plan / Run", padding=(8, 6))
     plan_run.grid(row=4, column=0, sticky="ew", pady=(8, 0))
