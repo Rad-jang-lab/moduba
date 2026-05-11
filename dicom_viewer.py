@@ -832,7 +832,7 @@ class DicomViewer:
         grip_container = ttk.Frame(window, width=RESIZE_GRIP_HIT_SIZE_PX, height=RESIZE_GRIP_HIT_SIZE_PX)
         try:
             grip_container.place(relx=1.0, rely=1.0, anchor="se")
-            grip_container.place_propagate(False)
+            grip_container.pack_propagate(False)
             ttk.Sizegrip(grip_container).pack(fill="both", expand=True)
             grip_container.lift()
         except tk.TclError:
