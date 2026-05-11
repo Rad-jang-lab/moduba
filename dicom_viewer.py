@@ -830,9 +830,13 @@ class DicomViewer:
     @staticmethod
     def _attach_resize_grip(window: tk.Misc) -> ttk.Frame:
         grip_container = ttk.Frame(window, width=RESIZE_GRIP_HIT_SIZE_PX, height=RESIZE_GRIP_HIT_SIZE_PX)
-        grip_container.place(relx=1.0, rely=1.0, anchor="se")
-        grip_container.place_propagate(False)
-        ttk.Sizegrip(grip_container).pack(fill="both", expand=True)
+        try:
+            grip_container.place(relx=1.0, rely=1.0, anchor="se")
+            grip_container.pack_propagate(False)
+            ttk.Sizegrip(grip_container).pack(fill="both", expand=True)
+            grip_container.lift()
+        except tk.TclError:
+            return grip_container
         return grip_container
 
     def _set_initial_split_sash(self) -> None:
@@ -15500,4 +15504,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

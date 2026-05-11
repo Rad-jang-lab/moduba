@@ -11,6 +11,8 @@ from window_b_panel_factory import (
     build_window_b_report_panel,
 )
 
+WINDOW_B_RESIZE_GRIP_HIT_SIZE_PX = 24
+
 
 class WindowBManager:
     """Window B lifecycle manager (single Toplevel instance, withdraw/reopen strategy)."""
@@ -125,10 +127,18 @@ class WindowBManager:
 
     @staticmethod
     def _attach_resize_grip(window: tk.Misc) -> ttk.Frame:
-        grip_container = ttk.Frame(window, width=24, height=24)
-        grip_container.place(relx=1.0, rely=1.0, anchor="se")
-        grip_container.place_propagate(False)
-        ttk.Sizegrip(grip_container).pack(fill="both", expand=True)
+        grip_container = ttk.Frame(
+            window,
+            width=WINDOW_B_RESIZE_GRIP_HIT_SIZE_PX,
+            height=WINDOW_B_RESIZE_GRIP_HIT_SIZE_PX,
+        )
+        try:
+            grip_container.place(relx=1.0, rely=1.0, anchor="se")
+            grip_container.pack_propagate(False)
+            ttk.Sizegrip(grip_container).pack(fill="both", expand=True)
+            grip_container.lift()
+        except tk.TclError:
+            return grip_container
         return grip_container
 
     def bind_store_events(self) -> None:

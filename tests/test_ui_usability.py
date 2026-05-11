@@ -2,7 +2,7 @@ import types
 
 from dicom_viewer import DicomViewer, ROI_SELECTION_HIT_RADIUS_PX, RESIZE_GRIP_HIT_SIZE_PX
 from domain_store import DomainStore
-from window_b_manager import WindowBManager
+from window_b_manager import WINDOW_B_RESIZE_GRIP_HIT_SIZE_PX, WindowBManager
 
 
 class DummyEvent:
@@ -151,8 +151,11 @@ def test_attach_resize_grip_adds_sizegrip_to_root(monkeypatch):
         def place(self, **kwargs):
             created.append(("place", kwargs))
 
-        def place_propagate(self, flag):
+        def pack_propagate(self, flag):
             created.append(("propagate", flag))
+
+        def lift(self):
+            created.append(("lift",))
 
     class FakeSizegrip:
         def __init__(self, _parent):
@@ -168,6 +171,21 @@ def test_attach_resize_grip_adds_sizegrip_to_root(monkeypatch):
 
     assert ("frame", RESIZE_GRIP_HIT_SIZE_PX, RESIZE_GRIP_HIT_SIZE_PX) in created
     assert any(item[0] == "sizegrip" for item in created)
+
+
+def test_resize_grip_helper_handles_destroyed_window_safely(monkeypatch):
+    class FakeFrame:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def place(self, **_kwargs):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr("dicom_viewer.ttk.Frame", FakeFrame)
+    monkeypatch.setattr("dicom_viewer.tk.TclError", RuntimeError)
+
+    # no exception
+    DicomViewer._attach_resize_grip(object())
 
 
 def test_grid_roi_still_selects_created_roi():
@@ -247,3 +265,48 @@ def test_window_b_create_window_adds_resize_grip(monkeypatch):
     manager._create_window()
 
     assert len(calls) == 1
+
+
+def test_window_b_resize_grip_helper_handles_destroyed_window_safely(monkeypatch):
+    class FakeFrame:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def place(self, **_kwargs):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr("window_b_manager.ttk.Frame", FakeFrame)
+    monkeypatch.setattr("window_b_manager.tk.TclError", RuntimeError)
+
+    WindowBManager._attach_resize_grip(object())
+
+
+def test_window_b_resize_grip_uses_expected_hit_size(monkeypatch):
+    created = []
+
+    class FakeFrame:
+        def __init__(self, _window, width, height):
+            created.append((width, height))
+
+        def place(self, **_kwargs):
+            return None
+
+        def pack_propagate(self, _flag):
+            return None
+
+        def lift(self):
+            return None
+
+    class FakeSizegrip:
+        def __init__(self, _parent):
+            return None
+
+        def pack(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr("window_b_manager.ttk.Frame", FakeFrame)
+    monkeypatch.setattr("window_b_manager.ttk.Sizegrip", FakeSizegrip)
+
+    WindowBManager._attach_resize_grip(object())
+
+    assert created == [(WINDOW_B_RESIZE_GRIP_HIT_SIZE_PX, WINDOW_B_RESIZE_GRIP_HIT_SIZE_PX)]
